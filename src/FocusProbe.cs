@@ -69,10 +69,10 @@ internal sealed class FocusProbe : IDisposable
         lock(gate){try{if(worker is {HasExited:false})worker.Kill();}catch{} Reset();}
     }
 }
-internal record FocusWire(long Window,long Focus,uint Pid,string App,bool Adobe,bool Text,bool Dialog,long At,string Reason,string Context)
+internal record FocusWire(long Window,long Focus,uint Pid,string App,bool Eligible,bool Text,bool Dialog,long At,string Reason,string Context,bool Korean)
 {
-    internal FocusSample ToSample()=>new((nint)Window,(nint)Focus,Pid,App,Adobe,Text,Dialog,At,Reason,Context);
-    internal static FocusWire From(FocusSample s)=>new(s.Window.ToInt64(),s.Focus.ToInt64(),s.Pid,s.App,s.Adobe,s.Text,s.Dialog,s.At,s.Reason,s.Context);
+    internal FocusSample ToSample()=>new((nint)Window,(nint)Focus,Pid,App,Eligible,Text,Dialog,At,Reason,Context,Korean);
+    internal static FocusWire From(FocusSample s)=>new(s.Window.ToInt64(),s.Focus.ToInt64(),s.Pid,s.App,s.Eligible,s.Text,s.Dialog,s.At,s.Reason,s.Context,s.Korean);
 }
 internal static class ProbeWorker
 {
@@ -82,7 +82,7 @@ internal static class ProbeWorker
         new Thread(()=>{try{parent.WaitForExit();}catch{} Process.GetCurrentProcess().Kill();}){IsBackground=true}.Start();
         using var probe=new UiaProbe();
         using var output=new StreamWriter(Console.OpenStandardOutput()){AutoFlush=true};
-        try {while(true){output.WriteLine(JsonSerializer.Serialize(FocusWire.From(probe.Current)));Thread.Sleep(60);}}
+        try {while(true){output.WriteLine(JsonSerializer.Serialize(FocusWire.From(probe.Current)));Thread.Sleep(40);}}
         catch(IOException){Process.GetCurrentProcess().Kill();}
     }
 }

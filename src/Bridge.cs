@@ -4,22 +4,32 @@ namespace AdobeKoreanShortcuts;
 // Direct key messages bypass IME translation. Never change the IME conversion mode.
 internal sealed class Bridge : IDisposable
 {
-    readonly FocusProbe probe;
+    readonly Func<FocusSample> current;
     readonly Native.HookProc callback;
-    readonly Dictionary<int,(nint Window,uint Scan,bool Extended)> held=[];
+    readonly Native.HookProc mouseCallback;
+    long changedAt;
+    readonly Dictionary<int,(nint Window,nint Foreground,nint Focus,uint Scan,bool Extended)> held=[];
     readonly HashSet<int> cancelled=[];
     readonly PressTracker presses=new();
-    nint hook;
+    nint hook,mouseHook;
     internal bool Paused {get;private set;}
     internal int Count {get;private set;}
     internal string LastResult {get;private set;}="단축키 입력 대기";
-    internal Bridge(FocusProbe probe)
+    internal Bridge(FocusProbe probe):this(()=>probe.Current){}
+    internal Bridge(Func<FocusSample> current)
     {
-        this.probe=probe;callback=OnKey;
+        this.current=current;callback=OnKey;mouseCallback=OnMouse;
         hook=Native.SetWindowsHookEx(13,callback,Native.GetModuleHandle(null),0);
         if(hook==0)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        mouseHook=Native.SetWindowsHookEx(14,mouseCallback,Native.GetModuleHandle(null),0);
+        if(mouseHook==0){Native.UnhookWindowsHookEx(hook);hook=0;throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());}
     }
     internal void TogglePause(){ReleaseAll();Paused=!Paused;}
+    nint OnMouse(int code,nint message,nint pointer)
+    {
+        if(code>=0 && message is 0x201 or 0x202 or 0x204 or 0x205 or 0x207 or 0x208 or 0x20A or 0x20B or 0x20C)changedAt=Environment.TickCount64;
+        return Native.CallNextHookEx(mouseHook,code,message,pointer);
+    }
     nint OnKey(int code,nint message,nint pointer)
     {
         if(code>=0)
@@ -28,6 +38,7 @@ internal sealed class Bridge : IDisposable
             {
                 var k=Marshal.PtrToStructure<Native.KeyInfo>(pointer);
                 int key=(int)k.Key;bool down=message==0x100||message==0x104;
+                if(key is 0x09 or 0x0D or 0x1B or 0x15 or 0x19 or 0xF2 or 0x20 or 0x11 or 0x12 or 0x5B or 0x5C || (key is >=0x21 and <=0x28) || (key is >=0x70 and <=0x87) || Native.Down(0x11) || Native.Down(0x12) || Native.Down(0x5B) || Native.Down(0x5C))changedAt=Environment.TickCount64;
                 bool firstDown=down && presses.Down(key);
                 if(!down)presses.Up(key);
                 if(cancelled.Contains(key)){if(!down)cancelled.Remove(key);return 1;}
@@ -38,26 +49,25 @@ internal sealed class Bridge : IDisposable
                 }
                 if(down && !Paused)
                 {
-                    var f=probe.Current;var window=Native.GetForegroundWindow();var gui=Native.Info(window);
-                    bool fresh=Policy.Fresh(f.At,Environment.TickCount64,f.Window==window,f.Focus==gui.Focus,gui.Size!=0);
-                    var facts=new FocusFacts(f.Adobe,f.Text||FocusProbe.NativeText(gui.Focus),gui.Caret!=0,f.Dialog||gui.MenuOwner!=0,fresh);
+                    var f=current();var window=Native.GetForegroundWindow();var gui=Native.Info(window);
+                    bool fresh=Policy.Fresh(f.At,Environment.TickCount64,f.Window==window,f.Focus==gui.Focus,gui.Size!=0) && Policy.AfterTransition(f.At,changedAt);
+                    var facts=new FocusFacts(f.Eligible,f.Text||FocusProbe.NativeText(gui.Focus),gui.Caret!=0,f.Dialog||gui.MenuOwner!=0,fresh);
                     if(held.TryGetValue(key,out var owner))
                     {
-                        if(owner.Window==window && Policy.ShouldBridge(facts,key,Native.Down(0x11),Native.Down(0x12),Native.Down(0x5B)||Native.Down(0x5C)))
+                        if(owner.Foreground==window && owner.Focus==gui.Focus && Policy.ShouldBridge(facts,key,Native.Down(0x11),Native.Down(0x12),Native.Down(0x5B)||Native.Down(0x5C)))
                             Native.PostMessage(owner.Window,0x100,(nuint)key,KeyMessage.Pack(owner.Scan,owner.Extended,false,true));
                         else {Native.PostMessage(owner.Window,0x101,(nuint)key,KeyMessage.Pack(owner.Scan,owner.Extended,true,true));held.Remove(key);cancelled.Add(key);}
                         return 1;
                     }
                     if(firstDown && Policy.ShouldBridge(facts,key,Native.Down(0x11),Native.Down(0x12),Native.Down(0x5B)||Native.Down(0x5C)))
                     {
-                        var target=gui.Focus!=0?gui.Focus:window;
-                        var ime=Native.ImmGetDefaultIMEWnd(target);
-                        if(Native.Ime(ime,5,0,out int open) && open!=0 && Native.Ime(ime,1,0,out int mode) && (mode&1)!=0)
+                        var target=f.App is "AfterFX" or "Adobe Premiere Pro"?window:gui.Focus;
+                        if(f.Korean && target!=0)
                         {
                             bool repeat=held.ContainsKey(key);bool extended=(k.Flags&1)!=0;
-                            if(Native.PostMessage(window,0x100,(nuint)key,KeyMessage.Pack(k.Scan,extended,false,repeat)))
+                            if(Native.PostMessage(target,0x100,(nuint)key,KeyMessage.Pack(k.Scan,extended,false,repeat)))
                             {
-                                held[key]=(window,k.Scan,extended);Count++;
+                                held[key]=(target,window,gui.Focus,k.Scan,extended);changedAt=Environment.TickCount64;Count++;
                                 LastResult="한글 상태 유지 · 단축키 메시지 전달";
                                 return 1;
                             }
@@ -79,5 +89,5 @@ internal sealed class Bridge : IDisposable
         }
         held.Clear();
     }
-    public void Dispose(){ReleaseAll();if(hook!=0)Native.UnhookWindowsHookEx(hook);hook=0;GC.KeepAlive(callback);}
+    public void Dispose(){ReleaseAll();if(hook!=0)Native.UnhookWindowsHookEx(hook);hook=0;if(mouseHook!=0)Native.UnhookWindowsHookEx(mouseHook);mouseHook=0;GC.KeepAlive(callback);GC.KeepAlive(mouseCallback);}
 }

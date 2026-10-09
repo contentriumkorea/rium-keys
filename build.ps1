@@ -1,8 +1,8 @@
-param([string]$Version='1.0.0')
+param([string]$Version='1.1.0')
 $ErrorActionPreference='Stop'
 Push-Location $PSScriptRoot
 try {
-    foreach($project in @('tests/Tests.csproj','native-tests/NativeTests.csproj','update-tests/UpdateTests.csproj')) {
+    foreach($project in @('tests/Tests.csproj','native-tests/NativeTests.csproj','update-tests/UpdateTests.csproj','integration-tests/IntegrationTests.csproj')) {
         dotnet run --project $project
         if($LASTEXITCODE -ne 0){throw "Tests failed: $project"}
     }

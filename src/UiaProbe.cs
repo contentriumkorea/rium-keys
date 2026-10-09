@@ -1,90 +1,116 @@
 using System.Diagnostics;
 using System.Windows.Automation;
-
 namespace AdobeKoreanShortcuts;
-internal record FocusSample(nint Window, nint Focus, uint Pid, string App, bool Adobe, bool Text, bool Dialog, long At, string Reason, string Context="");
+internal record FocusSample(nint Window,nint Focus,uint Pid,string App,bool Eligible,bool Text,bool Dialog,long At,string Reason,string Context="",bool Korean=false);
 internal sealed class UiaProbe : IDisposable
 {
-    internal static readonly HashSet<string> Supported = new(StringComparer.OrdinalIgnoreCase)
-    { "AfterFX", "Adobe Premiere Pro", "Photoshop", "Illustrator", "InDesign", "Animate", "Adobe Audition", "Lightroom", "Bridge", "Adobe Media Encoder", "Acrobat" };
-    private volatile bool stop;
+    volatile bool stop;
     readonly AdobeTextState textState=new();
-    private FocusSample sample = new(0,0,0,"",false,true,false,0,"시작 중");
-    internal FocusSample Current => Volatile.Read(ref sample);
-    internal UiaProbe() { new Thread(Run) { IsBackground = true, Name = "Adobe focus probe" }.Start(); }
+    AutomationElement? focusCache;
+    nint cachedWindow,cachedNativeFocus;
+    FocusSample sample=new(0,0,0,"",false,true,false,0,"시작 중");
+    internal FocusSample Current=>Volatile.Read(ref sample);
+    internal UiaProbe()=>new Thread(Run){IsBackground=true,Name="System focus probe"}.Start();
+    static CacheRequest Cache(bool names=false)
+    {
+        var cache=new CacheRequest{TreeScope=TreeScope.Element};
+        foreach(var property in new[]{AutomationElement.ProcessIdProperty,AutomationElement.ControlTypeProperty,AutomationElement.IsKeyboardFocusableProperty,AutomationElement.HasKeyboardFocusProperty,AutomationElement.IsPasswordProperty,AutomationElement.NativeWindowHandleProperty,ValuePattern.IsReadOnlyProperty})cache.Add(property);
+        if(names){cache.Add(AutomationElement.ClassNameProperty);cache.Add(AutomationElement.NameProperty);}
+        cache.Add(ValuePattern.Pattern);cache.Add(TextPattern.Pattern);
+        return cache;
+    }
     void Run()
     {
-        uint lastPid = 0; string app = ""; bool adobe = false;
-        while (!stop)
+        uint lastPid=0;string app="";
+        while(!stop)
         {
             try
             {
                 long observedAt=Environment.TickCount64;
-                var window = Native.GetForegroundWindow();
-                Native.GetWindowThreadProcessId(window, out uint pid);
-                if (pid != lastPid)
+                var window=Native.GetForegroundWindow();Native.GetWindowThreadProcessId(window,out uint pid);
+                if(pid!=lastPid){using var process=Process.GetProcessById((int)pid);app=process.ProcessName;lastPid=pid;}
+                var gui=Native.Info(window);
+                bool dialog=Native.Class(window)=="#32770" || gui.MenuOwner!=0;
+                bool text=true,eligible=false,korean=false;
+                string context="",reason="입력 영역 확인 중";
+                bool adobe=app is "AfterFX" or "Adobe Premiere Pro";
+                bool excluded=app is "RiumKeys" or "WindowsTerminal" or "OpenConsole" or "conhost" or "cmd" or "powershell" or "pwsh" || Native.Class(window)=="ConsoleWindowClass";
+                if(excluded)reason="원래 입력 사용";
+                else if(dialog || gui.Caret!=0 || FocusProbe.NativeText(gui.Focus))reason="한글 입력 중";
+                else if(Native.Class(gui.Focus).Equals("Button",StringComparison.OrdinalIgnoreCase) || Native.Class(gui.Focus).StartsWith("WindowsForms10.BUTTON.",StringComparison.OrdinalIgnoreCase))
                 {
-                    lastPid = pid; adobe = false; app = "";
-                    using var process = Process.GetProcessById((int)pid);
-                    app = process.ProcessName;
-                    if (Supported.Contains(app))
-                    {
-                        var path = process.MainModule?.FileName ?? "";
-                        adobe = path.Contains("\\Adobe\\", StringComparison.OrdinalIgnoreCase) &&
-                            (FileVersionInfo.GetVersionInfo(path).CompanyName ?? "").Contains("Adobe", StringComparison.OrdinalIgnoreCase);
-                    }
+                    eligible=true;text=false;reason="PC 단축키 대기";
                 }
-                var gui = Native.Info(window);
-                bool text = true;
-                bool dialog = Native.Class(window) == "#32770" || gui.MenuOwner != 0;
-                string reason = "Adobe 외 프로그램";
-                string context="";
-                if (adobe)
+                else if(gui.Size!=0 && gui.Focus!=0)
                 {
-                    var nativeElement=gui.Focus!=0?AutomationElement.FromHandle(gui.Focus):null;
-                    for(var el=nativeElement;el!=null;el=TreeWalker.ControlViewWalker.GetParent(el))
+                    bool knownAdobe=false;
+                    if(adobe)
                     {
-                        var curr=el.Current;
-                        if(curr.ProcessId!=pid)break;
-                        context+=curr.ControlType.ProgrammaticName+":"+curr.ClassName+"/";
-                        if(curr.Name is "AE Composition" or "AE Timeline" or "AE Project" or "Program Monitor" or "Timeline")context+=curr.Name+"/";
-                        if(context.Length>500)break;
-                    }
-                    text = !Policy.KnownWorkspace(app,context) || FocusProbe.NativeText(gui.Focus) || gui.Caret != 0 || textState.ProtectCanvas(pid,app,context);
-                    reason = text ? "한글 입력 영역 보호" : "단축키 대기";
-                    if(!text)
-                    {
-                    var focused = AutomationElement.FocusedElement;
-                    if (focused == null || focused.Current.ProcessId != pid)
-                    { text = true; reason = "포커스 확인 대기"; }
-                    else
-                    {
+                        using var nativeCache=Cache(true).Activate();
+                        var nativeElement=AutomationElement.FromHandle(gui.Focus);
                         int depth=0;
-                        for (var el = focused; el != null && depth++ < 12; el = TreeWalker.ControlViewWalker.GetParent(el))
+                        for(var el=nativeElement;el!=null && depth++<12;el=TreeWalker.ControlViewWalker.GetParent(el,Cache(true)))
                         {
-                            var current = el.Current;
-                            if (current.ProcessId != pid) break;
-                            if (current.ControlType == ControlType.Edit || current.ControlType == ControlType.ComboBox || current.IsPassword)
-                                text = true;
-                            if (el.TryGetCurrentPattern(ValuePattern.Pattern, out var value) && !((ValuePattern)value).Current.IsReadOnly)
-                                text = true;
-                            if (el.TryGetCurrentPattern(TextPattern.Pattern, out var pattern))
-                            {
-                                var range = ((TextPattern)pattern).DocumentRange;
-                                if (range.GetAttributeValue(TextPattern.IsReadOnlyAttribute) is bool readOnly && !readOnly) text = true;
-                            }
-                            if (current.ControlType == ControlType.Window) break;
+                            var c=el.Cached;if(c.ProcessId!=pid)break;
+                            context+=c.ControlType.ProgrammaticName+":"+c.ClassName+"/";
+                            if(c.Name is "AE Composition" or "AE Timeline" or "AE Project" or "Program Monitor" or "Timeline")context+=c.Name+"/";
+                            if(c.ControlType==ControlType.Window || context.Length>500)break;
                         }
-                        if (text) reason = "한글 입력 영역 보호";
+                        knownAdobe=Policy.KnownWorkspace(app,context);
                     }
+                    var cache=Cache();
+                    using var cached=cache.Activate();
+                    AutomationElement? focused=null;
+                    if(cachedWindow==window && cachedNativeFocus==gui.Focus && focusCache!=null)
+                    {
+                        focused=focusCache.GetUpdatedCache(cache);
+                        if(!focused.Cached.HasKeyboardFocus)focused=null;
+                    }
+                    if(focused==null)
+                    {
+                        var nativeFocus=AutomationElement.FromHandle(gui.Focus);
+                        focused=nativeFocus?.FindFirst(TreeScope.Subtree,new PropertyCondition(AutomationElement.HasKeyboardFocusProperty,true));
+                    }
+                    focusCache=focused;cachedWindow=window;cachedNativeFocus=gui.Focus;
+                    if(focused!=null && focused.Cached.ProcessId==pid)
+                    {
+                        text=false;
+                        var facts=ReadFacts(focused);
+                        eligible=knownAdobe || Policy.GenericWorkspace(facts.Role,facts.Focusable,facts.Password,facts.Writable,facts.HasText,facts.ReadOnly);
+                        int depth=0;
+                        for(var el=focused;knownAdobe && el!=null && depth++<12;el=TreeWalker.ControlViewWalker.GetParent(el,Cache(true)))
+                        {
+                            var c=el.Cached;if(c.ProcessId!=pid)break;
+                            var f=ReadFacts(el);
+                            if(f.Password || f.Writable || f.Role is "Edit" or "ComboBox" or "Spinner" || (f.HasText && f.ReadOnly!=true))text=true;
+                            if(c.ControlType==ControlType.Window)break;
+                        }
+                        if(knownAdobe && textState.ProtectCanvas(pid,app,context))text=true;
+                        if(!eligible)text=true;
+                        reason=text?"한글 입력 / 원래 입력 사용":"PC 단축키 대기";
                     }
                 }
-                if (Native.GetForegroundWindow() == window && Native.Info(window).Focus == gui.Focus)
-                    Volatile.Write(ref sample, new(window,gui.Focus,pid,app,adobe,text,dialog,observedAt,reason,context));
+                if(eligible && !text)
+                {
+                    // Cross-process IME reads stay out of the keyboard hook.
+                    var ime=Native.ImmGetDefaultIMEWnd(gui.Focus);
+                    korean=Native.Ime(ime,5,0,out int open) && open!=0 && Native.Ime(ime,1,0,out int mode) && (mode&1)!=0;
+                }
+                if(Native.GetForegroundWindow()==window && Native.Info(window).Focus==gui.Focus)
+                    Volatile.Write(ref sample,new(window,gui.Focus,pid,app,eligible,text,dialog,observedAt,reason,context,korean));
             }
-            catch { Volatile.Write(ref sample, new(0,0,0,"",false,true,false,Environment.TickCount64,"접근할 수 없는 창 보호")); }
-            Thread.Sleep(60);
+            catch{focusCache=null;cachedWindow=0;cachedNativeFocus=0;Volatile.Write(ref sample,new(0,0,0,"",false,true,false,Environment.TickCount64,"원래 입력 사용"));}
+            Thread.Sleep(40);
         }
     }
-    public void Dispose() { stop = true; }
+    static (string Role,bool Focusable,bool Password,bool Writable,bool HasText,bool? ReadOnly) ReadFacts(AutomationElement el)
+    {
+        var c=el.Cached;
+        bool writable=el.TryGetCachedPattern(ValuePattern.Pattern,out var value) && !((ValuePattern)value).Cached.IsReadOnly;
+        bool hasText=el.TryGetCachedPattern(TextPattern.Pattern,out var text);
+        bool? readOnly=null;
+        if(hasText && ((TextPattern)text).DocumentRange.GetAttributeValue(TextPattern.IsReadOnlyAttribute) is bool flag)readOnly=flag;
+        return(c.ControlType.ProgrammaticName.Replace("ControlType.",""),c.IsKeyboardFocusable,c.IsPassword,writable,hasText,readOnly);
+    }
+    public void Dispose()=>stop=true;
 }

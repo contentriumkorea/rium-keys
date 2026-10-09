@@ -1,5 +1,5 @@
 #Requires -Version 7.0
-param([string]$Version='1.0.0')
+param([string]$Version='1.1.0')
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Security.Cryptography.ProtectedData
 $installer=Join-Path $PSScriptRoot 'release/RIUM-Keys-Setup.exe'
@@ -15,4 +15,3 @@ try {
     $signature=$rsa.SignData($payload,[Security.Cryptography.HashAlgorithmName]::SHA256,[Security.Cryptography.RSASignaturePadding]::Pkcs1)
     [ordered]@{Payload=[Convert]::ToBase64String($payload);Signature=[Convert]::ToBase64String($signature)} | ConvertTo-Json -Compress | Set-Content -Encoding utf8 (Join-Path $PSScriptRoot 'release/update.json')
 } finally {[Array]::Clear($plain,0,$plain.Length);$rsa.Dispose()}
-
