@@ -25,3 +25,12 @@
 !integration-tests/
 !integration-tests/*.cs
 !integration-tests/*.csproj
+
+!input-probe/
+!input-probe/*.cpp
+!input-probe/*.h
+!input-probe/*.def
+!input-probe/*.ps1
+!input-probe/README.md
+!docs/
+!docs/system-input-design.md
