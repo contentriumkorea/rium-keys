@@ -1,5 +1,5 @@
 #Requires -Version 7.0
-param([string]$Version='1.1.0')
+param([string]$Version='1.1.1')
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Security.Cryptography.ProtectedData
 $installer=Join-Path $PSScriptRoot 'release/RIUM-Keys-Setup.exe'

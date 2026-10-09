@@ -11,7 +11,7 @@ public static class Policy
     public static bool KnownWorkspace(string app,string context) => app switch
     {
         "AfterFX" => context.Contains("AE Timeline/") || context.Contains("AE Composition/") || context.Contains("AE Project/"),
-        "Adobe Premiere Pro" => context.Contains("Timeline/") || context.Contains("Program Monitor/"),
+        "Adobe Premiere Pro" => context.Contains("Timeline/") || context.Contains("Program Monitor/") || context.Contains("Source Monitor/"),
         _ => false
     };
     public static bool Fresh(long observed, long now, bool sameWindow, bool sameFocus, bool valid) =>
