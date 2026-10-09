@@ -11,6 +11,7 @@ Build on the current Windows development machine:
 ./input-probe/build.ps1 -Architecture x86
 ./input-probe/out/x64/RiumContextProbe.exe --self-test
 ./input-probe/out/x64/RiumContextProbe.exe --registration-test
+./input-probe/out/x64/RiumContextFixture.exe --registration-test
 ./input-probe/out/x64/RiumContextProbe.exe --cleanup-registration
 ```
 
@@ -19,7 +20,7 @@ null-owner errors, factory lifetime and non-consuming callbacks. A manual
 ActivateEx result is printed as a diagnostic, not claimed as OS activation.
 
 `--registration-test` requires keyboard-category registration rights. It creates
-a temporary per-user COM entry and keyboard category, registers a **process-local**
+a temporary machine COM entry, diagnostic TIP identity and keyboard category, registers a **process-local**
 profile, activates it only inside the controller and checks both active keyboard
 profile identity and an actual service callback. A success HRESULT alone is not
 considered success. It restores the process-local profile and checks registration
@@ -28,7 +29,7 @@ cleanup. Registration refuses to overwrite an existing class entry.
 After abrupt controller termination, run `--cleanup-registration` with the same
 architecture and registration rights. It refuses an active diagnostic mapping or
 a COM DLL path different from the DLL beside the controller; it removes only the
-diagnostic GUID's category and COM entry and verifies both are absent. Process-local
+diagnostic GUID's TIP identity, category and COM entry. Process-local
 profiles end with their host process. An activation callback is not proof of real
 keyboard delivery; key-event callbacks and editable/non-editable contexts still
 need their own integration fixture.
@@ -53,3 +54,22 @@ Outputs are isolated under `out/x64` and `out/x86`; no installer changes are mad
   registration root for write separately raised SecurityException in this host.
 - Real Korean composition, Adobe contexts and first-key shortcut behavior have
   **not** been validated. A replacement IME must not ship on this evidence.
+
+## Elevated diagnostic on 2026-10-10
+
+- User authorized launching the administrator confirmation. Elevated TIP and
+  keyboard-category registration succeeded.
+- Elevated COM activation returned CLASSNOTREG with per-user registration; moving
+  this diagnostic's temporary COM entry to the machine scope yielded S_OK.
+- A visible, foreground Win32 EDIT fixture was verified by the controller. Even
+  after pumping messages, process-local profile activation did not match the
+  requested keyboard profile and no service callback arrived. The integration
+  check remains failed; no real Korean composition or shortcut coverage is claimed.
+- Normal cleanup removed this diagnostic's machine COM and CTF TIP keys, verified
+  separately. The shipping application was not modified or updated.
+- `--registration-test` writes `registration-result.log` beside the controller so
+  results survive the UAC launch without a console window.
+- Both console and GUI-subsystem fixtures report thread-manager active flags
+  `0x80000001` (including NOACTIVATETIP) and fail the activation check. Merely
+  changing the executable subsystem or foregrounding the edit window did not fix
+  the diagnostic. This is a fixture/runtime issue to resolve before app testing.

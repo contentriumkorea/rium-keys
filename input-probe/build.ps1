@@ -13,6 +13,8 @@ try {
     if($LASTEXITCODE){throw 'Probe DLL compilation failed'}
     & "$vc\bin\Hostx64\$Architecture\cl.exe" /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE "$PSScriptRoot\Controller.cpp" /link /OUT:RiumContextProbe.exe ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib
     if($LASTEXITCODE){throw 'Probe controller compilation failed'}
+    & "$vc\bin\Hostx64\$Architecture\link.exe" /nologo Controller.obj /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /OUT:RiumContextFixture.exe ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib
+    if($LASTEXITCODE){throw 'GUI fixture linking failed'}
     & .\RiumContextProbe.exe --self-test
     if($LASTEXITCODE){throw 'Probe contract checks failed'}
 } finally {Pop-Location}
