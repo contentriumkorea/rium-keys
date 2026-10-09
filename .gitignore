@@ -34,3 +34,8 @@
 !input-probe/README.md
 !docs/
 !docs/system-input-design.md
+!input-core/
+!input-core/*.h
+!input-core/*.cpp
+!input-core/*.ps1
+!input-core/README.md
