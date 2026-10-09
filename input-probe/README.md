@@ -43,6 +43,42 @@ window ID and callback event type; it does not include key values or text.
 The build currently uses the installed VS18 MSVC14.51 and Windows SDK10.0.22621.
 Outputs are isolated under `out/x64` and `out/x86`; no installer changes are made.
 
+## Current integration runner
+
+Run `./input-probe/test-registration.ps1` from a **non-administrator** PowerShell.
+It requests UAC for registration only, then starts the disposable fixture as the
+ordinary user. Named events coordinate a bounded registration lifetime; the
+elevated process removes the temporary registration even if the fixture fails.
+Do not run overlapping instances. The older direct `--registration-test` runner
+is not the current integration entry point.
+
+Registration uses `RegisterProfile` and `InstallLayoutOrTip`; it is temporary
+machine/user registration, while **activation is process-local**. Those are
+different scopes. It never makes the diagnostic the default keyboard.
+
+Before readiness polling, the fresh standard-user fixture resolved the service, keyboard
+category and language-profile description, but `EnumLanguageProfiles` ends
+normally with two other profiles and omits the diagnostic. `GetProfile` returns
+E_FAIL and the service activation callback is never entered. Cache invalidation,
+COM description and Windows-app compatibility registration have not resolved
+this failure on their own.
+
+The registration readiness test now polls `GetProfile` with message processing
+for up to three seconds. On 2026-10-10, an untraced run became ready after 250 ms,
+selected the diagnostic profile, entered `ActivateEx`, and registered the key
+sink with S_OK. Another run became ready after 265 ms. The earlier immediate
+selection was racing profile-list propagation. This is a registration/fixture
+fix, not evidence that the original production application's focus bug is fixed.
+
+The latest fixture separately requires a key callback through the system's
+`ITfKeystrokeMgr::TestKeyDown`. This is API dispatch testing, not physical-key
+delivery. A prior interactive attempt timed out during focus changes and did
+not demonstrate a key callback. Real input and Adobe coverage remain open gates.
+
+Machine COM/TIP keys are removed on normal teardown. Windows leaves a disabled
+HKCU entry for the exact diagnostic profile; this is not an installed service.
+The runner must distinguish that metadata from live machine registration.
+
 ## Verified on 2026-10-09
 
 - x64 and x86 DLL/controller build and self-test passed after cleanup changes.

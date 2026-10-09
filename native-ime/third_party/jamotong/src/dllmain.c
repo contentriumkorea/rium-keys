@@ -1,0 +1,197 @@
+#include <initguid.h>
+#include "jamotong.h"
+#include <stdbool.h>
+#include "config.h"   // Config_GrantAppContainerRead
+#include "jdict.h"        // JDict_SetLightOpen
+#include "plugin_loader.h" // PluginLoader_SetDeferBodies
+#include "seq_layout.h"   // SeqLayout_SetLazyOpen — 사전은 그 자판을 처음 쓸 때 연다 (B22)
+
+LONG g_DllRefCount = 0;
+HINSTANCE g_hInst = NULL;
+CRITICAL_SECTION g_configLock;   // live config 접근 직렬화 (입력 스레드 ↔ 설정 스레드)
+
+static const WCHAR c_szInfoKeyPrefix[] = L"CLSID\\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}";
+static const WCHAR c_szInprocServer32[] = L"InprocServer32";
+static const WCHAR c_szModelName[] = L"Apartment";
+static const WCHAR c_szDescription[] = L"RIUM Keys Input (development)";
+
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        g_hInst = hinstDLL;
+        DisableThreadLibraryCalls(hinstDLL);
+        InitializeCriticalSection(&g_configLock);
+        SeqLayout_SetLazyOpen(true);   // 켜 둔 자판의 사전을 앱마다 미리 매핑하지 않는다 (팩을 고칠 때 재부팅이 덜 필요하다)
+        JDict_SetLightOpen(true);
+        PluginLoader_SetDeferBodies(true);   // 꺼 둔 자판의 본문을 앱마다 읽지 않는다 (RFC-0020 F1)      // 사전을 열 때 색인·내용을 전수로 훑지 않는다 — 항목은 읽을 때마다 범위를 본다 (RFC-0020 F3)
+    } else if (fdwReason == DLL_PROCESS_DETACH) {
+        // 창 클래스 해제는 여기서 하지 않는다(RFC-0008 W2-05) — 로더 잠금 안에서 User32 를 부르는 것은
+        // 금지 목록이다. DllCanUnloadNow 가 S_OK 를 돌려줄 때(COM 이 곧 FreeLibrary 한다) 해제한다.
+        (void)lpvReserved;
+        DeleteCriticalSection(&g_configLock);
+    }
+    return TRUE;
+}
+
+// RFC-0008 W0-02: COM 참조만 보면 부족하다 — 우리가 건 타이머의 콜백은 이 DLL 안에 있다.
+// 보류 중인 것이 하나라도 있으면 아직 내리면 안 된다.
+bool Jamotong_HasPendingTimers(void);
+
+STDAPI DllCanUnloadNow(void) {
+    if (g_DllRefCount != 0) return S_FALSE;
+    if (Jamotong_HasPendingTimers()) return S_FALSE;
+    Jamo_UnregisterClasses();   // W2-05: 로더 잠금 밖, 인스턴스 0 인 지금
+    return S_OK;
+}
+
+// ------------------------------------------------------------------
+// Class Factory Implementation
+// ------------------------------------------------------------------
+
+static HRESULT STDMETHODCALLTYPE CF_QueryInterface(IClassFactory *pThis, REFIID riid, void **ppvObject) {
+    if (!ppvObject) return E_INVALIDARG;
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IClassFactory)) {
+        *ppvObject = pThis;
+        pThis->lpVtbl->AddRef(pThis);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE CF_AddRef(IClassFactory *pThis) {
+    JamotongClassFactory *factory = (JamotongClassFactory*)pThis;
+    InterlockedIncrement(&g_DllRefCount);
+    return InterlockedIncrement(&factory->refCount);
+}
+
+static ULONG STDMETHODCALLTYPE CF_Release(IClassFactory *pThis) {
+    JamotongClassFactory *factory = (JamotongClassFactory*)pThis;
+    ULONG res = InterlockedDecrement(&factory->refCount);
+    InterlockedDecrement(&g_DllRefCount);
+    if (res == 0) {
+        HeapFree(GetProcessHeap(), 0, factory);
+    }
+    return res;
+}
+
+static HRESULT STDMETHODCALLTYPE CF_CreateInstance(IClassFactory *pThis, IUnknown *pUnkOuter, REFIID riid, void **ppvObject) {
+    (void)pThis;
+    if (pUnkOuter) return CLASS_E_NOAGGREGATION;
+    
+    return JamotongTextService_Create(pUnkOuter, riid, ppvObject);
+}
+
+static HRESULT STDMETHODCALLTYPE CF_LockServer(IClassFactory *pThis, BOOL fLock) {
+    (void)pThis;
+    if (fLock) {
+        InterlockedIncrement(&g_DllRefCount);
+    } else {
+        InterlockedDecrement(&g_DllRefCount);
+    }
+    return S_OK;
+}
+
+static IClassFactoryVtbl ClassFactoryVtbl = {
+    CF_QueryInterface,
+    CF_AddRef,
+    CF_Release,
+    CF_CreateInstance,
+    CF_LockServer
+};
+
+STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID *ppv) {
+    if (!IsEqualIID(rclsid, &CLSID_JamotongIME)) {
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
+    JamotongClassFactory *factory = (JamotongClassFactory*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(JamotongClassFactory));
+    if (!factory) return E_OUTOFMEMORY;
+
+    factory->lpVtbl = &ClassFactoryVtbl;
+    factory->refCount = 1;
+    InterlockedIncrement(&g_DllRefCount);
+
+    HRESULT hr = factory->lpVtbl->QueryInterface((IClassFactory*)factory, riid, ppv);
+    factory->lpVtbl->Release((IClassFactory*)factory);
+    return hr;
+}
+
+// ------------------------------------------------------------------
+// DLL Registration
+// ------------------------------------------------------------------
+
+// RFC-0008 W1-04: 등록 도중 실패하면 앞 단계에서 만든 것을 역순으로 지운다 — CLSID 만 있고 프로필이 없는
+// "반쯤 등록된" 입력기를 남기지 않는다. (지우는 쪽 실패는 되돌릴 방법이 없으니 무시한다.)
+static void RegisterRollback(bool profiles, bool categories) {
+    if (categories) UnregisterCategories();
+    if (profiles) UnregisterProfiles();
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, c_szInfoKeyPrefix);
+}
+
+STDAPI DllRegisterServer(void) {
+    HKEY hKey = NULL;
+    HKEY hSubKey = NULL;
+    WCHAR szModule[MAX_PATH];
+
+    DWORD n = GetModuleFileNameW(g_hInst, szModule, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return E_FAIL;   // 잘린 경로로 등록하면 로드되지 않는다 (W1-04)
+
+    // 이 DLL 이 놓인 폴더를 UWP(AppContainer) 프로세스가 읽을 수 있게 한다.
+    // TIP 은 호스트 프로세스 안에서 로드된다 — 호스트가 UWP 앱(작업표시줄 검색·설정 앱·Store 앱)
+    // 이면 AppContainer 라서 이 권한이 없는 폴더의 DLL 을 **열지 못한다**. 그러면 일반 앱에서는
+    // 멀쩡한데 UWP 앱에서만 입력기가 목록에 뜨지 않는다(자모통 아이콘조차 안 보인다).
+    // `C:\Program Files` 는 상속으로 이미 갖고 있지만 임의 폴더와 `%LocalAppData%`(사용자별 설치
+    // 자리)는 아니다 — 그래서 설치 방식과 무관하게 **등록 시점에** 보장한다. 실기 2026-09-19/20.
+    {
+        WCHAR dir[MAX_PATH];
+        wcsncpy(dir, szModule, MAX_PATH - 1);
+        dir[MAX_PATH - 1] = L'\0';
+        WCHAR *slash = wcsrchr(dir, L'\\');
+        if (slash) { *slash = L'\0'; Config_GrantAppContainerRead(dir); }
+    }
+
+    // Register CLSID — 값 쓰기까지 확인한다(W1-04). 실패하면 만든 키를 지우고 실패를 돌려준다.
+    if (RegCreateKeyExW(HKEY_CLASSES_ROOT, c_szInfoKeyPrefix, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) return E_FAIL;
+    LONG rc = RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)c_szDescription, (DWORD)(wcslen(c_szDescription) + 1) * sizeof(WCHAR));
+    if (rc == ERROR_SUCCESS)
+        rc = RegCreateKeyExW(hKey, c_szInprocServer32, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hSubKey, NULL);
+    if (rc == ERROR_SUCCESS) {
+        rc = RegSetValueExW(hSubKey, NULL, 0, REG_SZ, (const BYTE*)szModule, (DWORD)(wcslen(szModule) + 1) * sizeof(WCHAR));
+        if (rc == ERROR_SUCCESS)
+            rc = RegSetValueExW(hSubKey, L"ThreadingModel", 0, REG_SZ, (const BYTE*)c_szModelName, (DWORD)(wcslen(c_szModelName) + 1) * sizeof(WCHAR));
+        RegCloseKey(hSubKey);
+    }
+    RegCloseKey(hKey);
+    if (rc != ERROR_SUCCESS) {   // InprocServer32 없이는 등록이 무의미 — 실패를 숨기지 않는다 (RFC-0004 P1-5)
+        RegisterRollback(false, false);
+        return HRESULT_FROM_WIN32((DWORD)rc);
+    }
+
+    // TSF 프로파일/카테고리 등록 실패를 regsvr32에 그대로 노출 — "설치 성공인데 IME가 안 보임"이
+    // 설치 시점에 드러나게 한다 (RFC-0004 P1-5). 실패하면 앞 단계를 역순으로 지운다 (W1-04).
+    HRESULT hr = RegisterProfiles();
+    if (FAILED(hr)) { RegisterRollback(true, false); return hr; }
+    hr = RegisterCategories();
+    if (FAILED(hr)) { RegisterRollback(true, true); return hr; }
+
+    return S_OK;
+}
+
+// RFC-0008 W1-05: 해제는 끝까지 시도하되, "원래 없었다"와 실제 실패를 구분해 돌려준다 —
+// 권한 부족 등으로 남은 등록을 설치 스크립트가 "제거됨"으로 믿지 않게.
+STDAPI DllUnregisterServer(void) {
+    // 시작 때 CLSID 키가 없었으면 "원래 없음" — 정리만 시도하고 성공으로 본다(프로필 해제가 이미 없는
+    // 등록에 무엇을 돌려주는지는 실측하지 않았다).
+    HKEY probe = NULL;
+    bool existed = RegOpenKeyExW(HKEY_CLASSES_ROOT, c_szInfoKeyPrefix, 0, KEY_READ, &probe) == ERROR_SUCCESS;
+    if (probe) RegCloseKey(probe);
+    HRESULT first = S_OK;
+    HRESULT hr = UnregisterProfiles();
+    if (FAILED(hr) && first == S_OK) first = hr;
+    hr = UnregisterCategories();
+    if (FAILED(hr) && first == S_OK) first = hr;
+
+    // Unregister CLSID
+    LONG rc = RegDeleteTreeW(HKEY_CLASSES_ROOT, c_szInfoKeyPrefix);
+    if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND && first == S_OK) first = HRESULT_FROM_WIN32((DWORD)rc);
+    return existed ? first : S_OK;
+}

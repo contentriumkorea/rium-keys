@@ -1,0 +1,126 @@
+#pragma once
+#include <stdbool.h>
+#include <wchar.h>
+
+// ── 사전 파일 (RFC-0016 P5, 오너 결정 2026-09-23) ──────────────────────────────────
+// 자판 파일(.jmt)은 규칙만 갖고, 변환 자료는 따로 구운 사전 파일(.jdb)이 갖는다.
+// 사전은 **읽기 전용 이진**이다: 열 때 통째로 메모리 매핑하고, 정렬된 키를 이진 탐색으로 찾는다.
+//   - 열기 비용이 0 에 가깝다 (파싱이 없다). 입력기 DLL 은 텍스트를 쓰는 모든 프로세스에 로드되므로
+//     같은 사전이 물리 메모리 한 벌로 공유되는 것이 중요하다.
+//   - 10만 항목이 비교 17번. 접두 최장 일치 하나만 하면 되므로 SQL 엔진은 필요 없다.
+//   - 남이 준 파일일 수 있다 → 열 때 머리부와 색인의 범위를 전부 검사하고, 그 뒤로는 범위 밖을
+//     읽지 않는다. 내용(키/값 바이트)은 훑지 않는다 — 깨져 있으면 결과가 틀릴 뿐 죽지 않는다.
+//
+// 파일 구조 (리틀엔디안, 머리부 64바이트):
+//   magic "JMTDICT\0" | formatVersion | kind | count | offIndex | offKeys | offVals |
+//   keyBytes | valBytes | maxKeyLen | maxValLen | flags | crc32 | fileSize | reserved
+//   색인   count x 12바이트 {u32 keyOff, u32 valOff, u16 keyLen, u16 valLen} — 키 오름차순
+//   키블록 UTF-8 바이트, 값블록 UTF-16LE (런타임이 변환하지 않는다)
+//   이름/라이선스 문자열은 값블록 뒤 꼬리에 UTF-16LE 로 붙는다.
+// 판 2 (오너 결정 A8, 2026-09-24): **후보 사전의 읽기**를 UTF-8 96바이트까지 (가나·한글 32자쯤).
+// 친 쪽(순차 사전)은 그대로 32바이트다. 파일에 적는 판은 **그 파일이 실제로 필요로 하는 판**이다 —
+// 32바이트를 넘는 키가 하나도 없으면 판 1 로 적어, 옛 자모통도 그대로 읽는다. 옛 자모통이 판 2 를
+// 만나면 "더 새 판" 이라고 분명히 거절한다(0.40.0 교훈: 본문이 바뀌면 판을 반드시 올린다).
+// 판 3 (2026-10-02, 중국어 이어 치기): **후보 사전의 항목마다 비용**(u16, 작을수록 흔하다)을 꼬리 뒤에 붙일 수 있다
+// (flags bit1). 엔진은 이것으로 읽기를 낱말로 가르는 가장 그럴듯한 길을 고른다(SeqKb_Convert). 비용이 없는
+// 사전은 예전 판으로 적어, 옛 자모통도 그대로 읽는다.
+// 판 4 (2026-10-04, RFC-0022 일본어): 후보 사전의 항목마다 **품사**(왼쪽·오른쪽 id, 각 u16)를 비용 뒤에 붙일 수 있다(flags bit2).
+// 엔진은 연결 비용 파일(.jdc)과 함께 품사 사이의 비용을 더해 문장을 가른다. 품사가 없는 사전은 예전 판으로 적는다.
+#define JDICT_FORMAT_VERSION 4
+#define JDICT_FORMAT_MIN     1
+#define JDICT_FLAG_ASCII_KEYS 1u   // 키가 전부 ASCII (순차 사전)
+#define JDICT_FLAG_COSTS      2u   // 항목마다 비용 (판 3)
+#define JDICT_FLAG_POS        4u   // 항목마다 품사 lid·rid (판 4, 비용과 함께만)
+#define JDICT_MAX_COST        65535
+#define JDICT_KIND_SEQUENCE  1
+// 후보 사전 (RFC-0016 §6.4): 읽기 하나에 후보가 여럿이다 — **같은 키가 여러 줄** 올 수 있고,
+// 원본에 적은 차례가 후보의 차례다. 순차 사전과 달리 중복이 오류가 아니다.
+#define JDICT_KIND_CANDIDATES 2
+#define JDICT_MAX_KEY        32    // 친 글자열 (순차 사전, ASCII 바이트)
+#define JDICT_MAX_KEY_CANDIDATES 96 // 읽기 (후보 사전, UTF-8 바이트 — 가나·한글 서른두 자쯤)
+// 한 사전의 항목 수 한도. 고를 때 파일 전체를 한 번 훑으므로(검사합·차례) 무한정 크면 안 된다 —
+// 50만 항목이면 10MB 안쪽이고 점검이 수십 ms 다.
+#define JDICT_MAX_ENTRIES    500000
+#define JDICT_MAX_VALUE      64    // 낼 글자 (UTF-16 부호단위)
+
+typedef enum JDictError {
+    JDICT_OK = 0,
+    JDICT_E_OPEN,       // 파일을 열지 못했다 (없거나 권한)
+    JDICT_E_MAGIC,      // 사전 파일이 아니다
+    JDICT_E_VERSION,    // 더 새 판 — 이 자모통이 못 읽는다
+    JDICT_E_LAYOUT,     // 머리부/색인이 파일 크기와 맞지 않는다 (잘림·조작)
+    JDICT_E_CRC,        // 내용이 굽던 때와 다르다 (전수 점검에서만)
+    JDICT_E_ORDER,      // 키가 오름차순이 아니다 (전수 점검에서만)
+    JDICT_E_KEY,        // 이 종류가 쓸 수 없는 키 글자 (전수 점검에서만)
+    JDICT_E_MEMORY
+} JDictError;
+
+// 값은 파일에 UTF-16LE 로 들어 있다. Windows 의 wchar_t 와 같은 폭이지만, 폭이 다른 곳(네이티브
+// 시험)에서도 같은 코드가 돌도록 16비트 단위로 명시한다. 값을 쓸 때는 JDict_CopyValue 로 옮긴다.
+typedef unsigned short jdchar;
+
+typedef struct JDict JDict;
+
+// 이 종류의 사전이 받는 키 길이(UTF-8 바이트). 컴파일러·로더·변환기가 같은 답을 쓴다.
+int JDict_MaxKeyBytes(int kind);
+
+// 사전을 열어 매핑한다. 실패하면 NULL 이고 *err 에 이유. path 는 이미 해석된 전체 경로.
+// 가벼운 열기 (RFC-0020 F3, 입력기 DLL 이 처음에 한 번): 열 때 색인을 전수로 훑지 않는다. 항목의 범위는 읽을 때마다
+//   본다(메모리 안전은 같다). 전수 점검(JDict_Verify)은 도구·시험이 한다.
+void JDict_SetLightOpen(bool on);
+JDict *JDict_Open(const wchar_t *path, JDictError *err);
+void   JDict_Close(JDict *d);
+
+int            JDict_Count(const JDict *d);
+int            JDict_Kind(const JDict *d);
+int            JDict_MaxKeyLen(const JDict *d);
+const wchar_t *JDict_Name(const JDict *d);
+const wchar_t *JDict_License(const JDict *d);
+const wchar_t *JDict_ErrorText(JDictError e);
+
+// 전수 점검 (오너 지시 2026-09-23: 자판을 고를 때 사전 데이터까지 보고 성한 것만 쓴다).
+//   머리부 뒤 전체의 crc32, 키 오름차순, 키 글자 범위를 확인한다. 파일 전체를 읽으므로 자판을
+//   목록에 올리거나 켤 때 한 번만 부른다 — 치는 동안에는 부르지 않는다.
+bool JDict_Verify(const JDict *d, JDictError *err);
+// 파일이 쓰는 검사합 (CRC-32/IEEE). 컴파일러와 로더가 같은 구현을 쓴다.
+unsigned JDict_Crc32(const void *data, unsigned long len);
+
+// 정확히 같은 키가 있는가. val/valLen 은 NULL 을 넘겨도 된다. val 은 매핑 안을 가리키며
+// (NUL 종단이 아니다) 사전이 닫힐 때까지 유효하다.
+bool JDict_Exact(const JDict *d, const wchar_t *key, const jdchar **val, int *valLen);
+// 찾은 값을 wchar_t 버퍼로 옮긴다 (NUL 종단). 자리가 모자라면 -1, 아니면 옮긴 부호단위 수.
+int  JDict_CopyValue(const jdchar *val, int valLen, wchar_t *out, int cap);
+// key 로 시작하면서 key 보다 긴 항목이 있는가 (엔진의 "더 기다릴까" 판정).
+bool JDict_HasLonger(const JDict *d, const wchar_t *key);
+// 후보 사전에서 그 읽기의 후보 범위 (first..first+count). 없으면 false.
+//   키는 순차 사전과 달리 ASCII 가 아니어도 된다(가나·한글 읽기).
+bool JDict_Candidates(const JDict *d, const wchar_t *key, int *first, int *count);
+// 후보 하나 (JDict_Candidates 가 준 범위 안의 자리).
+bool JDict_CandidateAt(const JDict *d, int index, const jdchar **val, int *valLen);
+// 그 자리의 비용 (판 3, 작을수록 흔하다). 비용이 없는 사전이거나 범위 밖이면 -1.
+int  JDict_CostAt(const JDict *d, int index);
+// 이어질 낱말 (추천 단어, 2026-10-02): 키가 key 로 **시작하고 더 긴** 항목 중 가장 싼 것 max 개의 자리를 싼 차례로
+//   out 에 담고 그 수를 돌려준다. 키 차례로 이어진 구간을 scanLimit 개까지만 본다(짧은 읽기도 빨리 끝나게).
+//   비용이 없는 사전은 키 차례(그 안에서는 원본 차례) 그대로 앞의 max 개.
+int  JDict_Completions(const JDict *d, const wchar_t *key, int *out, int max, int scanLimit);
+bool JDict_HasCosts(const JDict *d);
+// 품사 (판 4, RFC-0022): 그 자리의 왼쪽·오른쪽 품사 id. 품사가 없는 사전이거나 범위 밖이면 false.
+bool JDict_HasPos(const JDict *d);
+bool JDict_PosAt(const JDict *d, int index, int *lid, int *rid);
+
+// 연결 비용 파일 (.jdc, RFC-0022 일본어): 품사 rid 뒤에 lid 가 올 때의 비용. 매핑해 두고 범위를 보며 읽는다.
+//   verify = 머리 뒤 전부의 crc 를 본다(도구·시험). 입력기는 가볍게 연다.
+typedef struct JConn JConn;
+JConn *JConn_Open(const wchar_t *path, bool verify, JDictError *err);
+void   JConn_Close(JConn *c);
+int    JConn_Ids(const JConn *c);
+int    JConn_Cost(const JConn *c, int rid, int lid);   // 범위 밖이면 가장 비싼 값
+// 품사 종류 (.jdc 판 2, 0.73.0 문절 편집): 낱말을 문절로 묶는 데 쓴다. 판 1 파일·범위 밖이면 0.
+#define JCONN_CLASS_FUNC   1   // 앞 낱말에 붙는다: 조사·조동사·비자립 동사/형용사·접미·닫는 문장부호
+#define JCONN_CLASS_PREFIX 2   // 뒤 낱말이 붙는다: 접두사
+bool   JConn_HasClass(const JConn *c);
+int    JConn_Class(const JConn *c, int id);
+
+// buf 의 앞부분과 맞는 가장 긴 항목. 찾으면 *keyLen 에 그 길이, val/valLen 에 값.
+bool JDict_LongestPrefix(const JDict *d, const wchar_t *buf, int *keyLen,
+                         const jdchar **val, int *valLen);

@@ -1,0 +1,216 @@
+#pragma once
+
+#define COBJMACROS
+#define CINTERFACE
+#include <windows.h>
+#include <msctf.h>
+#include <olectl.h>
+#include "fsm.h"
+#include "config.h"
+#include "langbar.h"
+#include "display_attr.h"
+#include "chord.h"
+#include "chord_layout.h"
+#include "seq_layout.h"
+
+// RIUM Keys fork identity. Never register over upstream Jamotong.
+DEFINE_GUID(CLSID_JamotongIME, 
+0xe1985813, 0x4fa4, 0x4b93, 0x8e, 0xf4, 0xf8, 0xee, 0x77, 0x77, 0xe2, 0x91);
+
+// RIUM Keys profile: {EA007E57-6806-4596-BB29-88EBFBC620B5}
+DEFINE_GUID(GUID_Profile_Jamotong, 
+0xea007e57, 0x6806, 0x4596, 0xbb, 0x29, 0x88, 0xeb, 0xfb, 0xc6, 0x20, 0xb5);
+
+// ── ITfFnConfigure / ITfFunction (이 MinGW의 msctf.h엔 없어 최소 vtbl 직접 선언) ──
+//   Windows 언어 설정의 IME "옵션" 버튼이 이 인터페이스의 Show()를 호출해 설정창을 연다.
+//   ITfFnConfigure : ITfFunction : IUnknown (GetDisplayName은 ITfFunction, Show는 ITfFnConfigure).
+typedef struct ITfFnConfigure ITfFnConfigure;
+typedef struct ITfFnConfigureVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ITfFnConfigure*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(ITfFnConfigure*);
+    ULONG   (STDMETHODCALLTYPE *Release)(ITfFnConfigure*);
+    HRESULT (STDMETHODCALLTYPE *GetDisplayName)(ITfFnConfigure*, BSTR*);
+    HRESULT (STDMETHODCALLTYPE *Show)(ITfFnConfigure*, HWND, LANGID, REFGUID);
+} ITfFnConfigureVtbl;
+struct ITfFnConfigure { const ITfFnConfigureVtbl *lpVtbl; };
+extern const GUID IID_ITfFnConfigure_J;   // {88f567c6-1757-49f8-a1b2-89234c1eeff9}
+extern const GUID IID_ITfFunction_J;      // {101d6610-0990-11d3-8df0-00105a2799b5}
+
+// ITfTextInputProcessorEx vtbl — 부모(ITfTextInputProcessor) 5 + ActivateEx (★상속 순서 고정, T009/T010 선례).
+// mingw msctf.h 에 타입이 없어 직접 선언. self 인자는 기존 캐스트((ITfTextInputProcessor*)obj)와의
+// 호환을 위해 ITfTextInputProcessor* 로 둔다 (COM 이진 배치는 동일).
+typedef struct {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ITfTextInputProcessor*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(ITfTextInputProcessor*);
+    ULONG   (STDMETHODCALLTYPE *Release)(ITfTextInputProcessor*);
+    HRESULT (STDMETHODCALLTYPE *Activate)(ITfTextInputProcessor*, ITfThreadMgr*, TfClientId);
+    HRESULT (STDMETHODCALLTYPE *Deactivate)(ITfTextInputProcessor*);
+    HRESULT (STDMETHODCALLTYPE *ActivateEx)(ITfTextInputProcessor*, ITfThreadMgr*, TfClientId, DWORD);
+} JamoTIPExVtbl;
+
+// preserved key 등록 항목 (RFC-0013 C — preserved.c)
+#define JAMO_PRESERVED_MAX 32   // 기능 4종 × 단축키 최대 8
+typedef struct { GUID guid; int fn; TF_PRESERVEDKEY key; } JamoPreservedEntry;
+
+// Text Service Instance Struct
+
+// 이 툴체인의 msctf.h 에는 ITfTextLayoutSink 가 없다 — COM ABI 그대로 직접 선언한다.
+// (문서 배치 변화 통지: 캐럿·줄 배치가 바뀔 때 온다. light dismiss 에 쓴다 — B10)
+typedef struct ITfTextLayoutSink ITfTextLayoutSink;
+typedef struct ITfTextLayoutSinkVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ITfTextLayoutSink *This, REFIID riid, void **ppv);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(ITfTextLayoutSink *This);
+    ULONG   (STDMETHODCALLTYPE *Release)(ITfTextLayoutSink *This);
+    HRESULT (STDMETHODCALLTYPE *OnLayoutChange)(ITfTextLayoutSink *This, ITfContext *pic,
+                                                TsLayoutCode lcode, ITfContextView *pView);
+} ITfTextLayoutSinkVtbl;
+struct ITfTextLayoutSink { ITfTextLayoutSinkVtbl *lpVtbl; };
+
+typedef struct JamotongTextService {
+    JamoTIPExVtbl *lpVtblTIP;   // ITfTextInputProcessor(Ex) — 부모 5개가 앞이라 기존 캐스트 그대로 유효
+    ITfKeyEventSinkVtbl *lpVtblKES;                     // 키 입력(ITfKeyEventSink)
+    const ITfDisplayAttributeProviderVtbl *lpVtblDAP;   // 디스플레이 속성 공급자(RFC-0010 인라인 조합 밑줄)
+    ITfFunctionProviderVtbl *lpVtblFuncProv;            // 함수 공급자(설정 옵션 노출)
+    const ITfFnConfigureVtbl *lpVtblFnConfig;           // "옵션" 버튼 → 설정창
+    ITfThreadMgrEventSinkVtbl *lpVtblTMES;              // 문서 포커스 추적(문서 '관여')
+    ITfTextEditSinkVtbl *lpVtblTES;                     // 포커스 문서 텍스트편집 싱크
+    ITfTextLayoutSinkVtbl *lpVtblTLS;                   // 문서 배치(캐럿 자리) 싱크 — light dismiss (B10)
+    LONG refCount;
+    ITfThreadMgr *threadMgr;
+    TfClientId clientId;
+    DWORD activateFlags;   // ActivateEx 로 받은 플래그 (Activate 경유면 0)
+    ITfUIElementMgr *uiElemMgr;   // UI element 게이트 (RFC-0012 Phase 3, ui_element.c). 없으면 기존 동작
+    TfGuidAtom daAtom;   // registered atom for GUID_JamotongComposingDA
+    DWORD tmesCookie;    // ThreadMgrEventSink advise 쿠키
+    DWORD tesCookie;     // TextEditSink advise 쿠키
+    DWORD tlsCookie;     // TextLayoutSink advise 쿠키 (같은 컨텍스트에 함께 붙인다)
+    ITfContext *pTESContext;   // TextEditSink이 붙은 현재 컨텍스트
+
+    // 조합 미리보기 오버레이(RFC-0002)용: 마지막 편집 세션에서 얻은 캐럿 화면 rect.
+    //   편집 세션(동기) 안에서 GetTextExt로 기록 → OutputResult가 세션 반환 직후 읽음(입력 스레드 전용).
+    RECT lastCaretRect;
+    // 후보창을 띄울 때의 캐럿 자리. 문서 배치가 바뀌었을 때 "캐럿이 옮겨졌는가"를 이걸로 판정한다
+    // (light dismiss, B10). 후보창이 없으면 뜻이 없다.
+    RECT candAnchorRect;
+    BOOL candAnchorValid;
+    BOOL lastCaretValid;
+    // CUAS 낡은 좌표 보정용: 직전에 칩을 그린 '원시' rect. CUAS는 비동기 삽입 때문에
+    // GetTextExt/캐럿이 한 키 늦게 전진한다 — 커밋이 있었는데 rect가 그대로면 낡은 것.
+    RECT prevChipRect;
+    BOOL prevChipValid;
+    int  chipPendingAdv;   // 낡은 rect가 여러 키 지속(빠른 타이핑)될 때의 누적 보정 폭(px)
+
+    // ── RFC-0010 문서 인라인 표준 composition (비단명 컨텍스트, comp_inline.c) ──
+    const ITfCompositionSinkVtbl *lpVtblCompSink;   // 외부 종료 통지 sink
+    ITfComposition *pComposition;   // 활성 문서 composition (입력 스레드 전용)
+    ITfContext *pCompContext;       // composition 소유 컨텍스트 (AddRef 보유)
+    ITfContext *pPathContext;       // 경로 판정 캐시 대상 (weak — 포인터 비교 전용)
+    int  pathKind;                  // JamoPathKind (pPathContext에 대한 판정)
+    int  pathDemerits;              // 갱신 생존 없는 연속 외부 종료 카운트 (강등용)
+    BOOL compUpdatedOnce;           // 현 composition이 갱신에서 생존했는가 (강등 리셋 근거)
+
+    // 무간섭(직접 입력) 모드 — 원격 데스크톱 등에서 해제 단축키 외 모든 키를 통과.
+    // TIP 인스턴스는 프로세스별이므로 상태의 원본은 HKCU 레지스트리이고(프로세스 간 공유),
+    // 이 필드는 캐시다(포커스 변경·토글 시 재읽기 — text_service.c).
+    BOOL passthrough;
+
+    // ── RFC-0008 W1-09: 조합을 시작한 대상 — 포커스를 떠날 때 남은 음절을 여기에 확정한다 ──
+    HWND compTargetHwnd;           // 조합 시작 때 포커스였던 EDIT 창 (EDIT 계열이 아니면 NULL)
+    ITfContext *compTargetCtx;     // 조합 시작 때 문맥 (AddRef 보유)
+
+    // ── RFC-0012 Phase 1 compartment (compartment.c) — 한/영 상태의 표준 자리 ──
+    ITfCompartmentEventSinkVtbl *lpVtblCES;   // OPENCLOSE 변경 통지 sink
+    ITfCompartment *cpOpenClose;   // GUID_COMPARTMENT_KEYBOARD_OPENCLOSE (thread mgr 스코프)
+    ITfCompartment *cpConvMode;    // GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION
+    DWORD cpCookie;                // OPENCLOSE advise 쿠키
+    DWORD cpCookieConv;            // INPUTMODE_CONVERSION advise 쿠키 (한/A 표시기는 이쪽을 바꿀 수 있다)
+    wchar_t cpPendingCommit;       // 확정 못 한 음절(0=없음) — 그 대상으로 돌아와 키를 칠 때 한 번 재시도 (RFC-0008 W1-09)
+    HWND cpPendingHwnd;            // 보류 대상 EDIT 창 (없으면 NULL)
+    ITfContext *cpPendingCtx;      // 보류 대상 문맥 (AddRef 보유; NULL = 아무 문맥)
+    long  cpLastOpen, cpLastConv;  // 마지막으로 발행/수용한 값 (-1 = 아직 없음). 같으면 안 쓴다.
+    BOOL  cpSelfWrite;             // 우리가 쓰는 중 — OnChange 메아리 무시
+    BOOL  ctxKeyboardDisabled;     // 포커스 문맥의 KEYBOARD_DISABLED (앱이 입력기를 껐다) 캐시
+
+    // ── RFC-0013 C preserved key (preserved.c) ──
+    JamoPreservedEntry preserved[JAMO_PRESERVED_MAX];
+    int preservedCount;
+
+    // Config & Engine State
+    JamotongConfig config;
+    FsmContext fsm;
+    ChordContext chord;       // 모아치기(동시치기) 상태 (Moachigi=1 한글 자판)
+    ChordKbContext chordKb;   // 일반 코드 자판(ARTSEY류) 상태
+    SeqState seqKb;           // 순차 변환 자판(로마자→가나류) 보류 입력 (RFC-0016 §6.3)
+
+    // UI Elements
+    JamotongLangBarItem *pLangBarItem;
+
+    // ── 입력 세션 상태 (RFC-0008 W0-03) ────────────────────────────────────────────
+    // TIP 은 텍스트를 쓰는 모든 프로세스에, 한 프로세스 안에서도 입력 스레드마다 하나씩
+    // 만들어진다. "지금 무엇을 입력 중인가"를 파일 전역에 두면 인스턴스끼리 서로 덮고,
+    // 해제된 인스턴스를 가리키는 포인터가 남는다. 그래서 여기(인스턴스)가 소유자다.
+    // UI **창**은 프로세스당 하나가 자연스러우므로 옮기지 않는다(S2 에서 소유 스레드만 명시).
+    struct {                     // 한자 후보 선택 콜백이 쓰는 문맥
+        ITfContext *pic;
+        wchar_t word[32];        // 변환 대상 원문 (EDIT 선택 검증용)
+        bool fromSelection;      // 블록 선택에서 온 변환
+        HWND targetHwnd;         // 한자키 시점의 대상 EDIT
+    } candCtx;
+    struct {                     // UWP 폴백: 한자키를 거듭 눌러 후보 순환 (RFC-0015 이전 경로)
+        bool active;
+        wchar_t **cands;         // 사전이 소유하는 불변 배열
+        int count, idx;
+        HWND targetHwnd;
+        wchar_t applied[8];
+    } hanjaCycle;
+    struct {                     // 헬퍼가 그리는 후보창의 키 라우팅 상태 (RFC-0015)
+        bool active;
+        wchar_t **cands;
+        int count, sel, perPage, replaceLen;
+    } uiCand;
+    struct {                     // 헬퍼가 그리는 코드입력 줄 (RFC-0015 Phase 2)
+        bool active;
+        int x, y, caretTop;
+    } uiCode;
+} JamotongTextService;
+
+#include <stddef.h>
+#define IMPL_TO_OBJ(InterfaceName, pThis) \
+    ((JamotongTextService*)((char*)(pThis) - offsetof(JamotongTextService, lpVtbl##InterfaceName)))
+
+HRESULT JamotongTextService_Create(IUnknown *pUnkOuter, REFIID riid, void **ppvObject);
+
+
+// 무간섭(직접 입력) 모드 — text_service.c. 상태 원본=HKCU\Software\Jamotong\Passthrough.
+BOOL Jamotong_GetPassthroughReg(void);                             // 레지스트리 읽기
+void Jamotong_SetPassthrough(JamotongTextService *obj, BOOL on);   // 조합 정리+레지스트리+발행
+
+// 밖(compartment 통지 등)에서 자판이 바뀌었을 때의 공통 뒤처리: 조합 경계 정리 + 언어바. (text_service.c)
+// 키 이벤트 밖에서 자판을 바꾸기 **전에** 조합 중 음절을 확정·정리한다 (언어바 버튼 클릭·compartment 통지).
+// 실기 2026-08-23: 트레이의 한/A 칩 = 우리 언어바 버튼이고, 그 클릭은 0.16.2 부터 확정 없이 Rotate 만 했다.
+void Jamotong_PendingClear(JamotongTextService *obj);   // 보류 음절과 그 대상 참조를 비운다
+void Jamotong_FlushForExternalSwitch(JamotongTextService *obj);
+void Jamotong_OnLayoutSwitched(JamotongTextService *obj);
+
+// 함수 공급자/설정(ITfFnConfigure) — func_configure.c
+void    FuncConfig_Init(JamotongTextService *obj);       // vtbl 포인터 설정 (Create에서)
+HRESULT FuncConfig_Advise(JamotongTextService *obj);     // Activate에서 (in-session 노출)
+void    FuncConfig_Unadvise(JamotongTextService *obj);   // Deactivate에서
+
+// Registration Functions
+HRESULT RegisterProfiles(void);
+HRESULT UnregisterProfiles(void);
+HRESULT RegisterCategories(void);
+HRESULT UnregisterCategories(void);
+
+// Class Factory
+typedef struct JamotongClassFactory {
+    IClassFactoryVtbl *lpVtbl;
+    LONG refCount;
+} JamotongClassFactory;
+
+// Global instance count to manage DLL unloading
+extern LONG g_DllRefCount;
+#include "jamo_class.h"   // RFC-0008 W2-05 창 클래스 등록/해제
+
+// g_configLock은 config.h에 선언 (config.c도 접근).

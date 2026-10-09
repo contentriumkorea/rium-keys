@@ -1,0 +1,1058 @@
+#include "config.h"
+#ifdef _WIN32
+#include <sddl.h>     // ConvertStringSidToSidW
+#include <aclapi.h>   // GetNamedSecurityInfoW / SetEntriesInAclW
+#include <io.h>       // _commit (원자적 저장: 교체 전 디스크 반영, W1-06)
+#endif
+#include <windows.h>   // GetEnvironmentVariableW / CreateDirectoryW (Config_UserPath)
+#include "plugin_loader.h"
+#include "layout.h"   // KBD_DUBEOL / KBD_SEBEOL
+#include "hangul_layout.h"   // HangulLayout_Free (LAYOUT_TYPE_HANGUL_CUSTOM 소유)
+#include "chord_layout.h"    // ChordLayout_Free (LAYOUT_TYPE_CHORD 소유)
+#include "seq_layout.h"      // SeqLayout_Free (LAYOUT_TYPE_SEQUENCE 소유)
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>   // _wcsdup / free (레이아웃 name·플러그인 리소스 소유권 관리)
+
+void Config_LoadDefault(JamotongConfig *config) {
+    // 기본 레이아웃 2개 등록: 영문(패스스루) -> 한글(FSM)
+    config->layoutCount = 0;
+    
+    LayoutConfig en;
+    memset(&en, 0, sizeof(en));
+    en.type = LAYOUT_TYPE_PASSTHROUGH;
+    en.name = _wcsdup(L"en_qwerty");   // 모든 name을 heap으로 통일 → Config_Free가 균일하게 해제
+    wcscpy(en.abbrev, L"ENQW");   // 2x2 아이콘: EN/QW (비트맵 글꼴, langbar.c)
+    en.enabled = true;                  // 기본 켜짐
+    Config_AppendLayout(config, &en);
+
+    LayoutConfig dv;
+    memset(&dv, 0, sizeof(dv));
+    dv.type = LAYOUT_TYPE_STATIC_MAP;
+    Layout_FillDvorak(dv.charMap);     // 드보락 (공개 표준 ANSI)
+    dv.name = _wcsdup(L"en_dvorak");
+    wcscpy(dv.abbrev, L"ENDV");   // 2x2 아이콘: EN/DV
+    dv.enabled = false;                 // 기본 꺼짐 (설정 체크박스로 켬)
+    Config_AppendLayout(config, &dv);
+
+    LayoutConfig ko;
+    memset(&ko, 0, sizeof(ko));
+    ko.type = LAYOUT_TYPE_KOREAN_FSM;
+    ko.kbdVariant = KBD_DUBEOL;
+    ko.name = _wcsdup(L"ko_2bul");
+    wcscpy(ko.abbrev, L"KO2B");   // 2x2 아이콘: KO/2B (구 "2벌")
+    ko.enabled = true;                  // 기본 켜짐
+    Config_AppendLayout(config, &ko);
+
+    LayoutConfig ko3;
+    memset(&ko3, 0, sizeof(ko3));
+    ko3.type = LAYOUT_TYPE_KOREAN_FSM;
+    ko3.kbdVariant = KBD_SEBEOL;
+    ko3.name = _wcsdup(L"ko_3bul");   // 세벌식 최종 (표는 provisional — 실기 검증 필요)
+    wcscpy(ko3.abbrev, L"KO3B");   // 2x2 아이콘: KO/3B (구 "3벌")
+    ko3.enabled = false;                // 기본 꺼짐
+    Config_AppendLayout(config, &ko3);
+
+    // 플러그인 로더 호출 (.jmt 자동 감지) — 로드된 사용자 자판은 기본 꺼짐(enabled=false, zero-init)
+    PluginLoader_LoadAll(config);
+
+    config->currentLayoutIndex = 0; // 기본 시작: 영문 QWERTY (안전한 IME 기본값)
+    
+    // 기본 단축키 (기능별 목록)
+    memset(config->shortcuts, 0, sizeof(config->shortcuts));
+    ShortcutList *rot = &config->shortcuts[SC_FN_ROTATE];   // 자판 전환: 한/영 키, 오른쪽 Alt, Shift+Space
+    rot->count = 3;
+    rot->keys[0].vKey = VK_HANGUL; rot->keys[0].mods = 0;
+    rot->keys[1].vKey = VK_RMENU;  rot->keys[1].mods = 0;
+    rot->keys[2].vKey = VK_SPACE;  rot->keys[2].mods = SMOD_SHIFT;
+    ShortcutList *hj = &config->shortcuts[SC_FN_HANJA];     // 한자/특수문자 변환: 한자 키
+    hj->count = 1;
+    hj->keys[0].vKey = VK_HANJA; hj->keys[0].mods = 0;
+    ShortcutList *cd = &config->shortcuts[SC_FN_CODE];      // 유니코드 코드 입력: Ctrl+Alt+U
+    cd->count = 1;
+    cd->keys[0].vKey = 'U'; cd->keys[0].mods = SMOD_CTRL | SMOD_ALT;
+    ShortcutList *st = &config->shortcuts[SC_FN_SETTINGS];  // 설정 창 열기: Ctrl+Alt+K
+    st->count = 1;
+    st->keys[0].vKey = 'K'; st->keys[0].mods = SMOD_CTRL | SMOD_ALT;
+    ShortcutList *pt = &config->shortcuts[SC_FN_PASSTHROUGH];  // 무간섭(직접 입력) 모드: Ctrl+Alt+P
+    pt->count = 1;                                             // 잘 안 쓰이는 자리 — 설정·Code 와 같은 가족
+    pt->keys[0].vKey = 'P'; pt->keys[0].mods = SMOD_CTRL | SMOD_ALT;
+
+    // IME 옵션 기본값
+    config->options.fullWidth = false;
+    config->options.jamoDelete = true;         // 백스페이스 = 자소 단위 삭제
+    config->options.showPreview = true;        // 조합 미리보기 오버레이 (RFC-0002)
+    config->options.inlineComposition = true;  // 비단명 컨텍스트 문서 인라인 조합 (RFC-0010)
+    config->options.useCompartments = true;     // TSF compartment 한/영 상태 (RFC-0012 Phase 1)
+    config->options.usePreservedKeys = true;    // preserved key 명령키 (RFC-0013 C)
+    config->options.useUIElements = true;       // UI element 게이트 (RFC-0012 Phase 3)
+    config->options.useUiHelper = true;         // RFC-0015 UI 헬퍼
+    config->options.uwpHanjaCycle = true;       // UWP 후보창 미표시 대응 — 한자키 순환 변환
+    config->options.uwpOwnWindow = true;        // A9: UWP 에서도 자체 창이 먼저
+    wcscpy(config->options.previewFont, L"Malgun Gothic");
+    config->options.previewFontSize = 0;       // 0 = Auto(캐럿 높이)
+    wcscpy(config->options.candFont, L"Malgun Gothic");
+    config->options.candFontSize = 24;         // 한자 후보창 (판독성 우선 기본)
+}
+
+// 트리거 vKey가 모디파이어 키 자신이면 해당 모디파이어 비트 (자기 비트는 매칭에서 제외해야 함).
+static UINT VKToModBit(UINT vk) {
+    switch (vk) {
+        case VK_LSHIFT: case VK_RSHIFT: case VK_SHIFT:     return SMOD_SHIFT;
+        case VK_LCONTROL: case VK_RCONTROL: case VK_CONTROL: return SMOD_CTRL;
+        case VK_LMENU: case VK_RMENU: case VK_MENU:        return SMOD_ALT;
+        case VK_LWIN: case VK_RWIN:                        return SMOD_GUI;
+    }
+    return 0;
+}
+
+UINT Config_ResolveVK(WPARAM wParam, LPARAM lParam) {
+    UINT sc = (UINT)((lParam >> 16) & 0xFF);
+    BOOL ext = (BOOL)((lParam >> 24) & 1);
+    switch (wParam) {
+        case VK_SHIFT:   return (sc == 0x36) ? VK_RSHIFT : VK_LSHIFT;   // 좌우 Shift는 스캔코드로
+        case VK_CONTROL: return ext ? VK_RCONTROL : VK_LCONTROL;
+        case VK_MENU:    return ext ? VK_RMENU : VK_LMENU;
+    }
+    return (UINT)wParam;
+}
+
+UINT Config_CurrentMods(void) {
+    UINT m = 0;
+    if (GetKeyState(VK_SHIFT)   & 0x8000) m |= SMOD_SHIFT;
+    if (GetKeyState(VK_CONTROL) & 0x8000) m |= SMOD_CTRL;
+    if (GetKeyState(VK_MENU)    & 0x8000) m |= SMOD_ALT;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) m |= SMOD_GUI;
+    return m;
+}
+
+// 한 단축키가 (좌우 구분 vKey, 모디파이어 mods) 키 이벤트와 일치하는가.
+bool Config_MatchShortcut(const ShortcutKey *sk, UINT vKey, UINT mods) {
+    if (!sk->vKey) return false;
+    UINT eff = mods & ~VKToModBit(vKey);   // 트리거가 모디파이어 자신이면 자기 비트 제외
+    return sk->vKey == vKey && sk->mods == eff;
+}
+
+bool Config_IsShortcut(const JamotongConfig *config, ShortcutFn fn, UINT vKey, UINT mods) {
+    if (fn < 0 || fn >= SC_FN_COUNT) return false;
+    const ShortcutList *sl = &config->shortcuts[fn];
+    for (int i = 0; i < sl->count && i < SHORTCUTS_MAX; i++) {
+        if (Config_MatchShortcut(&sl->keys[i], vKey, mods)) return true;
+    }
+    return false;
+}
+
+void Config_RotateLayout(JamotongConfig *config) {
+    EnterCriticalSection(&g_configLock);
+    int n = config->layoutCount;
+    if (n > 0) {
+        // 다음 '켜진(enabled)' 레이아웃으로 순환. 하나만 켜져 있으면 자기 자신으로 되돌아온다.
+        for (int i = 1; i <= n; i++) {
+            int idx = (config->currentLayoutIndex + i) % n;
+            if (config->layouts[idx].enabled) { config->currentLayoutIndex = idx; break; }
+        }
+    }
+    LeaveCriticalSection(&g_configLock);
+}
+
+static bool (*g_bodyLoader)(LayoutConfig *L);
+void Config_SetBodyLoader(bool (*loader)(LayoutConfig *L)) { g_bodyLoader = loader; }
+bool Config_EnsureLayoutBody(LayoutConfig *L) {
+    if (!L || !L->bodyDeferred) return true;
+    EnterCriticalSection(&g_configLock);   // 설정 적용(다른 스레드)과 겹치지 않게
+    bool ok = true;
+    if (L->bodyDeferred) {
+        ok = g_bodyLoader && g_bodyLoader(L);
+        if (!ok) L->type = LAYOUT_TYPE_PASSTHROUGH;   // 상한 본문 — 글쇠는 응용으로
+        L->bodyDeferred = false;
+    }
+    LeaveCriticalSection(&g_configLock);
+    return ok;
+}
+
+LayoutConfig* Config_GetCurrentLayout(JamotongConfig *config) {
+    if (config->layoutCount <= 0) return NULL;
+    if (config->currentLayoutIndex < 0 || config->currentLayoutIndex >= config->layoutCount)
+        config->currentLayoutIndex = 0;   // 손상된 인덱스 방어 (OOB 방지)
+    LayoutConfig *L = &config->layouts[config->currentLayoutIndex];
+    if (L->bodyDeferred) Config_EnsureLayoutBody(L);   // 지금 자판이 될 때 본문을 읽는다 (RFC-0020 F1) — 부르는 쪽은 모두 live 다
+    return L;
+}
+
+// ── 자판 목록 배열 (RFC-0006 D3) ─────────────────────────────────────────────────────
+// 배열은 구조체가 소유한다. 늘릴 때 새 칸은 0 으로 채운다 — 파일에서 읽는 도중의 빈 칸이 쓰레기가 아니게.
+static bool Config_Reserve(JamotongConfig *config, int need) {
+    if (need <= config->layoutCap) return true;
+    int cap = config->layoutCap ? config->layoutCap : 8;
+    while (cap < need) {
+        if (cap > (1 << 20)) return false;
+        cap *= 2;
+    }
+    LayoutConfig *p = (LayoutConfig *)realloc(config->layouts, (size_t)cap * sizeof(LayoutConfig));
+    if (!p) return false;
+    memset(p + config->layoutCap, 0, (size_t)(cap - config->layoutCap) * sizeof(LayoutConfig));
+    config->layouts = p;
+    config->layoutCap = cap;
+    return true;
+}
+
+bool Config_AppendLayout(JamotongConfig *config, const LayoutConfig *layout) {
+    if (!Config_Reserve(config, config->layoutCount + 1)) return false;
+    config->layouts[config->layoutCount++] = *layout;
+    return true;
+}
+
+void Config_ReleaseLayoutArray(JamotongConfig *config) {
+    free(config->layouts);
+    config->layouts = NULL;
+    config->layoutCount = 0;
+    config->layoutCap = 0;
+}
+
+// dst 의 옛 배열은 버리고 src 를 복사한다. 자판 자원(name·HangulLayout…)의 포인터는 공유 — 소유 원칙 그대로.
+//   실패하면(메모리) dst 는 손대지 않고 false.
+bool Config_CopyShallow(JamotongConfig *dst, const JamotongConfig *src) {
+    if (dst == src) return true;
+    LayoutConfig *arr = NULL;
+    if (src->layoutCount > 0) {
+        arr = (LayoutConfig *)malloc((size_t)src->layoutCount * sizeof(LayoutConfig));
+        if (!arr) return false;
+        memcpy(arr, src->layouts, (size_t)src->layoutCount * sizeof(LayoutConfig));
+    }
+    free(dst->layouts);
+    *dst = *src;
+    dst->layouts = arr;
+    dst->layoutCap = src->layoutCount;
+    return true;
+}
+
+// ── 레이아웃 리소스 소유권 ────────────────────────────────────────────────────────
+// 원칙: 실제 리소스(플러그인 DLL/컨텍스트, heap name)는 "live" config 하나만 소유한다.
+// 설정 UI의 g_TempConfig 등 값복사본은 포인터를 공유하되 절대 해제하지 않는다. 해제는
+// (1) live 파괴 시 Config_Free, (2) 설정 적용/취소 시 reconcile에서만 일어난다.
+// 동일 리소스 판별은 name 포인터로 한다(모든 name이 유일한 heap 포인터).
+
+static void Layout_FreeResources(LayoutConfig *L) {
+    if (L->pHangulLayout) { HangulLayout_Free((HangulLayout*)L->pHangulLayout); L->pHangulLayout = NULL; }
+    if (L->pChordLayout) { ChordLayout_Free((ChordLayout*)L->pChordLayout); L->pChordLayout = NULL; }
+    if (L->pSeqLayout) { SeqLayout_Free((SeqLayout*)L->pSeqLayout); L->pSeqLayout = NULL; }
+    if (L->name) { free((void*)L->name); L->name = NULL; }
+    if (L->deferredPath) { free(L->deferredPath); L->deferredPath = NULL; }
+}
+static bool Config_HasLayout(const JamotongConfig *cfg, const LayoutConfig *L) {
+    if (!L->name) return false;
+    for (int i = 0; i < cfg->layoutCount; i++)
+        if (cfg->layouts[i].name == L->name) return true;   // 같은 리소스 = 같은 name 포인터
+    return false;
+}
+// live config의 모든 리소스 해제 (객체 파괴 시).
+void Config_Free(JamotongConfig *cfg) {
+    EnterCriticalSection(&g_configLock);
+    for (int i = 0; i < cfg->layoutCount; i++) Layout_FreeResources(&cfg->layouts[i]);
+    Config_ReleaseLayoutArray(cfg);
+    LeaveCriticalSection(&g_configLock);
+}
+// 설정 적용: edited가 떨어낸(삭제/교체) live 레이아웃의 리소스만 해제한 뒤 edited를 채택.
+void Config_ApplyEdited(JamotongConfig *live, const JamotongConfig *edited) {
+    EnterCriticalSection(&g_configLock);   // 입력 스레드의 현재-레이아웃 사용과 직렬화 → 플러그인 free 안전
+    for (int i = 0; i < live->layoutCount; i++)
+        if (!Config_HasLayout(edited, &live->layouts[i])) Layout_FreeResources(&live->layouts[i]);
+    // 설정 창이 열린 뒤에 본문을 읽은 자판(RFC-0020 F1): 편집본은 그 전에 뜬 사본이라 본문이 없다 — 이어받는다.
+    LayoutConfig *loaded = NULL; int nLoaded = 0;
+    for (int i = 0; i < live->layoutCount; i++)
+        if (live->layouts[i].deferredPath && !live->layouts[i].bodyDeferred && Config_HasLayout(edited, &live->layouts[i])) nLoaded++;
+    if (nLoaded && (loaded = (LayoutConfig *)malloc((size_t)nLoaded * sizeof(LayoutConfig))) != NULL) {
+        nLoaded = 0;
+        for (int i = 0; i < live->layoutCount; i++)
+            if (live->layouts[i].deferredPath && !live->layouts[i].bodyDeferred && Config_HasLayout(edited, &live->layouts[i]))
+                loaded[nLoaded++] = live->layouts[i];
+    } else nLoaded = 0;
+    if (!Config_CopyShallow(live, edited)) {   // 메모리가 없으면 옛 목록을 쓸 수 없다(자원을 이미 떼어 냈다) —
+        live->layoutCount = 0;                 //   빈 목록으로 두면 다음 로드가 기본값을 다시 채운다
+    }
+    for (int k = 0; k < nLoaded; k++)
+        for (int i = 0; i < live->layoutCount; i++) {
+            LayoutConfig *L = &live->layouts[i];
+            if (L->name != loaded[k].name || !L->bodyDeferred) continue;
+            L->type = loaded[k].type; L->kbdVariant = loaded[k].kbdVariant;
+            memcpy(L->charMap, loaded[k].charMap, sizeof L->charMap);
+            L->pHangulLayout = loaded[k].pHangulLayout; L->pChordLayout = loaded[k].pChordLayout; L->pSeqLayout = loaded[k].pSeqLayout;
+            L->bodyDeferred = false;
+        }
+    free(loaded);
+    // enabled 자판이 하나도 없으면 첫 자판을 켠다 — 회전이 영구히 먹통이 되는 0-enabled 상태 방어
+    // (삭제 경로 등으로 만들어질 수 있었음, RFC-0004 P0-3).
+    if (live->layoutCount > 0) {
+        bool any = false;
+        for (int i = 0; i < live->layoutCount; i++)
+            if (live->layouts[i].enabled) { any = true; break; }
+        if (!any) live->layouts[0].enabled = true;
+    }
+    // 현재 활성 자판이 꺼졌으면 켜진 첫 자판으로 이동 (꺼진 자판이 활성으로 남지 않도록)
+    if (live->layoutCount > 0 &&
+        (live->currentLayoutIndex < 0 || live->currentLayoutIndex >= live->layoutCount ||
+         !live->layouts[live->currentLayoutIndex].enabled)) {
+        for (int i = 0; i < live->layoutCount; i++)
+            if (live->layouts[i].enabled) { live->currentLayoutIndex = i; break; }
+    }
+    LeaveCriticalSection(&g_configLock);
+}
+// 설정 취소/폐기: live가 소유하지 않는(예: import로 새로 만든) edited 리소스만 해제.
+void Config_DiscardEdited(JamotongConfig *edited, const JamotongConfig *live) {
+    EnterCriticalSection(&g_configLock);
+    for (int i = 0; i < edited->layoutCount; i++)
+        if (!Config_HasLayout(live, &edited->layouts[i])) Layout_FreeResources(&edited->layouts[i]);
+    Config_ReleaseLayoutArray(edited);
+    LeaveCriticalSection(&g_configLock);
+}
+
+void Config_FreeLayoutResources(LayoutConfig *L) { Layout_FreeResources(L); }
+
+// 편집본에서 idx 자판 제거 (RFC-0004 P0-3): live가 소유하지 않은 리소스는 shift로 사라지기
+// 전에 여기서 해제한다. enabled 불변식(최소 1개)은 호출자(설정 UI)가 검사한다.
+void Config_RemoveEditedLayout(JamotongConfig *edited, int idx, const JamotongConfig *live) {
+    if (idx < 0 || idx >= edited->layoutCount) return;
+    if (!live || !Config_HasLayout(live, &edited->layouts[idx]))
+        Layout_FreeResources(&edited->layouts[idx]);
+    for (int i = idx; i < edited->layoutCount - 1; i++)
+        edited->layouts[i] = edited->layouts[i + 1];
+    edited->layoutCount--;
+}
+
+// ── UWP(AppContainer) 호스트에서 설정을 읽을 수 있게 한다 ─────────────────────────────
+// 자모통 TIP 은 호스트 프로세스 안에서 돈다. 그 호스트가 UWP 앱(작업표시줄 검색·설정 앱 등)이면
+// AppContainer 라서 %APPDATA% 아래를 **읽지 못한다** → config.ini·사용자 자판을 못 읽고 전부
+// 내장 기본값으로 동작한다(사용자가 고른 자판·단축키·옵션이 그 앱에서만 무시된다. 실기 2026-09-19).
+// 그래서 설정 폴더를 만들 때 ALL APPLICATION PACKAGES(S-1-15-2-1) 에 읽기 권한을 준다.
+// 폴더는 사용자 자신의 것이고 주는 권한은 읽기(RX)뿐이다. AppContainer 안에서 돌 때는 권한을
+// 바꿀 수 없으므로(그럴 필요도 없다) 조용히 지나간다.
+#ifdef _WIN32
+void Config_GrantAppContainerRead(const wchar_t *path) {
+    PSID sid = NULL;
+    if (!ConvertStringSidToSidW(L"S-1-15-2-1", &sid)) return;
+    PACL oldDacl = NULL, newDacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                              NULL, NULL, &oldDacl, NULL, &sd) == ERROR_SUCCESS) {
+        EXPLICIT_ACCESSW ea;
+        memset(&ea, 0, sizeof(ea));
+        ea.grfAccessPermissions = GENERIC_READ | GENERIC_EXECUTE;
+        ea.grfAccessMode = GRANT_ACCESS;
+        ea.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        ea.Trustee.ptstrName = (LPWSTR)sid;
+        if (SetEntriesInAclW(1, &ea, oldDacl, &newDacl) == ERROR_SUCCESS) {
+            SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                  NULL, NULL, newDacl, NULL);
+            LocalFree(newDacl);
+        }
+        LocalFree(sd);
+    }
+    LocalFree(sid);
+}
+#else   // 네이티브(비-Windows) 테스트 빌드: 보안 API 가 없다 — 할 일 없음
+void Config_GrantAppContainerRead(const wchar_t *path) { (void)path; }
+#endif
+
+// 사용자 설정 파일 경로: %APPDATA%\Jamotong\config.ini (디렉터리 없으면 생성).
+//   모든 TIP 인스턴스가 Create에서 이걸 로드하고, 설정창 Apply가 여기에 저장 → 세션·프로세스
+//   간 설정 공유(설정 "옵션" 버튼이 실제로 동작하려면 필수).
+bool Config_UserPath(wchar_t *out, int cch) {
+    if (!out || cch < 8) return false;
+    wchar_t appdata[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    wchar_t dir[MAX_PATH];
+    _snwprintf(dir, MAX_PATH, L"%ls\\Jamotong", appdata);
+    dir[MAX_PATH - 1] = L'\0';   // _snwprintf 잘림 시 널 종료 보장
+    CreateDirectoryW(dir, NULL);   // 이미 있으면 조용히 실패(무시)
+    Config_GrantAppContainerRead(dir);    // UWP 호스트도 설정을 읽을 수 있게 (위 주석)
+    _snwprintf(out, cch, L"%ls\\config.ini", dir);
+    out[cch - 1] = L'\0';
+    return true;
+}
+
+// 사용자 자판 저장소 %APPDATA%\Jamotong\layouts (없으면 생성). 설정창 Add가 여기로 복사하고
+// PluginLoader_LoadAll이 시작 시 자동 로드한다 (외부 .jmt 영속화, RFC-0004 P0-2).
+bool Config_UserLayoutDir(wchar_t *out, int cch) {
+    if (!out || cch < 8) return false;
+    wchar_t appdata[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    wchar_t dir[MAX_PATH];
+    _snwprintf(dir, MAX_PATH, L"%ls\\Jamotong", appdata);
+    dir[MAX_PATH - 1] = L'\0';
+    CreateDirectoryW(dir, NULL);
+    Config_GrantAppContainerRead(dir);
+    _snwprintf(out, cch, L"%ls\\layouts", dir);
+    out[cch - 1] = L'\0';
+    CreateDirectoryW(out, NULL);
+    return true;
+}
+
+// 설정 파일 [Shortcuts] 섹션의 기능별 키 이름 (ShortcutFn 인덱스)
+static const wchar_t *SC_NAMES[SC_FN_COUNT] = { L"Rotate", L"Hanja", L"Code", L"Settings", L"Passthrough" };
+
+// Windows 예약 장치 기본 이름(확장자를 붙여도 여전히 장치로 해석됨: CON.jmt → CON 장치).
+//   장치명은 '첫 점' 앞 구간이다(NUL.tar.gz 도 NUL). 그 구간 끝의 공백은 떼고 본다(CON .jmt).
+//   COM/LPT 뒤 숫자는 1~9 와 ISO 8859-1 위첨자 ¹²³ (Microsoft "Naming Files" 문서).
+static bool IsReservedDeviceBase(const wchar_t *name, size_t baseLen) {
+    static const wchar_t *dev3[] = { L"CON", L"PRN", L"AUX", L"NUL" };
+    static const wchar_t *dev4[] = { L"COM", L"LPT" };   // + 1~9 숫자
+    for (size_t i = 0; i < baseLen; i++)
+        if (name[i] == L'.') { baseLen = i; break; }
+    while (baseLen > 0 && name[baseLen - 1] == L' ') baseLen--;
+    if (baseLen == 3) {
+        for (size_t i = 0; i < 4; i++)
+            if (_wcsnicmp(name, dev3[i], 3) == 0) return true;
+    } else if (baseLen == 4 && ((name[3] >= L'1' && name[3] <= L'9') ||
+                                name[3] == L'¹' || name[3] == L'²' || name[3] == L'³')) {
+        for (size_t i = 0; i < 2; i++)
+            if (_wcsnicmp(name, dev4[i], 3) == 0) return true;
+    }
+    return false;
+}
+
+bool Config_UserDictDir(wchar_t *out, int cch) {
+    if (!out || cch < 8) return false;
+    wchar_t appdata[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    wchar_t dir[MAX_PATH];
+    _snwprintf(dir, MAX_PATH, L"%ls\\Jamotong", appdata);
+    dir[MAX_PATH - 1] = L'\0';
+    CreateDirectoryW(dir, NULL);
+    Config_GrantAppContainerRead(dir);
+    _snwprintf(out, cch, L"%ls\\dicts", dir);
+    out[cch - 1] = L'\0';
+    CreateDirectoryW(out, NULL);
+    Config_GrantAppContainerRead(out);
+    return true;
+}
+
+bool Config_MachineLayoutDir(wchar_t *out, int cch) {
+    if (!out || cch < 8) return false;
+    wchar_t base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"PROGRAMDATA", base, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    _snwprintf(out, cch, L"%ls\\Jamotong\\layouts", base);
+    out[cch - 1] = L'\0';
+    return true;
+}
+
+bool Config_MachineDictDir(wchar_t *out, int cch) {
+    if (!out || cch < 8) return false;
+    wchar_t base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"PROGRAMDATA", base, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    _snwprintf(out, cch, L"%ls\\Jamotong\\dicts", base);
+    out[cch - 1] = L'\0';
+    return true;
+}
+
+// 사전 파일 이름 (RFC-0016 P5): 자판 파일 이름과 같은 규칙, 확장자만 .jdb
+bool Config_IsSafeDictFileName(const wchar_t *name) {
+    if (!name) return false;
+    size_t n = wcslen(name);
+    if (n < 5 || _wcsicmp(name + n - 4, L".jdb") != 0) return false;
+    wchar_t alt[MAX_PATH];
+    if (n + 1 > MAX_PATH) return false;
+    wcscpy(alt, name);
+    wcscpy(alt + n - 4, L".jmt");        // 나머지 규칙(경로 구분자·장치명·점/공백)은 한 곳에서 본다
+    return Config_IsSafeLayoutFileName(alt);
+}
+
+bool Config_IsSafeLayoutFileName(const wchar_t *name) {
+    if (!name || !name[0]) return false;
+    if (wcspbrk(name, L"\\/:")) return false;   // 경로 구분자/드라이브/ADS 금지 → 상위 이동 차단
+    size_t n = wcslen(name);
+    if (n < 5) return false;                    // "x.jmt" 최소 길이
+    if (_wcsicmp(name + n - 4, L".jmt") != 0) return false;   // .jmt 확장자 강제
+                                                             //   (끝이 't'라 후행 점/공백도 자동 배제)
+    size_t base = n - 4;
+    if (IsReservedDeviceBase(name, base)) return false;   // CON.jmt/COM1.jmt 등 장치명 금지
+    // 경로 구분자가 없으므로 파일명 내부의 '..'(예: v2..jmt)는 상위 이동을 못 해 안전 → 허용.
+    //   단 basename(확장자 제외)이 점/공백뿐이면 거부('.'/'..' 등 특수 항목 트릭 방지).
+    for (size_t i = 0; i < base; i++)
+        if (name[i] != L'.' && name[i] != L' ') return true;   // 정상 문자 하나라도 있으면 안전
+    return false;
+}
+
+// [LayoutFile:name] 헤더는 ']'에서 끝난다(파서 `%127l[^]]`). 파일명에 ']'가 있으면 헤더가
+//   잘리므로, ']'와 디코딩 마커 '%'를 percent-encode 해서 실어 라운드트립 가능하게 한다.
+//   그 밖의 문자(공백·'['·유니코드 등)는 그대로 둔다.
+void Config_EncodeLayoutName(const wchar_t *in, wchar_t *out, size_t cch) {
+    static const wchar_t *hex = L"0123456789ABCDEF";
+    size_t o = 0;
+    for (size_t i = 0; in[i]; i++) {
+        if (o + 4 >= cch) break;
+        if (in[i] == L'%' || in[i] == L']') {
+            out[o++] = L'%';
+            out[o++] = hex[(in[i] >> 4) & 0xF];
+            out[o++] = hex[in[i] & 0xF];
+        } else {
+            out[o++] = in[i];
+        }
+    }
+    out[o] = L'\0';
+}
+
+static int HexDigit(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return c - L'0';
+    if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+    if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+    return -1;
+}
+
+// Config_EncodeLayoutName 의 역변환(제자리, 항상 축소되므로 안전). 임의의 %XX 를 디코드하되,
+//   결과 파일명은 반드시 Config_IsSafeLayoutFileName 으로 다시 검사한다(디코드가 만든 '\\' 등 차단).
+void Config_DecodeLayoutName(wchar_t *s) {
+    wchar_t *r = s, *w = s;
+    while (*r) {
+        int hi, lo;
+        if (r[0] == L'%' && (hi = HexDigit(r[1])) >= 0 && (lo = HexDigit(r[2])) >= 0) {
+            *w++ = (wchar_t)(hi * 16 + lo);
+            r += 3;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = L'\0';
+}
+
+static void TrimCrLf(wchar_t *str) {
+    size_t len = wcslen(str);
+    while (len > 0 && (str[len - 1] == L'\n' || str[len - 1] == L'\r')) {
+        str[len - 1] = L'\0';
+        len--;
+    }
+}
+
+// ── 원자적 파일 쓰기 (RFC-0008 W1-06) ─────────────────────────────────────────────────
+// 대상 파일을 바로 잘라 쓰면 도중 실패(디스크 가득·잠김·종료)에 설정이 반쯤 빈 채 남는다. 같은 폴더의
+// 임시 파일에 끝까지 쓰고, 쓰기·flush·디스크 반영·close 가 모두 성공했을 때만 대상과 바꾼다.
+// 실패하면 임시 파일을 지우고 원본은 그대로 둔다.
+static FILE *AtomicOpen(const wchar_t *target, wchar_t *tmp, int cch) {
+    // 임시 이름은 쓰는 쪽마다 다르다 — 업그레이드 뒤 한동안 옛 DLL(열려 있던 앱)과 새 DLL 이 같은 설정을 함께
+    //   쓴다. 이름이 같으면 한쪽이 다른 쪽의 반쯤 쓴 임시 파일을 대상으로 옮길 수 있다.
+    if (_snwprintf(tmp, cch, L"%ls.%lu-%lu.tmp", target, (unsigned long)GetCurrentProcessId(),
+                   (unsigned long)GetCurrentThreadId()) < 0) return NULL;
+    tmp[cch - 1] = L'\0';
+    return _wfopen(tmp, L"w, ccs=UTF-8");
+}
+
+static bool AtomicCommit(FILE *fp, const wchar_t *tmp, const wchar_t *target, bool replace) {
+    bool ok = !ferror(fp);
+    ok = (fflush(fp) == 0) && ok;
+    ok = (_commit(_fileno(fp)) == 0) && ok;   // 교체 전에 내용을 디스크에
+    ok = (fclose(fp) == 0) && ok;
+    if (ok) ok = MoveFileExW(tmp, target, (replace ? MOVEFILE_REPLACE_EXISTING : 0) | MOVEFILE_WRITE_THROUGH) != 0;
+    if (!ok) _wremove(tmp);
+    return ok;
+}
+
+bool Config_CopyFileAtomic(const wchar_t *src, const wchar_t *dst) {
+    wchar_t tmp[MAX_PATH + 40];
+    if (_snwprintf(tmp, MAX_PATH + 40, L"%ls.%lu-%lu.tmp", dst, (unsigned long)GetCurrentProcessId(),
+                   (unsigned long)GetCurrentThreadId()) < 0) return false;   // 쓰는 쪽마다 다른 임시 이름
+    tmp[MAX_PATH + 39] = L'\0';
+    if (!CopyFileW(src, tmp, FALSE)) { _wremove(tmp); return false; }
+    if (!MoveFileExW(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { _wremove(tmp); return false; }
+    return true;
+}
+
+static bool JoinPath(wchar_t *out, int cch, const wchar_t *dir, const wchar_t *name) {
+    int n = _snwprintf(out, cch, L"%ls\\%ls", dir, name);
+    out[cch - 1] = L'\0';
+    return n > 0 && n < cch;
+}
+
+int Config_CommitStagedLayouts(const ConfigStagedLayouts *st, const wchar_t *stagingDir, const wchar_t *storeDir) {
+    int moved = 0;
+    for (int i = 0; st && i < st->count; i++) {
+        if (!Config_IsSafeLayoutFileName(st->names[i])) continue;   // 방어 — 복원 때 이미 검사했다
+        wchar_t from[MAX_PATH], to[MAX_PATH];
+        if (!JoinPath(from, MAX_PATH, stagingDir, st->names[i]) || !JoinPath(to, MAX_PATH, storeDir, st->names[i])) continue;
+        if (MoveFileExW(from, to, MOVEFILE_WRITE_THROUGH)) moved++;   // 덮어쓰지 않는다 — 있으면 실패
+        else _wremove(from);                                          // 남은 스테이징은 치운다
+    }
+    return moved;
+}
+
+void Config_DiscardStagedLayouts(const ConfigStagedLayouts *st, const wchar_t *stagingDir) {
+    for (int i = 0; st && i < st->count; i++) {
+        wchar_t p[MAX_PATH];
+        if (JoinPath(p, MAX_PATH, stagingDir, st->names[i])) _wremove(p);
+    }
+}
+
+bool Config_StagingLayoutDir(wchar_t *out, int cch) {
+    wchar_t store[MAX_PATH];
+    if (!out || cch < 8 || !Config_UserLayoutDir(store, MAX_PATH)) return false;
+    int n = _snwprintf(out, cch, L"%ls.staging", store);
+    out[cch - 1] = L'\0';
+    if (n <= 0 || n >= cch) return false;
+    CreateDirectoryW(out, NULL);
+    return true;
+}
+
+// 사용자 자판 저장소의 모든 .jmt를 [LayoutFile:name] … [EndLayoutFile] 로 인라인 (Export용).
+static void BundleUserLayouts(FILE *fp) {
+    wchar_t dir[MAX_PATH];
+    if (!Config_UserLayoutDir(dir, MAX_PATH)) return;
+    wchar_t pat[MAX_PATH];
+    _snwprintf(pat, MAX_PATH, L"%ls\\*.jmt", dir);
+    pat[MAX_PATH - 1] = L'\0';   // _snwprintf 잘림 시 널 종료 보장
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        // 복원 시 안전한 파일명만 번들(예약 장치명 등은 복원해도 위험하므로 제외). 파서를 깨는
+        //   ']'/'%'는 아래 Config_EncodeLayoutName 이 이스케이프하므로 여기서 드롭하지 않는다.
+        if (!Config_IsSafeLayoutFileName(fd.cFileName))
+            continue;
+        wchar_t full[MAX_PATH];
+        _snwprintf(full, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+        full[MAX_PATH - 1] = L'\0';   // _snwprintf 잘림 시 널 종료 보장
+        FILE *lf = _wfopen(full, L"r, ccs=UTF-8");
+        if (!lf) continue;
+        wchar_t encName[MAX_PATH * 3];   // percent-encoding은 최대 3배
+        Config_EncodeLayoutName(fd.cFileName, encName, MAX_PATH * 3);
+        fwprintf(fp, L"\n[LayoutFile:%ls]\n", encName);
+        wchar_t line[512];
+        // 본문 각 줄 앞에 공백 마커를 붙인다 — 복원 시 첫 칸을 벗긴다. 본문 안의 '['로
+        //   시작하는 줄이 상위 config 파서의 섹션 헤더나 [EndLayoutFile] 센티넬로 오인되어
+        //   라운드트립이 깨지는 것을 막는다.
+        while (fgetws(line, 512, lf)) {
+            TrimCrLf(line);
+            fwprintf(fp, L" %ls\n", line);
+        }
+        fwprintf(fp, L"[EndLayoutFile]\n");
+        fclose(lf);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// ── 모르는 설정은 지키며 저장한다 (2026-10-02, 업그레이드 중 옛·새 DLL 공존) ───────────────────────────────
+// 업그레이드 뒤에도 열려 있던 앱에는 옛 DLL 이 남는다. 그 앱의 설정 창이 저장하면, 옛 판이 모르는 새 판의 설정이
+// 사라졌다. 그래서 저장은 지금 파일을 먼저 읽어, 이 판이 쓰지 않는 키(아는 절 안)와 모르는 절을 그대로 옮겨 적는다.
+// 이 판이 쓰는 키는 언제나 이 판의 값이 이긴다. 내보내기(다른 파일에 묶어 쓰기)에는 쓰지 않는다.
+#define KEEP_MAX 256
+typedef struct { wchar_t *line[KEEP_MAX]; int n; } KeepList;
+static const wchar_t *const kOptionKeys[] = {
+    L"FullWidth", L"JamoDelete", L"ShowPreview", L"InlineComposition", L"UseCompartments", L"UsePreservedKeys",
+    L"UseUIElements", L"UseUiHelper", L"UwpHanjaCycle", L"UwpOwnWindow", L"PreviewFontSize", L"PreviewFont",
+    L"CandFontSize", L"CandFont", NULL };
+static void KeepAdd(KeepList *k, const wchar_t *s) {
+    if (k->n < KEEP_MAX) { k->line[k->n] = _wcsdup(s); if (k->line[k->n]) k->n++; }
+}
+static void KeepFree(KeepList *k) { for (int i = 0; i < k->n; i++) free(k->line[i]); k->n = 0; }
+static bool KeyIs(const wchar_t *key, size_t klen, const wchar_t *w) { return wcslen(w) == klen && !_wcsnicmp(key, w, klen); }
+// 이 판이 그 절에 쓰는 키인가
+static bool OursLayouts(const wchar_t *key, size_t klen) {
+    if (KeyIs(key, klen, L"Count")) return true;
+    size_t i = 0;
+    while (i < klen && key[i] >= L'0' && key[i] <= L'9') i++;
+    if (i == 0 || i >= klen || key[i] != L'_') return false;
+    return KeyIs(key + i + 1, klen - i - 1, L"Type") || KeyIs(key + i + 1, klen - i - 1, L"Name") ||
+           KeyIs(key + i + 1, klen - i - 1, L"Enabled");
+}
+static bool OursShortcuts(const wchar_t *key, size_t klen) {
+    for (int f = 0; f < SC_FN_COUNT; f++) {
+        size_t nl = wcslen(SC_NAMES[f]);
+        if (klen <= nl || _wcsnicmp(key, SC_NAMES[f], nl) != 0) continue;
+        const wchar_t *t = key + nl; size_t tl = klen - nl;
+        if (KeyIs(t, tl, L"Count")) return true;
+        size_t i = 0;
+        while (i < tl && t[i] >= L'0' && t[i] <= L'9') i++;
+        if (i > 0 && (KeyIs(t + i, tl - i, L"_Key") || KeyIs(t + i, tl - i, L"_Mods"))) return true;
+    }
+    return false;
+}
+static bool OursOptions(const wchar_t *key, size_t klen) {
+    for (int i = 0; kOptionKeys[i]; i++) if (KeyIs(key, klen, kOptionKeys[i])) return true;
+    return false;
+}
+static bool OursLayoutOptions(const wchar_t *key, size_t klen) {
+    const wchar_t *dot = NULL;
+    for (size_t i = 0; i < klen; i++) if (key[i] == L'.') dot = key + i;
+    if (!dot) return false;
+    size_t tl = klen - (size_t)(dot + 1 - key);
+    return KeyIs(dot + 1, tl, L"Sentence") || KeyIs(dot + 1, tl, L"Suggest");
+}
+// keep[0..3] = [Layouts]·[Shortcuts]·[Options]·[LayoutOptions] 안의 모르는 줄, keep[4] = 모르는 절 통째로(머리 줄 포함)
+static void ReadUnknown(const wchar_t *path, KeepList keep[5]) {
+    FILE *f = _wfopen(path, L"r, ccs=UTF-8");
+    if (!f) return;
+    wchar_t line[1024];
+    int sec = -1;    // -1 = 절 밖, 0..2 아는 절, 3 모르는 절
+    while (fgetws(line, 1024, f)) {
+        size_t n = wcslen(line);
+        while (n && (line[n - 1] == L'\n' || line[n - 1] == L'\r')) line[--n] = 0;
+        if (line[0] == L'[') {
+            if (!_wcsicmp(line, L"[Layouts]")) sec = 0;
+            else if (!_wcsicmp(line, L"[Shortcuts]")) sec = 1;
+            else if (!_wcsicmp(line, L"[Options]")) sec = 2;
+            else if (!_wcsicmp(line, L"[LayoutOptions]")) sec = 3;
+            else { sec = 4; KeepAdd(&keep[4], L""); KeepAdd(&keep[4], line); }
+            continue;
+        }
+        if (sec == 4) { KeepAdd(&keep[4], line); continue; }
+        if (sec < 0 || !n || line[0] == L';' || line[0] == L'#') continue;
+        const wchar_t *eq = wcschr(line, L'=');
+        if (!eq) continue;
+        size_t klen = (size_t)(eq - line);
+        bool ours = sec == 0 ? OursLayouts(line, klen) : sec == 1 ? OursShortcuts(line, klen)
+                  : sec == 2 ? OursOptions(line, klen) : OursLayoutOptions(line, klen);
+        if (!ours) KeepAdd(&keep[sec], line);
+    }
+    fclose(f);
+}
+static void WriteKept(FILE *fp, const KeepList *k) { for (int i = 0; i < k->n; i++) fwprintf(fp, L"%ls\n", k->line[i]); }
+
+bool Config_SaveToFile(JamotongConfig *config, const wchar_t *filepath, bool bundleLayouts) {
+    KeepList keep[5];
+    memset(keep, 0, sizeof keep);
+    if (!bundleLayouts) ReadUnknown(filepath, keep);   // 옮겨 적을 모르는 설정 (내보내기는 아니다)
+    wchar_t tmp[MAX_PATH + 40];
+    FILE *fp = AtomicOpen(filepath, tmp, MAX_PATH + 40);   // W1-06: 임시 파일에 다 쓴 뒤 교체
+    if (!fp) { for (int i = 0; i < 5; i++) KeepFree(&keep[i]); return false; }
+
+    fwprintf(fp, L"[Layouts]\nCount=%d\n", config->layoutCount);
+    for (int i = 0; i < config->layoutCount; i++) {
+        fwprintf(fp, L"%d_Type=%d\n", i, config->layouts[i].type);
+        fwprintf(fp, L"%d_Name=%ls\n", i, config->layouts[i].name ? config->layouts[i].name : L"");
+        fwprintf(fp, L"%d_Enabled=%d\n", i, config->layouts[i].enabled ? 1 : 0);
+    }
+    WriteKept(fp, &keep[0]);
+    
+    // 기능별 단축키: <기능이름>Count / <기능이름><i>_Key / <기능이름><i>_Mods
+    fwprintf(fp, L"\n[Shortcuts]\n");
+    for (int f = 0; f < SC_FN_COUNT; f++) {
+        const ShortcutList *sl = &config->shortcuts[f];
+        fwprintf(fp, L"%lsCount=%d\n", SC_NAMES[f], sl->count);
+        for (int i = 0; i < sl->count && i < SHORTCUTS_MAX; i++) {
+            fwprintf(fp, L"%ls%d_Key=%u\n", SC_NAMES[f], i, sl->keys[i].vKey);
+            fwprintf(fp, L"%ls%d_Mods=%u\n", SC_NAMES[f], i, sl->keys[i].mods);
+        }
+    }
+    WriteKept(fp, &keep[1]);
+
+    fwprintf(fp, L"\n[Options]\n");
+    fwprintf(fp, L"FullWidth=%d\n", config->options.fullWidth ? 1 : 0);
+    fwprintf(fp, L"JamoDelete=%d\n", config->options.jamoDelete ? 1 : 0);
+    fwprintf(fp, L"ShowPreview=%d\n", config->options.showPreview ? 1 : 0);
+    fwprintf(fp, L"InlineComposition=%d\n", config->options.inlineComposition ? 1 : 0);
+    fwprintf(fp, L"UseCompartments=%d\n", config->options.useCompartments ? 1 : 0);
+    fwprintf(fp, L"UsePreservedKeys=%d\n", config->options.usePreservedKeys ? 1 : 0);
+    fwprintf(fp, L"UseUIElements=%d\n", config->options.useUIElements ? 1 : 0);
+    fwprintf(fp, L"UseUiHelper=%d\n", config->options.useUiHelper ? 1 : 0);
+    fwprintf(fp, L"UwpHanjaCycle=%d\n", config->options.uwpHanjaCycle ? 1 : 0);
+    fwprintf(fp, L"UwpOwnWindow=%d\n", config->options.uwpOwnWindow ? 1 : 0);
+    fwprintf(fp, L"PreviewFontSize=%d\n", config->options.previewFontSize);
+    fwprintf(fp, L"PreviewFont=%ls\n", config->options.previewFont[0] ? config->options.previewFont : L"Malgun Gothic");
+    fwprintf(fp, L"CandFontSize=%d\n", config->options.candFontSize);
+    fwprintf(fp, L"CandFont=%ls\n", config->options.candFont[0] ? config->options.candFont : L"Malgun Gothic");
+    WriteKept(fp, &keep[2]);
+
+    // 자판별 선택 — 순차 입력 자판만 (병음·가나). 이름에 '=' 는 없다(자판 이름 규칙).
+    fwprintf(fp, L"\n[LayoutOptions]\n");
+    for (int i = 0; i < config->layoutCount; i++) {
+        const LayoutConfig *L = &config->layouts[i];
+        if (L->type != LAYOUT_TYPE_SEQUENCE || !L->name || wcschr(L->name, L'=')) continue;
+        fwprintf(fp, L"%ls.Sentence=%d\n", L->name, L->optNoSentence ? 0 : 1);
+        fwprintf(fp, L"%ls.Suggest=%d\n", L->name, L->optNoSuggest ? 0 : 1);
+        fwprintf(fp, L"%ls.Punctuation=%d\n", L->name, L->optNoPunct ? 0 : 1);   // 중국어 병음 방식에서만 쓰인다
+        fwprintf(fp, L"%ls.Fuzzy=%d\n", L->name, L->optFuzzy ? 1 : 0);
+        fwprintf(fp, L"%ls.Emoji=%d\n", L->name, L->optNoEmoji ? 0 : 1);
+        fwprintf(fp, L"%ls.Tones=%d\n", L->name, L->optNoTones ? 0 : 1);
+        fwprintf(fp, L"%ls.Bar=%d\n", L->name, L->optBar ? 1 : 0);
+        fwprintf(fp, L"%ls.Keys=%ls\n", L->name, L->optKeys[0] ? L->optKeys : L"pinyin");
+    }
+    WriteKept(fp, &keep[3]);
+    WriteKept(fp, &keep[4]);   // 모르는 절 통째로
+    for (int i = 0; i < 5; i++) KeepFree(&keep[i]);
+
+    if (bundleLayouts) BundleUserLayouts(fp);   // Export: 사용자 자판 .jmt 본문 인라인
+
+    return AtomicCommit(fp, tmp, filepath, true);
+}
+
+// 설정 파일 로드 = '병합(merge)'. 파일에는 메타데이터(자판 이름/켜짐/순서·단축키·옵션)만 있다.
+//   실제 자판 리소스(charMap·HangulLayout·플러그인 포인터)는 *config(기본+플러그인 로드본)의 것을
+//   그대로 쓰고, 파일의 순서/켜짐만 이름 매칭으로 반영한다.
+//   ※ 통째 대입(*config = temp)이었던 구버전의 두 버그를 고침:
+//     (1) 기존 config의 heap name/HangulLayout 리소스가 전부 누수됐고,
+//     (2) 파일에서 온 자판은 리소스가 빈 껍데기라(드보락 charMap 소실) 실사용이 깨졌다.
+//         파일에만 있고 현재 없는 자판은 무시한다 — 옛 DLL 플러그인 자판(형식 3) 줄도 그렇게 조용히 빠진다.
+bool Config_LoadFromFile(JamotongConfig *config, const wchar_t *filepath) {
+    return Config_LoadFromFileEx(config, filepath, NULL, NULL);
+}
+
+bool Config_LoadFromFileEx(JamotongConfig *config, const wchar_t *filepath,
+                           const wchar_t *restoreDir, ConfigStagedLayouts *restored) {
+    if (restored) restored->count = 0;
+    FILE *fp = _wfopen(filepath, L"r, ccs=UTF-8");
+    if (!fp) return false;
+
+    JamotongConfig temp = {0};
+    temp.options.jamoDelete = true;   // [Options] 없는 .ini 대비 기본값
+    temp.options.showPreview = true; // 구버전 .ini 대비 기본 켜짐 (RFC-0002)
+    temp.options.inlineComposition = true;   // 구버전 .ini 대비 기본 켜짐 (RFC-0010)
+    temp.options.useCompartments = true;     // 구버전 .ini 대비 기본 켜짐 (RFC-0012 Phase 1)
+    temp.options.usePreservedKeys = true;    // 구버전 .ini 대비 기본 켜짐 (RFC-0013 C)
+    temp.options.useUIElements = true;       // 구버전 .ini 대비 기본 켜짐 (RFC-0012 Phase 3)
+    temp.options.useUiHelper = true;
+    temp.options.uwpHanjaCycle = true;       // 구버전 .ini 대비 기본 켜짐
+    temp.options.uwpOwnWindow = true;        // 구버전 .ini 대비 기본 켜짐 (A9)
+    temp.options.previewFontSize = 0;   // 기본 Auto
+    wcscpy(temp.options.previewFont, L"Malgun Gothic");
+    temp.options.candFontSize = 24;     // 구버전 .ini 대비 기본값
+    wcscpy(temp.options.candFont, L"Malgun Gothic");
+    bool haveSc[SC_FN_COUNT] = { false };   // 파일에 해당 기능 목록이 명시됐는가 (없으면 기존 유지)
+    wchar_t line[256];
+    wchar_t fontBuf[32];
+    int section = 0; // 1 = Layouts, 2 = Shortcuts, 3 = Options, 4 = LayoutOptions
+    struct { wchar_t name[64]; int sentence, suggest, punct, fuzzy, emoji, tones, bar; wchar_t keys[16]; } lopt[CONFIG_STAGED_MAX];   // -1 = 파일에 없음
+    int nlopt = 0;
+
+    // 번들 자판 복원용: 디렉터리는 한 번만 해석(섹션마다 env 읽기+CreateDirectory 반복 방지),
+    //   복원 개수는 자판 배열 크기(8)로 제한 — 적대적 config가 사용자 자판을 밀어내지 못하게.
+    wchar_t layoutDir[MAX_PATH];
+    bool haveLayoutDir;
+    if (restoreDir) {   // B8: Import 는 스테이징에 — 저장소는 Apply 때만 바뀐다
+        _snwprintf(layoutDir, MAX_PATH, L"%ls", restoreDir);
+        layoutDir[MAX_PATH - 1] = L'\0';
+        haveLayoutDir = true;
+    } else {
+        haveLayoutDir = Config_UserLayoutDir(layoutDir, MAX_PATH);
+    }
+    int lfRestored = 0;
+
+    while (fgetws(line, 256, fp)) {
+        TrimCrLf(line);
+        // [LayoutFile:name] … [EndLayoutFile] : Export 번들의 사용자 자판 본문 복원(P0-2 남은 절반).
+        //   layouts 폴더에 파일이 없을 때만 쓴다(기존 자판 덮어쓰기 방지). 다음 시작 시 자동 로드.
+        wchar_t lfName[128];
+        if (swscanf(line, L"[LayoutFile:%127l[^]]", lfName) == 1) {
+            Config_DecodeLayoutName(lfName);   // Export 의 ']'/'%' percent-encoding 복원
+            wchar_t dst[MAX_PATH];
+            wchar_t dstTmp[MAX_PATH + 40];
+            FILE *out = NULL;
+            // 파일명 안전성 검사: 신뢰 못 할 config.ini 를 Import 할 때 [LayoutFile:...] 이름은
+            //   공격자가 100% 제어한다. basename + .jmt 인 경우에만 복원 — 이 검사가 없으면
+            //   `..\..\...\Startup\evil.bat` 같은 이름으로 %APPDATA%\Jamotong\layouts 밖
+            //   (예: 시작프로그램 폴더)에 임의 파일을 심을 수 있다. 복원 개수도 CONFIG_STAGED_MAX 로
+            //   제한 — 적대적 config 가 사용자 자판 폴더를 파일로 채우지 못하게.
+            if (haveLayoutDir && lfRestored < CONFIG_STAGED_MAX && Config_IsSafeLayoutFileName(lfName)) {
+                _snwprintf(dst, MAX_PATH, L"%ls\\%ls", layoutDir, lfName);
+                dst[MAX_PATH - 1] = L'\0';   // _snwprintf 잘림 시 널 종료 보장
+                if (GetFileAttributesW(dst) == INVALID_FILE_ATTRIBUTES)   // 없을 때만 복원
+                    out = AtomicOpen(dst, dstTmp, MAX_PATH + 40);   // W1-06: 반쯤 쓴 자판을 남기지 않는다
+            }
+            // 본문은 Export 와 같은 512 버퍼로 읽어 긴 줄이 쪼개지지 않게 한다(마커 격리가
+            //   연속 청크에서 깨지는 것을 막음). 각 줄은 선두 공백 마커 — 첫 칸만 벗겨 복원.
+            //   본문에 '['로 시작하는 줄이 있어도 상위 섹션/센티넬로 오인되지 않는다.
+            wchar_t body[512];
+            while (fgetws(body, 512, fp)) {   // [EndLayoutFile]까지 본문 (있으면 파일에 씀)
+                TrimCrLf(body);
+                if (wcscmp(body, L"[EndLayoutFile]") == 0) break;
+                if (out) fwprintf(out, L"%ls\n", body[0] == L' ' ? body + 1 : body);
+            }
+            if (out && AtomicCommit(out, dstTmp, dst, false)) {   // 덮어쓰지 않는다
+                lfRestored++;
+                if (restored && restored->count < CONFIG_STAGED_MAX) {
+                    wcsncpy(restored->names[restored->count], lfName, 127);
+                    restored->names[restored->count][127] = L'\0';
+                    restored->count++;
+                }
+            }
+            section = 0;
+            continue;
+        }
+        if (wcscmp(line, L"[Layouts]") == 0) section = 1;
+        else if (wcscmp(line, L"[Shortcuts]") == 0) section = 2;
+        else if (wcscmp(line, L"[Options]") == 0) section = 3;
+        else if (wcscmp(line, L"[LayoutOptions]") == 0) section = 4;
+        else if (section == 4) {
+            // "<자판 이름>.<키>=<0|1>" — 이름에는 '.' 이 있을 수 있으므로 '=' 앞의 마지막 '.' 로 가른다
+            wchar_t *eq = wcschr(line, L'=');
+            if (eq) {
+                *eq = L'\0';
+                wchar_t *dot = wcsrchr(line, L'.');
+                if (dot && dot != line) {
+                    *dot = L'\0';
+                    int val = _wtoi(eq + 1) != 0;
+                    int k = 0;
+                    while (k < nlopt && wcscmp(lopt[k].name, line) != 0) k++;
+                    if (k == nlopt && nlopt < CONFIG_STAGED_MAX) {
+                        lstrcpynW(lopt[k].name, line, 64);
+                        lopt[k].sentence = lopt[k].suggest = lopt[k].punct = lopt[k].fuzzy = lopt[k].emoji = lopt[k].tones = lopt[k].bar = -1;
+                        lopt[k].keys[0] = L'\0';
+                        nlopt++;
+                    }
+                    if (k < nlopt) {
+                        if (!_wcsicmp(dot + 1, L"Sentence")) lopt[k].sentence = val;
+                        else if (!_wcsicmp(dot + 1, L"Suggest")) lopt[k].suggest = val;
+                        else if (!_wcsicmp(dot + 1, L"Punctuation")) lopt[k].punct = val;
+                        else if (!_wcsicmp(dot + 1, L"Fuzzy")) lopt[k].fuzzy = val;
+                        else if (!_wcsicmp(dot + 1, L"Emoji")) lopt[k].emoji = val;
+                        else if (!_wcsicmp(dot + 1, L"Tones")) lopt[k].tones = val;
+                        else if (!_wcsicmp(dot + 1, L"Bar")) lopt[k].bar = val;
+                        else if (!_wcsicmp(dot + 1, L"Keys")) {   // 이름: 소문자만 (pinyin = 온 병음)
+                            wchar_t kv[16]; int o = 0;
+                            for (const wchar_t *q = eq + 1; *q && o < 15; q++) if (*q >= L'a' && *q <= L'z') kv[o++] = *q;
+                            kv[o] = L'\0';
+                            lstrcpynW(lopt[k].keys, wcscmp(kv, L"pinyin") ? kv : L"", 16);
+                        }
+                    }
+                }
+            }
+        }
+        else if (section == 1) {
+            int count;
+            // 개수에는 제한이 없다(D3) — 다만 파일이 적은 번호는 CONFIG_FILE_LAYOUTS_MAX 안에서만 믿는다(조작된 .ini).
+            if (swscanf(line, L"Count=%d", &count) == 1)
+                temp.layoutCount = count < 0 ? 0 : (count > CONFIG_FILE_LAYOUTS_MAX ? CONFIG_FILE_LAYOUTS_MAX : count);
+            else {
+                int idx, val;
+                wchar_t nameBuf[64];
+                // 줄의 번호가 배열보다 크면 그 자리까지 늘린다(새 칸은 0). 번호 순서가 뒤섞여도 된다.
+                #define TEMP_SLOT(i) ((unsigned)(i) < CONFIG_FILE_LAYOUTS_MAX && Config_Reserve(&temp, (i) + 1))
+                if (swscanf(line, L"%d_Type=%d", &idx, &val) == 2 && TEMP_SLOT(idx)) {
+                    temp.layouts[idx].type = (LayoutType)val;
+                // %l[ 필수: C 표준상 swscanf의 %[ 는 'l' 없이는 char* 대상(glibc가 그렇게 동작).
+                // MSVCRT는 %l[ 도 wide로 동일 처리하므로 양쪽 CRT에서 안전.
+                } else if (swscanf(line, L"%d_Name=%63l[^\n]", &idx, nameBuf) == 2 && TEMP_SLOT(idx)) {
+                    free((void*)temp.layouts[idx].name);   // 중복 Name 줄이면 이전 것 해제 (누수 방지; NULL이면 no-op)
+                    temp.layouts[idx].name = _wcsdup(nameBuf);   // 균일 heap 소유 (Config_Free/reconcile가 관리)
+                } else if (swscanf(line, L"%d_Enabled=%d", &idx, &val) == 2 && TEMP_SLOT(idx)) {
+                    temp.layouts[idx].enabled = (val != 0);
+                }
+                #undef TEMP_SLOT
+            }
+        }
+        else if (section == 2) {
+            int idx, val;
+            wchar_t fmt[48];
+            bool hit = false;
+            for (int f = 0; f < SC_FN_COUNT && !hit; f++) {   // 기능별 이름: RotateCount / Rotate0_Key / ...
+                ShortcutList *sl = &temp.shortcuts[f];
+                swprintf(fmt, 48, L"%lsCount=%%d", SC_NAMES[f]);
+                if (swscanf(line, fmt, &val) == 1) {
+                    sl->count = val < 0 ? 0 : (val > SHORTCUTS_MAX ? SHORTCUTS_MAX : val);   // 배열 크기 클램프
+                    haveSc[f] = true; hit = true; break;
+                }
+                swprintf(fmt, 48, L"%ls%%d_Key=%%d", SC_NAMES[f]);
+                if (swscanf(line, fmt, &idx, &val) == 2 && (unsigned)idx < SHORTCUTS_MAX) {
+                    sl->keys[idx].vKey = (UINT)val; hit = true; break;
+                }
+                swprintf(fmt, 48, L"%ls%%d_Mods=%%d", SC_NAMES[f]);
+                if (swscanf(line, fmt, &idx, &val) == 2 && (unsigned)idx < SHORTCUTS_MAX) {
+                    sl->keys[idx].mods = (UINT)val; hit = true; break;
+                }
+            }
+            if (!hit) {   // 구형식(~v0.11): Count/0_Key/0_Mods = 자판 전환 목록
+                ShortcutList *rot = &temp.shortcuts[SC_FN_ROTATE];
+                if (swscanf(line, L"Count=%d", &val) == 1) {
+                    rot->count = val < 0 ? 0 : (val > SHORTCUTS_MAX ? SHORTCUTS_MAX : val);
+                    haveSc[SC_FN_ROTATE] = true;
+                }
+                else if (swscanf(line, L"%d_Key=%d", &idx, &val) == 2 && (unsigned)idx < SHORTCUTS_MAX) rot->keys[idx].vKey = (UINT)val;
+                else if (swscanf(line, L"%d_Mods=%d", &idx, &val) == 2 && (unsigned)idx < SHORTCUTS_MAX) rot->keys[idx].mods = (UINT)val;
+            }
+        }
+        else if (section == 3) {
+            int val;
+            // 구형식(~v0.11): [Options]의 HanjaKey/HanjaMods 단일 한자키 → 한자 목록[0]으로 승격
+            if (swscanf(line, L"HanjaKey=%d", &val) == 1) {
+                temp.shortcuts[SC_FN_HANJA].keys[0].vKey = (UINT)val;
+                if (temp.shortcuts[SC_FN_HANJA].count < 1) temp.shortcuts[SC_FN_HANJA].count = 1;
+                haveSc[SC_FN_HANJA] = true;
+            }
+            else if (swscanf(line, L"HanjaMods=%d", &val) == 1) {
+                temp.shortcuts[SC_FN_HANJA].keys[0].mods = (UINT)val;
+                if (temp.shortcuts[SC_FN_HANJA].count < 1) temp.shortcuts[SC_FN_HANJA].count = 1;
+                haveSc[SC_FN_HANJA] = true;
+            }
+            else if (swscanf(line, L"FullWidth=%d", &val) == 1) temp.options.fullWidth = (val != 0);
+            else if (swscanf(line, L"JamoDelete=%d", &val) == 1) temp.options.jamoDelete = (val != 0);
+            // (구버전 .ini의 LegacyImm= 줄은 무시됨 — 옵션 제거, 2026-07-07)
+            else if (swscanf(line, L"ShowPreview=%d", &val) == 1) temp.options.showPreview = (val != 0);
+            else if (swscanf(line, L"InlineComposition=%d", &val) == 1) temp.options.inlineComposition = (val != 0);
+            else if (swscanf(line, L"UseCompartments=%d", &val) == 1) temp.options.useCompartments = (val != 0);
+            else if (swscanf(line, L"UsePreservedKeys=%d", &val) == 1) temp.options.usePreservedKeys = (val != 0);
+            else if (swscanf(line, L"UseUIElements=%d", &val) == 1) temp.options.useUIElements = (val != 0);
+            else if (swscanf(line, L"UseUiHelper=%d", &val) == 1) temp.options.useUiHelper = (val != 0);
+            else if (swscanf(line, L"UwpHanjaCycle=%d", &val) == 1) temp.options.uwpHanjaCycle = (val != 0);
+            else if (swscanf(line, L"UwpOwnWindow=%d", &val) == 1) temp.options.uwpOwnWindow = (val != 0);
+            else if (swscanf(line, L"CandFontSize=%d", &val) == 1)
+                temp.options.candFontSize = (val < 12) ? 12 : (val > 72 ? 72 : val);
+            else if (swscanf(line, L"CandFont=%31l[^\n]", fontBuf) == 1 && fontBuf[0]) {
+                wcsncpy(temp.options.candFont, fontBuf, 31); temp.options.candFont[31] = L'\0';
+            }
+            else if (swscanf(line, L"PreviewFontSize=%d", &val) == 1)
+                temp.options.previewFontSize = (val <= 0) ? 0 : (val < 8 ? 8 : (val > 96 ? 96 : val));
+            else if (swscanf(line, L"PreviewFont=%31l[^\n]", fontBuf) == 1 && fontBuf[0]) {
+                wcsncpy(temp.options.previewFont, fontBuf, 31); temp.options.previewFont[31] = L'\0';
+            }
+        }
+    }
+    
+    fclose(fp);
+
+    // ── 병합: 파일 순서대로, 현재 config에 '이름이 같은' 자판을 찾아 재배열 + enabled 반영 ──
+    JamotongConfig merged = *config;   // 값 복사(리소스 포인터 공유 — 해제 없음). 배열은 새로 만든다.
+    merged.layouts = NULL; merged.layoutCount = 0; merged.layoutCap = 0;
+    bool *used = config->layoutCount > 0 ? (bool *)calloc((size_t)config->layoutCount, sizeof(bool)) : NULL;
+    bool ok = (config->layoutCount == 0 || used) && Config_Reserve(&merged, config->layoutCount);
+    for (int i = 0; ok && i < temp.layoutCount && i < temp.layoutCap; i++) {
+        if (!temp.layouts[i].name) continue;
+        for (int j = 0; j < config->layoutCount; j++) {
+            if (!used[j] && config->layouts[j].name &&
+                wcscmp(config->layouts[j].name, temp.layouts[i].name) == 0) {
+                merged.layouts[merged.layoutCount] = config->layouts[j];
+                merged.layouts[merged.layoutCount].enabled = temp.layouts[i].enabled;
+                merged.layoutCount++;
+                used[j] = true;
+                break;
+            }
+        }
+        // 매칭 실패(파일에만 있는 자판) → 무시: 빈 껍데기 방지. 옛 DLL 플러그인 자판(형식 3)도 여기서 빠진다.
+    }
+    for (int j = 0; ok && j < config->layoutCount; j++)   // 파일에 없는(새) 자판은 뒤에 유지
+        if (!used[j]) merged.layouts[merged.layoutCount++] = config->layouts[j];
+    free(used);
+    for (int i = 0; i < temp.layoutCap; i++)   // 매칭용 임시 이름 해제 — Count가 엔트리보다 작은 기형 파일도 전체 해제
+        if (temp.layouts[i].name) free((void*)temp.layouts[i].name);
+    Config_ReleaseLayoutArray(&temp);
+    if (!ok) { Config_ReleaseLayoutArray(&merged); return false; }   // 메모리 없음 — config 는 그대로
+
+    for (int f = 0; f < SC_FN_COUNT; f++) {
+        // 파일에 명시된 기능 목록만 교체. 자판 전환은 0개가 되면 자판을 못 바꾸므로 0이면 기존 유지.
+        if (haveSc[f] && (f != SC_FN_ROTATE || temp.shortcuts[f].count > 0))
+            merged.shortcuts[f] = temp.shortcuts[f];
+    }
+    merged.options = temp.options;
+    for (int k = 0; k < nlopt; k++)   // 자판별 선택 — 이름으로 찾아 붙인다 (없는 자판의 줄은 그냥 둔다)
+        for (int i = 0; i < merged.layoutCount; i++)
+            if (merged.layouts[i].name && !wcscmp(merged.layouts[i].name, lopt[k].name)) {
+                if (lopt[k].sentence >= 0) merged.layouts[i].optNoSentence = !lopt[k].sentence;
+                if (lopt[k].suggest >= 0)  merged.layouts[i].optNoSuggest  = !lopt[k].suggest;
+                if (lopt[k].punct >= 0)    merged.layouts[i].optNoPunct    = !lopt[k].punct;
+                if (lopt[k].fuzzy >= 0)    merged.layouts[i].optFuzzy      = lopt[k].fuzzy != 0;
+                if (lopt[k].emoji >= 0)    merged.layouts[i].optNoEmoji    = !lopt[k].emoji;
+                if (lopt[k].tones >= 0)    merged.layouts[i].optNoTones    = !lopt[k].tones;
+                if (lopt[k].bar >= 0)      merged.layouts[i].optBar        = lopt[k].bar != 0;
+                lstrcpynW(merged.layouts[i].optKeys, lopt[k].keys, 16);
+            }
+
+    merged.currentLayoutIndex = 0;   // 첫 '켜진' 자판에서 시작 (없으면 0)
+    for (int i = 0; i < merged.layoutCount; i++)
+        if (merged.layouts[i].enabled) { merged.currentLayoutIndex = i; break; }
+
+    free(config->layouts);   // 옛 배열만 버린다(자판 자원은 merged 로 옮겨 갔다)
+    *config = merged;
+    return true;
+}

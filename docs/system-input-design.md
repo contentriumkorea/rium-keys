@@ -40,8 +40,10 @@ pair falsifies automatic classification based on those signals.
 
 ## Replacement implementation after the gate passes
 
-1. Deterministic two-beolsik composition engine with compound vowels/finals,
-   splitting, backspace, selection replacement and commit/cancel tests.
+1. Reuse the existing Jamotong Windows input engine, pinned to
+   `aa78c1a328bab5d193f5f9932c5f824d5fb222d5` (MIT with retained third-party notices).
+   The user's requested direction is reuse, not another hand-written composer.
+   `native-ime` owns this candidate; `input-core` remains historical test work.
 2. TSF edit sessions and composition ownership. Context loss commits to the original
    context only; unavailable context passes input without replay. Modifier shortcuts
    are not consumed. No context from another app may be reused.
@@ -62,6 +64,7 @@ neither is silently substituted for the requested automatic design. Production
 1.1.1 remains unchanged while this feasibility gate is open.
 
 References:
+- https://github.com/rubidus-api/jamotong_ime
 - https://learn.microsoft.com/en-us/windows/apps/develop/input/input-method-editor-requirements
 - https://learn.microsoft.com/en-us/windows/win32/tsf/predefined-compartments
 - https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfkeyeventsink-ontestkeydown

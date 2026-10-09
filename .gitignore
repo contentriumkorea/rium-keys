@@ -39,3 +39,17 @@
 !input-core/*.cpp
 !input-core/*.ps1
 !input-core/README.md
+upstream-research/
+!native-ime/
+!native-ime/*.ps1
+!native-ime/*.md
+!native-ime/*.c
+!native-ime/*.cpp
+!native-ime/*.h
+!native-ime/third_party/
+!native-ime/third_party/jamotong/
+!native-ime/third_party/jamotong/LICENSE
+!native-ime/third_party/jamotong/*.md
+!native-ime/third_party/jamotong/Makefile
+!native-ime/third_party/jamotong/src/
+!native-ime/third_party/jamotong/src/*

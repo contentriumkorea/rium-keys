@@ -9,11 +9,11 @@ $output=Join-Path $PSScriptRoot "out\$Architecture"
 New-Item -ItemType Directory -Force $output | Out-Null
 Push-Location $output
 try {
-    & "$vc\bin\Hostx64\$Architecture\cl.exe" /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE /LD "$PSScriptRoot\Service.cpp" /link /OUT:RiumContextProbe.dll "/DEF:$PSScriptRoot\Service.def" ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib
+    & "$vc\bin\Hostx64\$Architecture\cl.exe" /nologo /std:c++17 /utf-8 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE /LD "$PSScriptRoot\Service.cpp" /link /OUT:RiumContextProbe.dll "/DEF:$PSScriptRoot\Service.def" ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib imm32.lib
     if($LASTEXITCODE){throw 'Probe DLL compilation failed'}
-    & "$vc\bin\Hostx64\$Architecture\cl.exe" /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE "$PSScriptRoot\Controller.cpp" /link /OUT:RiumContextProbe.exe ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib
+    & "$vc\bin\Hostx64\$Architecture\cl.exe" /nologo /std:c++17 /utf-8 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE "$PSScriptRoot\Controller.cpp" /link /OUT:RiumContextProbe.exe ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib imm32.lib shell32.lib gdi32.lib
     if($LASTEXITCODE){throw 'Probe controller compilation failed'}
-    & "$vc\bin\Hostx64\$Architecture\link.exe" /nologo Controller.obj /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /OUT:RiumContextFixture.exe ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib
+    & "$vc\bin\Hostx64\$Architecture\link.exe" /nologo Controller.obj /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /OUT:RiumContextFixture.exe ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib imm32.lib shell32.lib gdi32.lib
     if($LASTEXITCODE){throw 'GUI fixture linking failed'}
     & .\RiumContextProbe.exe --self-test
     if($LASTEXITCODE){throw 'Probe contract checks failed'}
