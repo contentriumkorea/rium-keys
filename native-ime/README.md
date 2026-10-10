@@ -152,6 +152,14 @@ input configurations it cannot snapshot faithfully. It is a first-install
 preview, not an upgrade mechanism. An interrupted commit is reported as unknown
 instead of being labeled rolled back.
 
+Local attempt on 2026-10-10: Windows administrator approval was cancelled before
+the machine worker started, including one retry. The installer recorded
+`FailedRolledBack`; a fresh readback confirmed Microsoft Korean remained the
+default/active profile, no fork COM/TIP/uninstall keys existed in either registry
+view, no native version directory existed, and the installed 1.1.1 utility was
+running again. Native installation and the installed-DLL physical test remain
+pending; the build/test results above do not establish installation success.
+
 API references: [profile activation](https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-activateprofile),
 [user profile enablement](https://learn.microsoft.com/en-us/windows/win32/tsf/installlayoutortip),
 [default input selection](https://learn.microsoft.com/en-us/windows/win32/tsf/setdefaultlayoutortip).

@@ -38,5 +38,12 @@ Failure focus: wrong user after elevation; second-architecture failure; locked
 DLLs; partial legacy uninstall; user profile selection failure. All must fail
 visibly with recovery information rather than reporting completion.
 
+2026-10-10 outcome: code review found no remaining concrete installation blocker.
+Both guarded and installable x64/x86 builds passed 26 engine and 42 routing/policy
+checks per build. Two UAC attempts were cancelled before machine registration.
+Rollback readback confirmed no native registration or version directory, the
+original Microsoft default/active profile, and the legacy 1.1.1 utility running.
+The actual installation/installed-DLL physical verification items stay open.
+
 References: Microsoft ITfInputProcessorProfileMgr::ActivateProfile,
 InstallLayoutOrTip and SetDefaultLayoutOrTip documentation.
