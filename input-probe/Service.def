@@ -1,0 +1,4 @@
+LIBRARY RiumContextProbe
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

@@ -1,0 +1,757 @@
+#include "edit_session.h"
+#include "candidate_ui.h"
+#include <richedit.h>   // EM_EXGETSEL/EM_GETSELTEXT/CHARRANGE (선택 읽기 RichEdit 폴백)
+#include <string.h>
+#include <wctype.h>     // towlower (포커스 컨트롤 클래스명 판정)
+#include "edit_verdict.h"   // EM_REPLACESEL 전후 선택 비교 판정 (B1)
+
+#ifdef JAMO_DIAG   // 임시 진단 로그 (-DJAMO_DIAG 빌드에서만): %TEMP%\jamotong-diag.log
+#include <stdio.h>
+#include <stdarg.h>
+void JamoDiag(const char *fmt, ...) {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, path);
+    if (!n || n > MAX_PATH - 24) return;
+    wcscat(path, L"jamotong-diag.log");
+    FILE *fp = _wfopen(path, L"a");
+    if (!fp) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fclose(fp);
+}
+#else
+void JamoDiag(const char *fmt, ...) { (void)fmt; }
+#endif
+
+typedef struct JamotongEditSession {
+    ITfEditSessionVtbl *lpVtbl;
+    LONG refCount;
+    JamotongTextService *pService;
+    ITfContext *pContext;
+    EditSessionData data;
+} JamotongEditSession;
+
+static HRESULT STDMETHODCALLTYPE ES_QueryInterface(ITfEditSession *pThis, REFIID riid, void **ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_ITfEditSession)) {
+        *ppvObject = pThis;
+        pThis->lpVtbl->AddRef(pThis);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE ES_AddRef(ITfEditSession *pThis) {
+    JamotongEditSession *es = (JamotongEditSession*)pThis;
+    return InterlockedIncrement(&es->refCount);
+}
+
+static ULONG STDMETHODCALLTYPE ES_Release(ITfEditSession *pThis) {
+    JamotongEditSession *es = (JamotongEditSession*)pThis;
+    ULONG res = InterlockedDecrement(&es->refCount);
+    if (res == 0) {
+        es->pService->lpVtblTIP->Release((ITfTextInputProcessor*)es->pService);
+        es->pContext->lpVtbl->Release(es->pContext);
+        HeapFree(GetProcessHeap(), 0, es);
+    }
+    return res;
+}
+
+// 삽입 후 커서(선택)를 range 끝으로 이동. 이걸 안 하면 다음 삽입이 커서 위치(앞)에 계속 들어가
+// 글자가 역순(abcd→dcba)으로 쌓인다. Clone으로 원본 range는 보존.
+static BOOL EditSessionOwnsFocus(JamotongTextService *svc, const EditSessionData *data) {
+    if (!data) return TRUE;
+    if (data->bindFocus && (!data->focusOwner || data->focusOwner != GetFocus())) return FALSE;
+    return !data->bindInputOwner || RiumOwner_AllowsWrite(&svc->inputOwner,&data->inputOwner,data->deferred);
+}
+
+static void MoveCaretToEnd(JamotongTextService *svc, ITfContext *ctx, TfEditCookie ec, ITfRange *range,
+                           const EditSessionData *data) {
+    if (!EditSessionOwnsFocus(svc,data)) return;
+    ITfRange *pEnd = NULL;
+    if (SUCCEEDED(range->lpVtbl->Clone(range, &pEnd)) && pEnd) {
+        HRESULT hr = pEnd->lpVtbl->Collapse(pEnd, ec, TF_ANCHOR_END);
+        TF_SELECTION sel;
+        sel.range = pEnd;
+        sel.style.ase = TF_AE_NONE;
+        sel.style.fInterimChar = FALSE;
+        if (SUCCEEDED(hr) && EditSessionOwnsFocus(svc,data))
+            ctx->lpVtbl->SetSelection(ctx, ec, 1, &sel);
+        pEnd->lpVtbl->Release(pEnd);
+    }
+}
+
+// 현재 선택(캐럿)의 화면 rect를 svc->lastCaretRect에 기록 (조합 미리보기 오버레이용, RFC-0002).
+//   TSF 정석: GetActiveView → GetTextExt(선택 range). TF_E_NOLAYOUT 등으로 실패하면
+//   lastCaretValid=FALSE로 남고, 호출자(text_service)가 GetGUIThreadInfo로 폴백한다.
+static void CaptureCaretRect(JamotongTextService *svc, ITfContext *ctx, TfEditCookie ec) {
+    svc->lastCaretValid = FALSE;
+    TF_SELECTION sel; ULONG fetched = 0;
+    if (FAILED(ctx->lpVtbl->GetSelection(ctx, ec, TF_DEFAULT_SELECTION, 1, &sel, &fetched)) || fetched == 0)
+        return;
+    ITfContextView *pView = NULL;
+    if (SUCCEEDED(ctx->lpVtbl->GetActiveView(ctx, &pView)) && pView) {
+        RECT rc; BOOL clipped = FALSE;
+        if (SUCCEEDED(pView->lpVtbl->GetTextExt(pView, ec, sel.range, &rc, &clipped))
+            && (rc.right - rc.left >= 0) && (rc.bottom - rc.top > 0)) {
+            svc->lastCaretRect = rc;
+            svc->lastCaretValid = TRUE;
+        }
+        pView->lpVtbl->Release(pView);
+    }
+    sel.range->lpVtbl->Release(sel.range);
+}
+
+// ── 커밋 전용 엔진 (감지 없음, TSF 조합 없음) ────────────────────────────────────────
+//   확정된 음절(committed)만 문서에 삽입한다. 조합중(preedit)은 문서에 넣지 않고,
+//   플로팅 오버레이(RFC-0002)가 캐럿 위치에 표시한다(캡처한 캐럿 rect 사용).
+//   삽입(InsertTextAtSelection)은 네이티브·CUAS 모든 앱에서 동작하고, range 편집(제자리 교체)은
+//   CUAS EDIT 컨트롤에서 안 되므로(누적 버그) 문서 인라인 미리보기는 하지 않는다.
+// 우리 편집 세션 깊이 (동기 세션이므로 스택 깊이로 충분하다)
+long g_ourEditDepth = 0;
+bool Jamotong_InOurEdit(void) { return g_ourEditDepth > 0; }
+static HRESULT ES_DoEditSession_Inner(ITfEditSession *pThis, TfEditCookie ec) {
+    JamotongEditSession *es = (JamotongEditSession*)pThis;
+    ITfContext *ctx = es->pContext;
+    int cLen = (int)wcslen(es->data.committed);
+    HRESULT hrOut = S_OK;   // 삽입 실패를 hrSession으로 전파 (RFC-0004 P2-2: S_OK로 삼키지 않음)
+    if (!EditSessionOwnsFocus(es->pService,&es->data)) return E_PENDING;
+
+    if (cLen > 0) {
+        ITfInsertAtSelection *pIns = NULL;
+        hrOut = ctx->lpVtbl->QueryInterface(ctx, &IID_ITfInsertAtSelection, (void**)&pIns);
+        if (SUCCEEDED(hrOut)) {
+            ITfRange *r = NULL;
+            if (!EditSessionOwnsFocus(es->pService,&es->data)) {
+                pIns->lpVtbl->Release(pIns);
+                return E_PENDING;
+            }
+            HRESULT hrIns = pIns->lpVtbl->InsertTextAtSelection(pIns, ec, 0, es->data.committed, cLen, &r);
+            JamoDiag("INSERT U+%04X len=%d hr=0x%08lX r=%p", (unsigned)es->data.committed[0], cLen, (unsigned long)hrIns, (void*)r);
+            if (SUCCEEDED(hrIns) && r) {
+                MoveCaretToEnd(es->pService, ctx, ec, r, &es->data); // A completed insertion is not retried if caret movement is skipped.
+                r->lpVtbl->Release(r);
+            }
+            if (FAILED(hrIns)) hrOut = hrIns;
+            pIns->lpVtbl->Release(pIns);
+        }
+    }
+    if (EditSessionOwnsFocus(es->pService,&es->data)) CaptureCaretRect(es->pService, ctx, ec);
+    return hrOut;
+}
+static HRESULT STDMETHODCALLTYPE ES_DoEditSession(ITfEditSession *pThis, TfEditCookie ec) {
+    g_ourEditDepth++;                      // 이 변화는 **우리가** 낸 것이다 (light dismiss 판정용)
+    HRESULT hr = ES_DoEditSession_Inner(pThis, ec);
+    g_ourEditDepth--;
+    return hr;
+}
+
+static ITfEditSessionVtbl EditSessionVtbl = {
+    ES_QueryInterface,
+    ES_AddRef,
+    ES_Release,
+    ES_DoEditSession
+};
+
+HRESULT RequestEditSessionData(JamotongTextService *pService, ITfContext *pContext, const EditSessionData *data) {
+    return RequestEditSessionDataEx(pService, pContext, data, TF_ES_SYNC | TF_ES_READWRITE);
+}
+
+HRESULT RequestEditSessionDataEx(JamotongTextService *pService, ITfContext *pContext, const EditSessionData *data, DWORD esFlags) {
+    JamotongEditSession *es = (JamotongEditSession*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(JamotongEditSession));
+    if (!es) return E_OUTOFMEMORY;
+    
+    es->lpVtbl = &EditSessionVtbl;
+    es->refCount = 1;
+    es->pService = pService;
+    es->pContext = pContext;
+    es->data = *data;
+    if (!es->data.bindInputOwner) {
+        RiumOwner_Capture(&pService->inputOwner,&es->data.inputOwner);
+        es->data.bindInputOwner=TRUE;
+    }
+    es->data.deferred = es->data.deferred || !(esFlags & TF_ES_SYNC);
+    
+    pService->lpVtblTIP->AddRef((ITfTextInputProcessor*)pService);
+    pContext->lpVtbl->AddRef(pContext);
+
+    pService->lastCaretValid = FALSE;   // 세션 실패/미도달 시 낡은 캐럿 rect 사용 방지
+    // 동기(TF_ES_SYNC) — NavilIME도 동기를 쓰며 AkelPad에서 정상 동작한다. (async는 무효였음)
+    HRESULT hrSession = S_OK;
+    HRESULT hr = pContext->lpVtbl->RequestEditSession(pContext, pService->clientId, (ITfEditSession*)es, esFlags, &hrSession);
+
+    es->lpVtbl->Release((ITfEditSession*)es);   // 비동기면 TSF 가 자기 참조로 수명을 쥔다(힙 객체+참조계수)
+    // 바깥 hr(요청 접수)만 반환하면 DoEditSession 내부 실패가 숨는다 → 세션 hr까지 전파 (RFC-0004 P2-2)
+    // ASYNCDONTCARE can execute immediately: its failure must also propagate.
+    // TF_S_ASYNC is a queued request, never evidence that insertion completed.
+    return FAILED(hr) ? hr : hrSession;
+}
+
+HRESULT RequestEditSession(JamotongTextService *pService, ITfContext *pContext, FsmResult fsmRes) {
+    EditSessionData data = {0};
+    if (fsmRes.commitChar) data.committed[0] = fsmRes.commitChar;
+    if (fsmRes.preeditChar) data.composing[0] = fsmRes.preeditChar;
+    return RequestEditSessionData(pService, pContext, &data);
+}
+
+// ----------------------------------------------------
+// 읽기 세션 (단어 단위 한자 변환을 위해 커서 앞의 텍스트 읽기)
+// ----------------------------------------------------
+typedef struct {
+    ITfEditSessionVtbl *lpVtbl;
+    LONG refCount;
+    JamotongTextService *pService;
+    ITfContext *pContext;
+    wchar_t *outBuf;
+    int maxLen;
+} ReadEditSession;
+
+static HRESULT STDMETHODCALLTYPE RES_QueryInterface(ITfEditSession *pThis, REFIID riid, void **ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_ITfEditSession)) {
+        *ppvObject = pThis;
+        pThis->lpVtbl->AddRef(pThis);
+        return S_OK;
+    }
+    *ppvObject = NULL; return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE RES_AddRef(ITfEditSession *pThis) {
+    return InterlockedIncrement(&((ReadEditSession*)pThis)->refCount);
+}
+static ULONG STDMETHODCALLTYPE RES_Release(ITfEditSession *pThis) {
+    ReadEditSession *es = (ReadEditSession*)pThis;
+    ULONG res = InterlockedDecrement(&es->refCount);
+    if (res == 0) {
+        es->pService->lpVtblTIP->Release((ITfTextInputProcessor*)es->pService);
+        es->pContext->lpVtbl->Release(es->pContext);
+        HeapFree(GetProcessHeap(), 0, es);
+    }
+    return res;
+}
+static HRESULT RES_DoEditSession_Inner(ITfEditSession *pThis, TfEditCookie ec) {
+    ReadEditSession *es = (ReadEditSession*)pThis;
+    es->outBuf[0] = L'\0';
+    
+    ITfInsertAtSelection *pInsert = NULL;
+    if (FAILED(es->pContext->lpVtbl->QueryInterface(es->pContext, &IID_ITfInsertAtSelection, (void**)&pInsert))) return E_FAIL;
+    
+    ITfRange *pRange = NULL;
+    // READ 쿠키에선 QUERYONLY(삽입 없이 선택 range만)만 유효. NOQUERY(수정 삽입)는 실패했음.
+    if (SUCCEEDED(pInsert->lpVtbl->InsertTextAtSelection(pInsert, ec, TF_IAS_QUERYONLY, NULL, 0, &pRange)) && pRange) {
+        LONG cch = 0;
+        pRange->lpVtbl->ShiftStart(pRange, ec, -es->maxLen, &cch, NULL);
+        if (cch < 0) {
+            ULONG copied = 0;
+            pRange->lpVtbl->GetText(pRange, ec, 0, es->outBuf, es->maxLen, &copied);
+            es->outBuf[copied] = L'\0';
+        }
+        pRange->lpVtbl->Release(pRange);
+    }
+    pInsert->lpVtbl->Release(pInsert);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE RES_DoEditSession(ITfEditSession *pThis, TfEditCookie ec) {
+    g_ourEditDepth++;                      // 이 변화는 **우리가** 낸 것이다 (light dismiss 판정용)
+    HRESULT hr = RES_DoEditSession_Inner(pThis, ec);
+    g_ourEditDepth--;
+    return hr;
+}
+static ITfEditSessionVtbl ReadSessionVtbl = { RES_QueryInterface, RES_AddRef, RES_Release, RES_DoEditSession };
+
+HRESULT RequestReadSessionString(JamotongTextService *pService, ITfContext *pContext, wchar_t *outBuf, int maxLen) {
+    ReadEditSession *es = (ReadEditSession*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ReadEditSession));
+    if (!es) return E_OUTOFMEMORY;
+    es->lpVtbl = &ReadSessionVtbl; es->refCount = 1; es->pService = pService; es->pContext = pContext;
+    es->outBuf = outBuf; es->maxLen = maxLen;
+    pService->lpVtblTIP->AddRef((ITfTextInputProcessor*)pService); pContext->lpVtbl->AddRef(pContext);
+    HRESULT hrSession = S_OK;
+    HRESULT hr = pContext->lpVtbl->RequestEditSession(pContext, pService->clientId, (ITfEditSession*)es, TF_ES_SYNC | TF_ES_READ, &hrSession);
+    es->lpVtbl->Release((ITfEditSession*)es);
+    return FAILED(hr) ? hr : hrSession;   // 세션 내부 실패까지 전파 (RFC-0004 P2-2)
+}
+
+// ----------------------------------------------------
+// 교체 세션 (한자 선택 시 기존 텍스트 교체)
+// ----------------------------------------------------
+typedef struct {
+    ITfEditSessionVtbl *lpVtbl;
+    LONG refCount;
+    JamotongTextService *pService;
+    ITfContext *pContext;
+    int replaceLen;
+    wchar_t replacement[128];
+} ReplaceEditSession;
+
+static HRESULT STDMETHODCALLTYPE Rep_QueryInterface(ITfEditSession *pThis, REFIID riid, void **ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_ITfEditSession)) {
+        *ppvObject = pThis; pThis->lpVtbl->AddRef(pThis); return S_OK;
+    }
+    *ppvObject = NULL; return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE Rep_AddRef(ITfEditSession *pThis) {
+    return InterlockedIncrement(&((ReplaceEditSession*)pThis)->refCount);
+}
+static ULONG STDMETHODCALLTYPE Rep_Release(ITfEditSession *pThis) {
+    ReplaceEditSession *es = (ReplaceEditSession*)pThis;
+    ULONG res = InterlockedDecrement(&es->refCount);
+    if (res == 0) {
+        es->pService->lpVtblTIP->Release((ITfTextInputProcessor*)es->pService);
+        es->pContext->lpVtbl->Release(es->pContext);
+        HeapFree(GetProcessHeap(), 0, es);
+    }
+    return res;
+}
+static HRESULT Rep_DoEditSession_Inner(ITfEditSession *pThis, TfEditCookie ec) {
+    ReplaceEditSession *es = (ReplaceEditSession*)pThis;
+
+    // 치환(단어단위 한자) 후 오토마타 초기화 — 안 하면 다음 키가 옛 음절을 이어가 중복/깨짐.
+    Fsm_Init(&es->pService->fsm);
+
+    ITfInsertAtSelection *pInsert = NULL;
+    if (FAILED(es->pContext->lpVtbl->QueryInterface(es->pContext, &IID_ITfInsertAtSelection, (void**)&pInsert))) return E_FAIL;
+    
+    ITfRange *pRange = NULL;
+    // TF_IAS_QUERYONLY: 삽입 없이 현재 선택 range만 얻는다(MSDN 규약 — NOQUERY는 ppRange를 채우지
+    // 않을 수 있어 NULL 역참조 위험이 있었음). 얻은 range의 시작을 뒤로 밀어 교체 대상 확보 후 SetText.
+    if (SUCCEEDED(pInsert->lpVtbl->InsertTextAtSelection(pInsert, ec, TF_IAS_QUERYONLY, NULL, 0, &pRange)) && pRange) {
+        LONG cch = 0;
+        pRange->lpVtbl->ShiftStart(pRange, ec, -es->replaceLen, &cch, NULL);
+        int rlen = (int)wcslen(es->replacement);
+        pRange->lpVtbl->SetText(pRange, ec, 0, es->replacement, rlen);
+        MoveCaretToEnd(es->pService, es->pContext, ec, pRange, NULL); // Existing unbound replacement path.
+        pRange->lpVtbl->Release(pRange);
+    }
+    pInsert->lpVtbl->Release(pInsert);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE Rep_DoEditSession(ITfEditSession *pThis, TfEditCookie ec) {
+    g_ourEditDepth++;                      // 이 변화는 **우리가** 낸 것이다 (light dismiss 판정용)
+    HRESULT hr = Rep_DoEditSession_Inner(pThis, ec);
+    g_ourEditDepth--;
+    return hr;
+}
+static ITfEditSessionVtbl RepSessionVtbl = { Rep_QueryInterface, Rep_AddRef, Rep_Release, Rep_DoEditSession };
+
+HRESULT RequestReplaceSessionString(JamotongTextService *pService, ITfContext *pContext, int replaceLen, const wchar_t *replacement) {
+    ReplaceEditSession *es = (ReplaceEditSession*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ReplaceEditSession));
+    if (!es) return E_OUTOFMEMORY;
+    es->lpVtbl = &RepSessionVtbl; es->refCount = 1; es->pService = pService; es->pContext = pContext;
+    es->replaceLen = replaceLen;
+    wcsncpy(es->replacement, replacement, 127); es->replacement[127] = L'\0';   // [128] 버퍼 오버플로 방지
+    pService->lpVtblTIP->AddRef((ITfTextInputProcessor*)pService); pContext->lpVtbl->AddRef(pContext);
+    HRESULT hrSession = S_OK;
+    HRESULT hr = pContext->lpVtbl->RequestEditSession(pContext, pService->clientId, (ITfEditSession*)es, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
+    es->lpVtbl->Release((ITfEditSession*)es);
+    return FAILED(hr) ? hr : hrSession;   // 세션 내부 실패까지 전파 (RFC-0004 P2-2)
+}
+
+// ----------------------------------------------------
+// [RFC-0003] 선택(블록) 텍스트 읽기 세션 — 선택 후 한자키 변환용.
+//   선택 교체는 이후 InsertTextAtSelection(삽입)이 자동 수행하므로(타이핑 덮어쓰기와 동일 경로)
+//   커밋 전용 원칙과 호환. 여기서는 읽기 + 후보창 위치용 rect 캡처만 한다.
+// ----------------------------------------------------
+typedef struct {
+    ITfEditSessionVtbl *lpVtbl;
+    LONG refCount;
+    JamotongTextService *pService;
+    ITfContext *pContext;
+    wchar_t *outBuf;
+    int maxLen;
+} ReadSelSession;
+
+static HRESULT STDMETHODCALLTYPE RSel_QueryInterface(ITfEditSession *pThis, REFIID riid, void **ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_ITfEditSession)) {
+        *ppvObject = pThis; pThis->lpVtbl->AddRef(pThis); return S_OK;
+    }
+    *ppvObject = NULL; return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE RSel_AddRef(ITfEditSession *pThis) {
+    return InterlockedIncrement(&((ReadSelSession*)pThis)->refCount);
+}
+static ULONG STDMETHODCALLTYPE RSel_Release(ITfEditSession *pThis) {
+    ReadSelSession *es = (ReadSelSession*)pThis;
+    ULONG res = InterlockedDecrement(&es->refCount);
+    if (res == 0) {
+        es->pService->lpVtblTIP->Release((ITfTextInputProcessor*)es->pService);
+        es->pContext->lpVtbl->Release(es->pContext);
+        HeapFree(GetProcessHeap(), 0, es);
+    }
+    return res;
+}
+static HRESULT RSel_DoEditSession_Inner(ITfEditSession *pThis, TfEditCookie ec) {
+    ReadSelSession *es = (ReadSelSession*)pThis;
+    JamotongTextService *svc = es->pService;
+    ITfContext *ctx = es->pContext;
+    es->outBuf[0] = L'\0';
+    svc->lastCaretValid = FALSE;
+
+    TF_SELECTION sel; ULONG fetched = 0;
+    if (FAILED(ctx->lpVtbl->GetSelection(ctx, ec, TF_DEFAULT_SELECTION, 1, &sel, &fetched)) || fetched == 0)
+        return S_OK;
+
+    ULONG copied = 0;
+    sel.range->lpVtbl->GetText(sel.range, ec, 0, es->outBuf, (ULONG)es->maxLen, &copied);
+    es->outBuf[copied] = L'\0';   // 빈 선택(접힌 캐럿)이면 copied=0
+
+    if (copied > 0) {   // 후보창 위치 = 선택 range의 화면 rect (실패 시 호출자가 GUIThreadInfo 폴백)
+        ITfContextView *pView = NULL;
+        if (SUCCEEDED(ctx->lpVtbl->GetActiveView(ctx, &pView)) && pView) {
+            RECT rc; BOOL clipped = FALSE;
+            if (SUCCEEDED(pView->lpVtbl->GetTextExt(pView, ec, sel.range, &rc, &clipped))
+                && (rc.bottom - rc.top > 0)) {
+                svc->lastCaretRect = rc;
+                svc->lastCaretValid = TRUE;
+            }
+            pView->lpVtbl->Release(pView);
+        }
+    }
+    sel.range->lpVtbl->Release(sel.range);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE RSel_DoEditSession(ITfEditSession *pThis, TfEditCookie ec) {
+    g_ourEditDepth++;                      // 이 변화는 **우리가** 낸 것이다 (light dismiss 판정용)
+    HRESULT hr = RSel_DoEditSession_Inner(pThis, ec);
+    g_ourEditDepth--;
+    return hr;
+}
+static ITfEditSessionVtbl ReadSelVtbl = { RSel_QueryInterface, RSel_AddRef, RSel_Release, RSel_DoEditSession };
+
+// CUAS 폴백 (실기 2026-07-08: 레거시 EDIT 계열은 선택을 TSF GetSelection으로 노출하지 않아
+// 블록 한자 변환이 무동작이었다). 포커스 컨트롤에서 EM_GETSEL + WM_GETTEXT로 직접 읽는다 —
+// EDIT/RichEdit/AkelEdit 등 EDIT 호환 컨트롤에서 동작하고, 그 외 컨트롤은 검증(s<e·범위)에
+// 걸려 무해하게 빈손 반환. 같은 스레드의 포커스 창이므로 SendMessage 계열은 안전.
+// ①차 폴백: RichEdit 계열(AkelEdit 포함) — EM_EXGETSEL(CHARRANGE)+EM_GETSELTEXT.
+//   컨트롤이 선택 텍스트를 '직접' 복사해 주므로 오프셋 해석(문자/바이트·개행 축약) 차이에서
+//   자유롭다. (실기 2026-07-08: EM_GETSEL+WM_GETTEXT 조합은 레거시 앱에서 "대한민국" 선택이
+//   "대한"으로 잘리는 오프셋 불일치를 보임.) 모르는 컨트롤은 CHARRANGE를 안 건드려 걸러진다.
+static bool ReadSelViaRichEdit(HWND h, wchar_t *outBuf, int maxLen) {
+    CHARRANGE cr; cr.cpMin = -2; cr.cpMax = -2;   // 미응답 감지용 초기값
+    SendMessageW(h, EM_EXGETSEL, 0, (LPARAM)&cr);
+    if (cr.cpMin < 0 || cr.cpMax <= cr.cpMin) return false;
+    if (cr.cpMax - cr.cpMin > maxLen) return false;   // 사전 조회 상한 초과
+    // EM_GETSELTEXT는 버퍼 크기 인자가 없는 고전 API — 선택 길이를 위에서 상한(≤maxLen≤16)
+    // 검증했고, CRLF 확장 등 여유를 위해 넉넉한 지역 버퍼에 받은 뒤 길이를 재검증한다.
+    wchar_t buf[256]; buf[0] = L'\0';
+    LRESULT n = SendMessageW(h, EM_GETSELTEXT, 0, (LPARAM)buf);
+    if (n <= 0 || n > maxLen) return false;
+    buf[n] = L'\0';
+    wmemcpy(outBuf, buf, (size_t)n + 1);
+    return true;
+}
+
+// Scintilla(Notepad++ 등)는 EDIT 계열 메시지에 바이트로 답해 블록 한자 변환이 무동작이었다(실기 2026-09-30, C3).
+//   SCI_* 메시지로 선택을 읽는다 — 입력기는 앱 프로세스 안에 있으므로 지역 버퍼를 그대로 넘겨도 된다.
+//   선택은 문서 코드 페이지의 바이트로 온다(65001 = UTF-8, 0 = 시스템 ANSI, 그 밖은 DBCS 코드 페이지).
+#define JAMO_SCI_GETCODEPAGE        2137
+#define JAMO_SCI_GETSELECTIONSTART  2143
+#define JAMO_SCI_GETSELECTIONEND    2145
+#define JAMO_SCI_GETSELTEXT         2161
+static bool ReadSelViaScintilla(HWND h, wchar_t *outBuf, int maxLen) {
+    wchar_t cls[16];
+    if (GetClassNameW(h, cls, 16) <= 0 || _wcsicmp(cls, L"Scintilla") != 0) return false;
+    LRESULT s = SendMessageW(h, JAMO_SCI_GETSELECTIONSTART, 0, 0);
+    LRESULT e = SendMessageW(h, JAMO_SCI_GETSELECTIONEND, 0, 0);
+    char buf[16 * 4 + 8];                                // 사전 조회 상한 16자 × UTF-8 최대 4바이트
+    if (s < 0 || e <= s || e - s >= (LRESULT)sizeof buf) return false;
+    memset(buf, 0, sizeof buf);
+    SendMessageW(h, JAMO_SCI_GETSELTEXT, 0, (LPARAM)buf); // 선택 바이트 + NUL (버퍼는 선택+1 이상)
+    int bytes = (int)strnlen(buf, sizeof buf - 1);
+    if (bytes <= 0 || bytes != (int)(e - s)) return false; // 다중 선택·응답 불일치는 건드리지 않는다
+    UINT cp = (UINT)SendMessageW(h, JAMO_SCI_GETCODEPAGE, 0, 0);
+    if (cp == 0) cp = CP_ACP;
+    int n = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, buf, bytes, outBuf, maxLen);
+    if (n <= 0 || n > maxLen) { outBuf[0] = L'\0'; return false; }
+    outBuf[n] = L'\0';
+    return true;
+}
+
+// 컨트롤 h의 현재 선택 텍스트 읽기: ① Scintilla ② RichEdit 정확 경로 ③ 플레인 EDIT(EM_GETSEL=문자 단위)
+//   Scintilla 가 먼저다: EM_EXGETSEL·EM_GETSELTEXT 에도 답하지만 바이트 오프셋과 UTF-8 바이트를 돌려줘,
+//   RichEdit 경로로 읽으면 '한'이 글자 셋짜리 쓰레기(U+95ED…)가 되어 사전 조회가 조용히 실패했다(실기 2026-09-30).
+static bool ReadSelFromCtl(HWND h, wchar_t *outBuf, int maxLen) {
+    outBuf[0] = L'\0';
+    if (ReadSelViaScintilla(h, outBuf, maxLen)) return true;
+    if (ReadSelViaRichEdit(h, outBuf, maxLen)) return true;
+    DWORD s = 0, e = 0;
+    SendMessageW(h, EM_GETSEL, (WPARAM)&s, (LPARAM)&e);
+    if (e <= s || (int)(e - s) > maxLen) return false;   // 선택 없음(비-EDIT 포함)/사전 상한 초과
+    if (e > 262144) return false;                        // 과대 문서 보호 (전체 텍스트 복사 상한 512KB)
+    int total = GetWindowTextLengthW(h);
+    if (total <= 0 || (DWORD)total < e) return false;    // EM_GETSEL 응답이 텍스트와 불일치(비-EDIT 방어)
+    wchar_t *buf = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, ((size_t)e + 1) * sizeof(wchar_t));
+    if (!buf) return false;
+    int got = GetWindowTextW(h, buf, (int)e + 1);        // 선택 끝까지만 복사
+    if ((DWORD)got >= e) {
+        DWORD n = e - s;
+        wmemcpy(outBuf, buf + s, n);
+        outBuf[n] = L'\0';
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
+    return outBuf[0] != L'\0';
+}
+
+static void ReadSelectionFromFocusCtl(wchar_t *outBuf, int maxLen) {
+    GUITHREADINFO gti; memset(&gti, 0, sizeof(gti)); gti.cbSize = sizeof(gti);
+    if (!GetGUIThreadInfo(0, &gti) || !gti.hwndFocus) return;
+    ReadSelFromCtl(gti.hwndFocus, outBuf, maxLen);
+}
+
+// 포커스된 컨트롤이 EDIT 계열(선택/캐럿을 EM_EXGETSEL 또는 EM_GETSEL로 노출)이면 그 HWND,
+// 아니면 NULL. 삽입/교체 시점의 포커스 창을 '한 번' 얻어 이후 EM_* 조작에 재사용한다 —
+// 후보창 콜백 등 뒤늦은 시점엔 포커스가 옮겨가 GetGUIThreadInfo가 딴 창을 주기 때문(실기 2026-07-08).
+HWND EditCtl_FocusEditWindow(void) {
+    GUITHREADINFO gti; memset(&gti, 0, sizeof(gti)); gti.cbSize = sizeof(gti);
+    if (!GetGUIThreadInfo(0, &gti) || !gti.hwndFocus) return NULL;
+    HWND h = gti.hwndFocus;
+    // 클래스명에 "edit"(대소문자 무관)가 있어야 EDIT 계열로 인정 — PuTTY 같은 자체 렌더링
+    // 터미널이 EM_GETSEL/EM_EXGETSEL에 우연히 응답해 EDIT로 오판되고, 우리가 보낸
+    // EM_REPLACESEL을 무시해 한글 입력이 통째로 씹히는 것을 막는다(실기 2026-07-08).
+    // 표준 클래스: "Edit", "RICHEDIT50W"/"RichEdit20W", AkelPad "AkelEditW" — 모두 'edit' 포함.
+    wchar_t cls[64];
+    int n = GetClassNameW(h, cls, 64);
+    if (n <= 0) return NULL;
+    for (int i = 0; i < n; i++) cls[i] = (wchar_t)towlower(cls[i]);
+    if (!wcsstr(cls, L"edit")) return NULL;         // PuTTY("PuTTY")·터미널·네이티브 앱 → TSF 경로
+    CHARRANGE cr; cr.cpMin = -2; cr.cpMax = -2;
+    SendMessageW(h, EM_EXGETSEL, 0, (LPARAM)&cr);
+    if (cr.cpMin >= 0) return h;                    // RichEdit/AkelEdit
+    DWORD s = 0xFFFFFFFF, e = 0xFFFFFFFF;
+    SendMessageW(h, EM_GETSEL, (WPARAM)&s, (LPARAM)&e);
+    if (s != 0xFFFFFFFF) return h;                  // 플레인 EDIT
+    return NULL;
+}
+
+// 캐럿 앞의 단어(word)를 EDIT 메시지로 '프로그램적으로 선택'하고 읽어서 검증한다.
+// 성공하면 선택이 잡힌 채 반환 → 이어지는 InsertTextAtSelection 삽입이 선택을 교체한다
+// (= 검증된 CUAS 호환 경로). TSF range 교체(ShiftStart+SetText)는 CUAS에서 부분 적용되어
+// "대한민국→大韓민국"처럼 앞 글자만 바뀌는 오동작을 보였다(실기 2026-07-08).
+// 오프셋 단위(문자/바이트)를 신뢰하지 않는다: 선택 후 실제 텍스트를 기대 단어와 대조하고,
+// 불일치하면 문자당 2단위(바이트 해석)도 시도, 그래도 아니면 캐럿을 복원하고 실패한다.
+// 컨트롤 h에서 [from,to)를 선택. RichEdit(EM_EXSETSEL)와 플레인 EDIT(EM_SETSEL) 모두 커버.
+static void CtlSetSel(HWND h, LONG from, LONG to, bool rich) {
+    if (rich) { CHARRANGE cr; cr.cpMin = from; cr.cpMax = to; SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr); }
+    else SendMessageW(h, EM_SETSEL, (WPARAM)from, (LPARAM)to);
+}
+
+bool EditCtl_SelectWordBeforeCaret(HWND h, const wchar_t *word) {
+    int len = (int)wcslen(word);
+    if (!h || len <= 0 || len > 16) return false;
+    // 캐럿 위치: EM_EXGETSEL(RichEdit/AkelEdit) 우선 — AkelEdit는 EM_GETSEL 미응답이라
+    // EM_GETSEL만 쓰면 단어 선택이 통째로 실패했다(실기 2026-07-08).
+    LONG caret = -1; bool rich = false;
+    CHARRANGE cr; cr.cpMin = -2; cr.cpMax = -2;
+    SendMessageW(h, EM_EXGETSEL, 0, (LPARAM)&cr);
+    if (cr.cpMin >= 0 && cr.cpMin == cr.cpMax) { caret = cr.cpMin; rich = true; }
+    else {
+        DWORD s = 0xFFFFFFFF, e = 0xFFFFFFFF;
+        SendMessageW(h, EM_GETSEL, (WPARAM)&s, (LPARAM)&e);
+        if (s == 0xFFFFFFFF || s != e) return false;   // 비-EDIT/캐럿이 접혀있지 않음
+        caret = (LONG)e;
+    }
+    if (caret <= 0) return false;
+    for (int mult = 1; mult <= 2; mult++) {   // 1=문자 오프셋, 2=UTF-16 코드유닛(2단위) 해석
+        LONG span = (LONG)len * mult;
+        if (caret < span) continue;
+        CtlSetSel(h, caret - span, caret, rich);
+        wchar_t got[24] = {0};
+        if (ReadSelFromCtl(h, got, 16) && wcscmp(got, word) == 0)
+            return true;   // 검증 성공 — 선택 유지한 채 반환(호출자가 EM_REPLACESEL 교체)
+    }
+    CtlSetSel(h, caret, caret, rich);   // 검증 실패 → 캐럿 복원
+    return false;
+}
+
+// 컨트롤 h의 현재 선택을 str로 교체(EM_REPLACESEL, undo 가능; 선택이 비었으면 캐럿에 삽입).
+// EDIT의 표준 동작이라 정확히 교체/삽입된다 — AkelEdit는 TSF InsertTextAtSelection을 hr=0으로
+// 받고도 실제 반영하지 않아(실기 2026-07-08: raw 좌표 고정), 커밋·교체 모두 이 경로가 신뢰성 있다.
+// h는 EditCtl_FocusEditWindow()로 미리 얻은 EDIT 계열 창.
+// 현재 선택 읽기 (판정용): RichEdit/AkelEdit 는 EM_EXGETSEL, 플레인 EDIT 는 EM_GETSEL.
+static EditSelSnap ReadSelSnap(HWND h) {
+    EditSelSnap snap = { 0, -1, -1 };
+    CHARRANGE cr; cr.cpMin = -2; cr.cpMax = -2;
+    SendMessageW(h, EM_EXGETSEL, 0, (LPARAM)&cr);
+    if (cr.cpMin >= 0) { snap.ok = 1; snap.start = cr.cpMin; snap.end = cr.cpMax; return snap; }
+    DWORD s = 0xFFFFFFFF, e = 0xFFFFFFFF;
+    SendMessageW(h, EM_GETSEL, (WPARAM)&s, (LPARAM)&e);
+    if (s != 0xFFFFFFFF) { snap.ok = 1; snap.start = (long)s; snap.end = (long)e; }
+    return snap;
+}
+
+// 반환: 문서에 들어가지 **않은 것이 확실할 때만** false (RFC-0008 W0-04, BACKLOGS B1).
+//   EM_REPLACESEL 은 결과를 주지 않으므로 전후 선택을 견준다 — 규칙은 edit_verdict.h.
+bool EditCtl_ReplaceSelection(HWND h, const wchar_t *str) {
+    if (!h) return false;
+    EditSelSnap before = ReadSelSnap(h);
+    SendMessageW(h, EM_REPLACESEL, TRUE, (LPARAM)str);
+    EditSelSnap after = ReadSelSnap(h);
+    EditVerdict v = EditVerdict_Decide(before, after, (long)wcslen(str));
+    JamoDiag("REPLACESEL len=%d verdict=%d sel=%ld,%ld->%ld,%ld", (int)wcslen(str), (int)v,
+             before.start, before.end, after.start, after.end);
+    return !EditVerdict_Failed(v);
+}
+
+bool EditCtl_ReplaceSelectionOwned(HWND h, const wchar_t *str, JamotongTextService *svc,
+                                   const RiumOwnerBinding *owner, BOOL deferred) {
+    if (!h || h!=GetFocus() || !RiumOwner_AllowsWrite(&svc->inputOwner,owner,deferred)) return false;
+    EditSelSnap before=ReadSelSnap(h);
+    // Even EM_GETSEL can run application code. Recheck immediately before the
+    // single mutation; never replay it after a successful send changes focus.
+    if (h!=GetFocus() || !RiumOwner_AllowsWrite(&svc->inputOwner,owner,deferred)) return false;
+    SendMessageW(h,EM_REPLACESEL,TRUE,(LPARAM)str);
+    if (h!=GetFocus() || !RiumOwner_AllowsWrite(&svc->inputOwner,owner,deferred)) return true;
+    EditSelSnap after=ReadSelSnap(h);
+    if (h!=GetFocus() || !RiumOwner_AllowsWrite(&svc->inputOwner,owner,deferred)) return true;
+    return !EditVerdict_Failed(EditVerdict_Decide(before,after,(long)wcslen(str)));
+}
+
+bool EditCtl_ReadSelection(HWND h, wchar_t *outBuf, int maxLen) {
+    if (!h || !outBuf || maxLen <= 0) return false;
+    outBuf[0] = L'\0';
+    return ReadSelFromCtl(h, outBuf, maxLen);
+}
+
+void EditCtl_CollapseSelectionToEnd(HWND h) {
+    if (!h) return;
+    CHARRANGE cr; cr.cpMin = -2; cr.cpMax = -2;
+    SendMessageW(h, EM_EXGETSEL, 0, (LPARAM)&cr);
+    if (cr.cpMin >= 0) { CtlSetSel(h, cr.cpMax, cr.cpMax, true); return; }
+    DWORD s = 0xFFFFFFFF, e = 0xFFFFFFFF;
+    SendMessageW(h, EM_GETSEL, (WPARAM)&s, (LPARAM)&e);
+    if (s != 0xFFFFFFFF) CtlSetSel(h, (LONG)e, (LONG)e, false);
+}
+
+HRESULT RequestReadSelectionString(JamotongTextService *pService, ITfContext *pContext, wchar_t *outBuf, int maxLen) {
+    ReadSelSession *es = (ReadSelSession*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ReadSelSession));
+    if (!es) return E_OUTOFMEMORY;
+    es->lpVtbl = &ReadSelVtbl; es->refCount = 1; es->pService = pService; es->pContext = pContext;
+    es->outBuf = outBuf; es->maxLen = maxLen;
+    outBuf[0] = L'\0';
+    pService->lpVtblTIP->AddRef((ITfTextInputProcessor*)pService); pContext->lpVtbl->AddRef(pContext);
+    HRESULT hrSession = S_OK;
+    HRESULT hr = pContext->lpVtbl->RequestEditSession(pContext, pService->clientId, (ITfEditSession*)es, TF_ES_SYNC | TF_ES_READ, &hrSession);
+    es->lpVtbl->Release((ITfEditSession*)es);
+    JamoDiag("SELREAD tsf len=%d first=U+%04X", (int)wcslen(outBuf), (unsigned)outBuf[0]);
+    // TSF가 빈손이면(레거시 앱) 포커스 EDIT 컨트롤에서 직접 읽기 — 후보창 위치는 호출자의
+    // GUIThreadInfo 캐럿 폴백이 잡는다. 삽입=선택 교체는 EDIT의 표준 동작이라 그대로 성립.
+    if (outBuf[0] == L'\0') {
+        ReadSelectionFromFocusCtl(outBuf, maxLen);
+        JamoDiag("SELREAD ctl len=%d first=U+%04X", (int)wcslen(outBuf), (unsigned)outBuf[0]);
+    }
+    return FAILED(hr) ? hr : hrSession;   // 세션 내부 실패까지 전파 (RFC-0004 P2-2)
+}
+
+// ── UI 창 소유 스레드 가드의 계수기 (B5) ──────────────────────────────────────────
+// 진단 빌드가 아니어도 센다. 값은 **횟수 하나뿐** — 무엇을 쳤는지는 어디에도 남기지 않는다.
+void UiGuard_CrossThread(const char *what, unsigned long owner, unsigned long me) {
+    JamoDiag("UI cross-thread %s owner=%lu me=%lu", what, owner, me);
+    static long s_hits = 0;
+    long n = ++s_hits;
+    if ((n & (n - 1)) != 0) return;        // 1·2·4·8… 번째만 기록한다
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Contentrium\\RiumKeysInput", 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) return;
+    DWORD v = (DWORD)n;
+    RegSetValueExW(k, L"UiCrossThread", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
+    RegCloseKey(k);
+}
+
+// ── 캐럿이 옮겨졌는지만 보는 읽기 세션 (light dismiss, B10) ────────────────────────
+typedef struct {
+    ITfEditSessionVtbl *lpVtbl;
+    LONG refCount;
+    JamotongTextService *pService;
+    ITfContext *pContext;
+} CaretProbeSession;
+
+static HRESULT STDMETHODCALLTYPE CP_QueryInterface(ITfEditSession *pThis, REFIID riid, void **ppv) {
+    if (!ppv) return E_POINTER;
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_ITfEditSession)) {
+        *ppv = pThis; pThis->lpVtbl->AddRef(pThis); return S_OK;
+    }
+    *ppv = NULL; return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE CP_AddRef(ITfEditSession *pThis) {
+    CaretProbeSession *es = (CaretProbeSession*)pThis;
+    return (ULONG)InterlockedIncrement(&es->refCount);
+}
+static ULONG STDMETHODCALLTYPE CP_Release(ITfEditSession *pThis) {
+    CaretProbeSession *es = (CaretProbeSession*)pThis;
+    LONG n = InterlockedDecrement(&es->refCount);
+    if (n == 0) {
+        es->pService->lpVtblTIP->Release((ITfTextInputProcessor*)es->pService);
+        es->pContext->lpVtbl->Release(es->pContext);
+        HeapFree(GetProcessHeap(), 0, es);
+    }
+    return (ULONG)n;
+}
+static HRESULT STDMETHODCALLTYPE CP_DoEditSession(ITfEditSession *pThis, TfEditCookie ec) {
+    CaretProbeSession *es = (CaretProbeSession*)pThis;
+    JamotongTextService *svc = es->pService;
+    if (!CandidateUI_IsVisible() || !svc->candAnchorValid) return S_OK;
+    TF_SELECTION sel; ULONG fetched = 0;
+    if (FAILED(es->pContext->lpVtbl->GetSelection(es->pContext, ec, TF_DEFAULT_SELECTION, 1, &sel, &fetched)) || fetched == 0)
+        return S_OK;
+    ITfContextView *pView = NULL;
+    RECT rc; BOOL clipped = FALSE;
+    bool moved = false;
+    if (SUCCEEDED(es->pContext->lpVtbl->GetActiveView(es->pContext, &pView)) && pView) {
+        if (SUCCEEDED(pView->lpVtbl->GetTextExt(pView, ec, sel.range, &rc, &clipped))
+            && (rc.bottom - rc.top) > 0) {
+            const LONG slack = 3;   // 글꼴 렌더링 오차만큼은 같은 자리로 본다
+            moved = labs(rc.left - svc->candAnchorRect.left) > slack ||
+                    labs(rc.top  - svc->candAnchorRect.top)  > slack;
+        }
+        pView->lpVtbl->Release(pView);
+    }
+    sel.range->lpVtbl->Release(sel.range);
+    if (moved) CandidateUI_Cancel();   // 캐럿이 옮겨졌다 → 후보창은 남의 자리를 가리킨다
+    return S_OK;
+}
+static ITfEditSessionVtbl CaretProbeVtbl = { CP_QueryInterface, CP_AddRef, CP_Release, CP_DoEditSession };
+
+HRESULT RequestCaretMoveProbe(JamotongTextService *pService, ITfContext *pContext) {
+    if (!pService || !pContext) return E_INVALIDARG;
+    CaretProbeSession *es = (CaretProbeSession*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *es);
+    if (!es) return E_OUTOFMEMORY;
+    es->lpVtbl = &CaretProbeVtbl;
+    es->refCount = 1;
+    es->pService = pService;
+    es->pContext = pContext;
+    pService->lpVtblTIP->AddRef((ITfTextInputProcessor*)pService);
+    pContext->lpVtbl->AddRef(pContext);
+    HRESULT hrSession = S_OK;
+    // 싱크 안이라 동기 세션은 거절된다 — 비동기 읽기 전용으로 부탁한다.
+    HRESULT hr = pContext->lpVtbl->RequestEditSession(pContext, pService->clientId, (ITfEditSession*)es,
+                                                      TF_ES_ASYNCDONTCARE | TF_ES_READ, &hrSession);
+    es->lpVtbl->Release((ITfEditSession*)es);
+    return hr;
+}
+
+// 캐럿 자리만 재는 동기 읽기 세션 (B16). 조합을 한 번도 하지 않은 문맥에서는 lastCaretRect 가 비어 있다 —
+//   UWP 검색 상자처럼 고전 캐럿도 없으면 팝업이 화면 구석에 떴다. 키 싱크 안에서 부른다(동기 가능).
+static HRESULT STDMETHODCALLTYPE CR_DoEditSession(ITfEditSession *pThis, TfEditCookie ec) {
+    CaretProbeSession *es = (CaretProbeSession*)pThis;
+    CaptureCaretRect(es->pService, es->pContext, ec);
+    return S_OK;
+}
+static ITfEditSessionVtbl CaretRectVtbl = { CP_QueryInterface, CP_AddRef, CP_Release, CR_DoEditSession };
+
+bool RequestCaretRect(JamotongTextService *pService, ITfContext *pContext) {
+    if (!pService || !pContext) return false;
+    CaretProbeSession *es = (CaretProbeSession*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *es);
+    if (!es) return false;
+    es->lpVtbl = &CaretRectVtbl;
+    es->refCount = 1;
+    es->pService = pService;
+    es->pContext = pContext;
+    pService->lpVtblTIP->AddRef((ITfTextInputProcessor*)pService);
+    pContext->lpVtbl->AddRef(pContext);
+    HRESULT hrSession = E_FAIL;
+    HRESULT hr = pContext->lpVtbl->RequestEditSession(pContext, pService->clientId, (ITfEditSession*)es,
+                                                      TF_ES_SYNC | TF_ES_READ, &hrSession);
+    es->lpVtbl->Release((ITfEditSession*)es);
+    JamoDiag("CARET probe hr=0x%08lX session=0x%08lX valid=%d", (unsigned long)hr, (unsigned long)hrSession,
+             (int)pService->lastCaretValid);
+    return SUCCEEDED(hr) && SUCCEEDED(hrSession) && pService->lastCaretValid;
+}

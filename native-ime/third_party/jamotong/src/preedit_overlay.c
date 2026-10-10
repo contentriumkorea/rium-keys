@@ -1,0 +1,261 @@
+#include "preedit_overlay.h"
+#include "popup_style.h"
+#include "jamo_class.h"   // RFC-0008 W2-05
+#include "ui_element.h"
+#include "edit_session.h"   // JamoDiag (JAMO_DIAG 빌드에서만 기록)
+#include <string.h>
+
+extern HINSTANCE g_hInst;
+
+// 상태 (입력 스레드 전용 — candidate_ui와 동일 단일스레드 계약)
+
+// ── RFC-0008 W0-03 S2: 이 UI 창의 소유 스레드 ──────────────────────────────────────
+// 창은 프로세스당 하나가 맞다(한 번에 하나만 보인다 — 스레드마다 만들면 그게 회귀다).
+// 다만 **만든 스레드만** 만져야 한다: 다른 입력 스레드가 같은 HWND 를 조작하면 cross-thread
+// 창 조작이 되고, 그 스레드가 죽은 뒤엔 해제된 창을 만지게 된다.
+// 실기(2026-09-21, 메모장·UWP 검색·헬퍼 경로)에서 교차 호출은 0 이었다. 그건 '차단해도 안전하다'가
+// 아니라 '아직 못 봤다'는 뜻이다. 그래서 두 갈래로 나눈다 (B5, 2026-09-24):
+//   - **키 처리**는 막는다. 남의 스레드가 우리 창의 키를 먹는 것은 어차피 옳지 않고, 안 먹으면
+//     그 키는 응용으로 갈 뿐이라 잃는 것이 없다.
+//   - **보이기·숨기기·그리기**는 막지 않는다. 여기서 막으면 우리가 못 본 정상 경로에서 창이 안
+//     뜨거나 뜬 채 남는 새 회귀가 된다.
+// 어느 쪽이든 **횟수는 배포판에서도 센다**(UiGuard_CrossThread) — 진단 빌드는 배포하지 않으므로,
+// 세지 않으면 '로그에 찍히면 올린다'는 계획이 영원히 결론에 못 이른다.
+static DWORD g_ownerTid = 0;
+
+static void OwnerThreadClaim(void) { g_ownerTid = GetCurrentThreadId(); }
+
+static bool OwnerThreadGuard(const char *what) {
+    DWORD me = GetCurrentThreadId();
+    if (g_ownerTid && g_ownerTid != me) {
+        UiGuard_CrossThread(what, (unsigned long)g_ownerTid, (unsigned long)me);
+        return false;
+    }
+    return true;
+}
+
+static HWND    g_hwnd = NULL;
+static wchar_t g_text[64];              // 조합 표시 문자열 — 한글은 1~2자지만, 다국어(로마자
+                                        // 시퀀스·단어 단위 preedit 등)를 위해 여러 글자 허용
+static HFONT   g_font = NULL;
+static wchar_t g_fontFace[32];          // 현재 글꼴 캐시 키
+static int     g_fontH = 0;
+static int     g_fixedSize = 0;         // 마지막 Show의 크기 설정 (0=Auto=캐럿 높이)
+static RECT    g_shownRect;             // 마지막으로 적용한 캐럿 rect (화면 좌표)
+static int     g_adjustLeft = 0;        // 사후 보정 잔여 횟수 (WM_TIMER)
+
+#define PAD_X 4                          // 칩 좌우 여백(px)
+#define PAD_Y 2
+
+// 사후 자기보정: 호스트 앱의 삽입/렌더가 비동기(CUAS)거나 글자 크기가 섞인 문서라
+// Show 시점의 캐럿 rect(위치·줄높이)가 낡을 수 있다 → 표시 직후 짧게 시스템 캐럿을
+// 재표본해서 실제 캐럿과 다르면 즉시 따라간다 (다음 키 입력까지 기다리지 않음).
+#define ADJUST_TIMER_ID  1
+#define ADJUST_INTERVAL  40              // ms — 40/80/120ms 세 번 확인
+#define ADJUST_TRIES     3
+
+// 다크/라이트에 무난한 칩 색 (은은한 남색 배경 + 흰 글자 + 밑줄)
+#define CHIP_BG   RGB(37, 61, 97)
+#define CHIP_TEXT RGB(255, 255, 255)
+#define CHIP_LINE RGB(140, 180, 255)
+
+static void EnsureFont(const wchar_t *face, int h) {
+    if (h < 12) h = 12;
+    if (h > 96) h = 96;
+    if (g_font && g_fontH == h && wcscmp(g_fontFace, face) == 0) return;
+    if (g_font) DeleteObject(g_font);
+    g_font = CreateFontW(h, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                         DEFAULT_PITCH, face);
+    g_fontH = h;
+    wcsncpy(g_fontFace, face, 31); g_fontFace[31] = L'\0';
+}
+
+// 포그라운드 스레드의 시스템 캐럿 화면 rect. 옛 EDIT/CUAS 앱은 시스템 캐럿을 쓰므로
+// 앱이 렌더를 마친 '지금'의 위치·줄높이를 정확히 보고한다 (사후 보정의 기준).
+static BOOL GuitiCaretRect(RECT *out) {
+    GUITHREADINFO gti; memset(&gti, 0, sizeof(gti)); gti.cbSize = sizeof(gti);
+    if (!GetGUIThreadInfo(0, &gti) || !gti.hwndCaret) return FALSE;
+    if (gti.rcCaret.bottom - gti.rcCaret.top <= 0) return FALSE;
+    POINT tl = { gti.rcCaret.left, gti.rcCaret.top };
+    POINT br = { gti.rcCaret.right, gti.rcCaret.bottom };
+    if (!ClientToScreen(gti.hwndCaret, &tl) || !ClientToScreen(gti.hwndCaret, &br)) return FALSE;
+    out->left = tl.x; out->top = tl.y; out->right = br.x; out->bottom = br.y;
+    return TRUE;
+}
+
+// 밑줄형 커서 판정 한계(px): 이보다 낮은 캐럿은 줄 높이가 아니라 '밑줄/블록 커서의 두께'다.
+// 텍스트 캐럿(I-beam)은 줄 높이 전체로 보고되므로 이 값 이하로 내려오지 않는다.
+#define UNDERLINE_CARET_MAX_H 8
+
+// 캐럿 rect에 맞춰 글꼴(Auto=줄높이)·칩 크기·위치를 한 번에 적용.
+// face=NULL이면 현재 글꼴 캐시 유지 (타이머 보정 경로).
+// 밑줄형 커서(PuTTY 등 터미널: 높이 몇 px)는 그 높이를 무시한다 — 크기는 커서 '폭'
+// (터미널 셀 폭 ≈ 글자높이/2 → 폭*2)으로 추정하고, 칩을 커서 '위'에 바닥 정렬로 띄워
+// 커서를 가리지 않는다(실기 2026-07-24: 칩이 밑줄 위에서 너무 작게 그려짐).
+static void PlaceChip(const RECT *rcCaret, const wchar_t *face) {
+    int caretH = rcCaret->bottom - rcCaret->top;
+    int caretW = rcCaret->right - rcCaret->left;
+    bool underlineCaret = (caretH > 0 && caretH <= UNDERLINE_CARET_MAX_H);
+    int lineH;
+    if (g_fixedSize > 0) {
+        lineH = Popup_Scale(g_fixedSize, g_hwnd ? Popup_WindowDpi(g_hwnd) : 96);   // 설정값은 100% 기준 (W2-03)
+    } else if (underlineCaret) {
+        lineH = caretW * 2;                 // 셀 폭으로 줄 높이 근사 (모노스페이스 ≈ 1:2)
+        if (lineH < 16) lineH = 16;
+        if (lineH > 64) lineH = 64;
+    } else {
+        lineH = caretH;
+    }
+    if (lineH <= 0) lineH = 20;
+    wchar_t f[32];
+    wcsncpy(f, (face && face[0]) ? face : (g_fontFace[0] ? g_fontFace : L"Malgun Gothic"), 31);
+    f[31] = L'\0';
+    EnsureFont(f, lineH);
+    if (!g_font || !g_hwnd) return;
+
+    // 텍스트 폭 측정 → 칩 크기 (높이는 클램프 반영된 실제 글꼴 높이 기준)
+    int w = g_fontH, h = g_fontH + PAD_Y * 2 + 2;   // 밑줄 여유 +2
+    HDC hdc = GetDC(g_hwnd);
+    if (hdc) {
+        HFONT of = (HFONT)SelectObject(hdc, g_font);
+        SIZE sz;
+        if (GetTextExtentPoint32W(hdc, g_text, (int)wcslen(g_text), &sz)) w = sz.cx + PAD_X * 2;
+        SelectObject(hdc, of);
+        ReleaseDC(g_hwnd, hdc);
+    }
+    // 밑줄형 커서: 칩 바닥을 커서 바로 위에 붙인다(커서·해당 줄을 덮지 않음).
+    // 화면 위로 벗어나면 커서 아래로 폴백.
+    // 화면 위로 벗어나면 커서 아래로 폴백. 모니터 작업영역 기준(W2-03 — 전엔 y<0 만 봤다).
+    int x = rcCaret->left;
+    int y = underlineCaret ? rcCaret->top - h - 1 : rcCaret->top;
+    RECT work;
+    if (Popup_WorkAreaAt(rcCaret->left, rcCaret->top, &work)) {
+        if (y < work.top) y = rcCaret->bottom + 2;
+        Popup_ClampRect(&work, rcCaret->top, w, h, &x, &y);
+    } else if (y < 0) {
+        y = rcCaret->bottom + 2;
+    }
+    g_shownRect = *rcCaret;
+    SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, w, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_hwnd, NULL, TRUE);
+}
+
+static int IAbs(int v) { return v < 0 ? -v : v; }
+
+static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_TIMER:
+            if (wp == ADJUST_TIMER_ID) {
+                if (--g_adjustLeft <= 0) KillTimer(hwnd, ADJUST_TIMER_ID);
+                RECT rc;
+                if (g_text[0] && IsWindowVisible(hwnd) && GuitiCaretRect(&rc)) {
+                    // '위치가 실제로 움직였을 때만' 실캐럿을 따라간다(크기도 그때 새 rect 높이로).
+                    // 높이만 다른 경우는 무시 — 편집세션 rect와 시스템 캐럿 rect가 같은 자리를
+                    // 항상 다른 높이로 보고하는 앱(메모장)에서, 매 키마다 Show(큰)↔보정(작은)이
+                    // 번갈아 그려져 칩이 여러 번 깜빡이던 실기 발견(2026-07-08)의 원인이었다.
+                    // 낡은 좌표(CUAS)·다른 크기 영역으로의 이동은 위치도 함께 변하므로 계속 잡힌다.
+                    BOOL moved = IAbs(rc.left - g_shownRect.left) > 2 || IAbs(rc.top - g_shownRect.top) > 2;
+                    if (moved) {
+                        JamoDiag("OVERLAY adjust h=%ld->%ld", g_shownRect.bottom - g_shownRect.top,
+                                 rc.bottom - rc.top);
+                        PlaceChip(&rc, NULL);
+                    }
+                }
+                return 0;
+            }
+            break;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc; GetClientRect(hwnd, &rc);
+            // 고대비 테마면 시스템 강조색 쌍으로 (W2-03) — 고정 남색은 일부 테마에서 읽히지 않는다
+            bool hc = Popup_HighContrast();
+            COLORREF cBg = hc ? GetSysColor(COLOR_HIGHLIGHT) : CHIP_BG;
+            COLORREF cText = hc ? GetSysColor(COLOR_HIGHLIGHTTEXT) : CHIP_TEXT;
+            COLORREF cLine = hc ? GetSysColor(COLOR_HIGHLIGHTTEXT) : CHIP_LINE;
+            HBRUSH bg = CreateSolidBrush(cBg);
+            FillRect(hdc, &rc, bg);
+            DeleteObject(bg);
+            if (g_text[0] && g_font) {
+                HFONT of = (HFONT)SelectObject(hdc, g_font);
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, cText);
+                TextOutW(hdc, PAD_X, PAD_Y, g_text, (int)wcslen(g_text));
+                SelectObject(hdc, of);
+                // 조합 표시 밑줄 (인라인 조합의 관례를 칩 안에서 재현)
+                HPEN pen = CreatePen(PS_SOLID, 1, cLine);
+                HGDIOBJ op = SelectObject(hdc, pen);
+                MoveToEx(hdc, PAD_X, rc.bottom - 2, NULL);
+                LineTo(hdc, rc.right - PAD_X, rc.bottom - 2);
+                SelectObject(hdc, op);
+                DeleteObject(pen);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;   // 포커스 탈취 금지 (WS_EX_NOACTIVATE 보강)
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// 클래스 등록(1회). 실패해도 다음 Show에서 재시도하지 않도록 s_tried로 1회만.
+static bool EnsureClass(void) {
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc = OverlayWndProc;
+    wc.hInstance = g_hInst;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = L"JamotongPreeditOverlay";
+    return Jamo_EnsureClass(&wc);   // W2-05
+}
+
+void PreeditOverlay_Show(const RECT *rcCaret, const wchar_t *text, const wchar_t *fontFace, int fixedSize) {
+    // RFC-0012 Phase 3: 창을 띄우기 전 UIElementMgr 게이트 — 호스트(UI-less)가 거부하면 안 그린다.
+    // (commit 전용 호스트에서 칩이 유일한 조합 표시지만, UI-less 앱은 애초에 창이 떠선 안 되는 곳이다.)
+    if (!UiElem_BeginChip()) return;   // 호스트가 그리기 거부 → 표시 생략 (재호출 안전 — began 이면 이전 답)
+    if (!rcCaret || !text || !text[0]) { PreeditOverlay_Hide(); return; }
+    if (!EnsureClass()) return;
+
+    if (!g_hwnd) {
+        // 클릭 통과(TRANSPARENT)·포커스 비탈취(NOACTIVATE)·항상 위(TOPMOST)·작업표시줄 제외(TOOLWINDOW)
+        g_hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+            L"JamotongPreeditOverlay", L"", WS_POPUP,
+            0, 0, 10, 10, NULL, NULL, g_hInst, NULL);
+        if (!g_hwnd) { JamoDiag("OVERLAY CreateWindow FAIL err=%lu", GetLastError()); return; }
+        OwnerThreadClaim();   // 이 창은 이 스레드 것이다 (W0-03 S2)
+        SetLayeredWindowAttributes(g_hwnd, 0, 235, LWA_ALPHA);   // 약간 비치는 칩
+    }
+
+    wcsncpy(g_text, text, 63); g_text[63] = L'\0';
+    // 글꼴 크기: 고정(fixedSize>0)이면 그 값, Auto면 캐럿(줄) 높이 근사.
+    // (PuTTY 등 일부 앱은 캐럿 rect가 실제 글자보다 작게 보고됨 → 고정 크기 설정으로 해결)
+    g_fixedSize = fixedSize;
+    PlaceChip(rcCaret, (fontFace && fontFace[0]) ? fontFace : L"Malgun Gothic");
+    JamoDiag("OVERLAY show '%lc' at (%ld,%ld) h=%d vis=%d",
+             text[0], rcCaret->left, rcCaret->top, g_fontH, (int)IsWindowVisible(g_hwnd));
+
+    // 사후 자기보정 시작: 낡은 rect(비동기 렌더·혼합 글자크기)를 실캐럿으로 40ms 간격 재확인
+    g_adjustLeft = ADJUST_TRIES;
+    SetTimer(g_hwnd, ADJUST_TIMER_ID, ADJUST_INTERVAL, NULL);
+}
+
+void PreeditOverlay_Hide(void) {
+    OwnerThreadGuard("Hide");
+    UiElem_EndChip();   // 게이트 종료 (began 아니면 no-op)
+    if (g_hwnd) {
+        KillTimer(g_hwnd, ADJUST_TIMER_ID);
+        ShowWindow(g_hwnd, SW_HIDE);   // 파괴 대신 숨김(재사용 — 창 생성 비용 절약)
+    }
+    g_adjustLeft = 0;
+    g_text[0] = L'\0';
+}
+
+void PreeditOverlay_Uninitialize(void) {
+    if (g_hwnd) { DestroyWindow(g_hwnd); g_hwnd = NULL; }   // 타이머는 창 파괴와 함께 소멸
+    if (g_font) { DeleteObject(g_font); g_font = NULL; }
+    g_fontFace[0] = L'\0'; g_fontH = 0; g_text[0] = L'\0';
+    g_adjustLeft = 0;
+}

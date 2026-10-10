@@ -42,6 +42,10 @@ internal sealed class UiaProbe : IDisposable
                 bool excluded=app is "RiumKeys" or "WindowsTerminal" or "OpenConsole" or "conhost" or "cmd" or "powershell" or "pwsh" || Native.Class(window)=="ConsoleWindowClass";
                 if(excluded)reason="원래 입력 사용";
                 else if(dialog || gui.Caret!=0 || FocusProbe.NativeText(gui.Focus))reason="한글 입력 중";
+                // Premiere returns main-window focus after a tab-header click. Its
+                // subtree can contain thousands of unrelated controls; scanning it
+                // cannot establish which internal panel owns the keyboard.
+                else if(app=="Adobe Premiere Pro" && gui.Focus==window)reason="프리미어 패널 확인 불가 · 원래 입력 사용";
                 else if(Native.Class(gui.Focus).Equals("Button",StringComparison.OrdinalIgnoreCase) || Native.Class(gui.Focus).StartsWith("WindowsForms10.BUTTON.",StringComparison.OrdinalIgnoreCase))
                 {
                     eligible=true;text=false;reason="PC 단축키 대기";

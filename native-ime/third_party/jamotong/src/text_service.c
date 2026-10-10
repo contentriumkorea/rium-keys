@@ -1,0 +1,2767 @@
+#include "jamotong.h"
+#include "langbar.h"
+#include "hanja_dict.h"
+#include "candidate_ui.h"
+#include "special_char.h"
+#include "layout.h"
+#include "hangul_layout.h"
+#include "edit_session.h"
+#include "settings_ui.h"
+#include "preedit_overlay.h"
+#include "code_input.h"
+#include "comp_inline.h"   // RFC-0010 비단명 컨텍스트 문서 인라인 조합
+#include "compartment.h"   // RFC-0012 Phase 1 compartment (한/영 상태의 표준 자리)
+#include "preserved.h"     // RFC-0013 C preserved key (문맥 무관 명령키)
+#include "ui_element.h"
+#include "ui_client.h"   // RFC-0015 데스크톱 UI 헬퍼
+#include "ui_ipc.h"    // RFC-0012 Phase 3 UI element 게이트
+#include "transition.h" // RFC-0008 W1-09 조합 경계 전환 정책
+#include "hanja_txn.h"  // RFC-0008 W1-02 한자 변환 트랜잭션 정책
+#include "../../../rium-policy.h"
+static void Jamotong_ChordTimerCancel(JamotongTextService *obj);   // 3판 조합 판정 타이머 (RFC-0016 §7.1)
+// ITfTextInputProcessorEx IID (SDK msctf.idl + windows-sys 이중 확인 — RFC-0013 A)
+static const GUID kIID_ITfTextInputProcessorEx = { 0x6e4e2102, 0xf9cd, 0x433d, { 0xb4, 0x96, 0x30, 0x3c, 0xe0, 0x3a, 0x65, 0x07 } };
+extern HINSTANCE g_hInst;   // dllmain.c — DLL 모듈 핸들(사전 경로·윈도 클래스 등록용)
+#include "../../../input-owner-runtime.h"
+
+// 무간섭(직접 입력) 모드 상태의 원본 — TIP 인스턴스는 프로세스별이라 레지스트리로 공유한다.
+BOOL Jamotong_GetPassthroughReg(void) {
+    DWORD v = 0, cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Contentrium\\RiumKeysInput", L"Passthrough",
+                     RRF_RT_REG_DWORD, NULL, &v, &cb) != ERROR_SUCCESS)
+        return FALSE;
+    return v != 0;
+}
+
+static void WritePassthroughReg(BOOL on) {
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Contentrium\\RiumKeysInput", 0, NULL, 0, KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS) {
+        DWORD v = on ? 1u : 0u;
+        RegSetValueExW(hk, L"Passthrough", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+        RegCloseKey(hk);
+    }
+}
+
+// 캐럿 화면 rect 획득 폴백 체인 (RFC-0002 §3.1):
+//   1) 방금 편집 세션에서 GetTextExt로 캡처한 값(svc->lastCaretRect) — TSF 정석.
+//   2) GetGUIThreadInfo의 시스템 캐럿(rcCaret+hwndCaret) — 옛 EDIT(AkelPad)·PuTTY에서 정확.
+//   둘 다 실패 → FALSE (미리보기 생략).
+// 지금 화면의 캐럿 자리를 **캐시 없이** 읽는다. 캐시(lastCaretRect)는 우리 편집 세션에서 잡은 값이라,
+// 사용자가 캐럿을 옮겨도 그대로다 — "옮겨졌는가"를 묻는 자리에서는 캐시를 보면 안 된다 (B10).
+static BOOL GetLiveCaretScreenRect(RECT *out) {
+    GUITHREADINFO gti; memset(&gti, 0, sizeof(gti)); gti.cbSize = sizeof(gti);
+    if (GetGUIThreadInfo(0, &gti) && gti.hwndCaret &&
+        (gti.rcCaret.bottom - gti.rcCaret.top) > 0) {
+        POINT tl = { gti.rcCaret.left, gti.rcCaret.top };
+        POINT br = { gti.rcCaret.right, gti.rcCaret.bottom };
+        if (ClientToScreen(gti.hwndCaret, &tl) && ClientToScreen(gti.hwndCaret, &br)) {
+            out->left = tl.x; out->top = tl.y; out->right = br.x; out->bottom = br.y;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL GetCaretScreenRect(JamotongTextService *obj, RECT *out) {
+    if (obj->lastCaretValid) { *out = obj->lastCaretRect; return TRUE; }
+    GUITHREADINFO gti; memset(&gti, 0, sizeof(gti)); gti.cbSize = sizeof(gti);
+    if (GetGUIThreadInfo(0, &gti) && gti.hwndCaret &&
+        (gti.rcCaret.bottom - gti.rcCaret.top) > 0) {
+        POINT tl = { gti.rcCaret.left, gti.rcCaret.top };
+        POINT br = { gti.rcCaret.right, gti.rcCaret.bottom };
+        if (ClientToScreen(gti.hwndCaret, &tl) && ClientToScreen(gti.hwndCaret, &br)) {
+            out->left = tl.x; out->top = tl.y; out->right = br.x; out->bottom = br.y;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// 확정 텍스트 커밋: EDIT 계열이면 EM_REPLACESEL(빈 선택=캐럿 삽입), 아니면 TSF 편집세션.
+//   AkelEdit는 TSF InsertTextAtSelection을 hr=0으로 받고도 반영하지 않아(실기 2026-07-08),
+//   EDIT 계열은 EM_REPLACESEL만 신뢰할 수 있다. 반환 후 lastCaretValid를 세팅해 오버레이가
+//   올바른 캐럿 소스를 쓰게 한다(EDIT=GUIThreadInfo 시스템 캐럿, TSF=세션 GetTextExt).
+// RFC-0008 W0-04: 문서에 **실제로 들어갔는지**를 돌려준다. 편집 세션은 동기라 삽입 실패가
+// hrSession 으로 올라온다(RFC-0004 P2-2) — 그 값을 버리지 않는 것이 이 계약의 전부다.
+//
+// EDIT 계열 경로: `EM_REPLACESEL` 은 결과를 주지 않으므로 전후 선택을 견준다(edit_verdict.h, B1).
+// **확실히 안 들어갔을 때만** 실패다 — 판정 불가는 성공으로 본다. EDIT 로 판정된 창에서 실패하면
+// TSF 로 다시 넣지 않는다: CUAS 를 거쳐도 같은 컨트롤이 받으므로 읽기 전용·길이 제한을 넘지 못할
+// 것이고(미실측), 판정이 틀렸다면 이중 삽입이 된다.
+static bool CommitText(JamotongTextService *obj, ITfContext *pic, const wchar_t *str) {
+    RiumOwnerBinding binding={0};
+    RiumOwner_Capture(&obj->inputOwner,&binding);
+    HWND edit = EditCtl_FocusEditWindow();
+    if (edit) {
+        obj->lastCaretValid = FALSE;   // TSF rect 없음 → 오버레이는 GUIThreadInfo 캐럿 폴백
+        return EditCtl_ReplaceSelectionOwned(edit,str,obj,&binding,FALSE);
+    }
+    EditSessionData esd = {0};
+    esd.bindInputOwner=TRUE;esd.inputOwner=binding;
+    wcsncpy(esd.committed, str, 127); esd.committed[127] = L'\0';
+    HRESULT hr = RequestEditSessionData(obj, pic, &esd);   // 비-EDIT(터미널·네이티브): TSF + 캐럿 캡처
+    if (FAILED(hr)) JamoDiag("COMMIT fail hr=0x%08lX", (unsigned long)hr);
+    return SUCCEEDED(hr);
+}
+
+// FSM 결과 출력 → 커밋(확정 음절) + 조합 미리보기 오버레이 갱신(RFC-0002).
+//   g_configLock 재진입: OnKeyDown(락 보유)에서도, KeyUp(무락)에서도 안전.
+static bool OutputResult(JamotongTextService *obj, ITfContext *pic, FsmResult res, BOOL isFlush) {
+    (void)isFlush;
+    bool ok = true;
+    if (res.commitChar) {                 // 확정 음절 → EDIT=EM_REPLACESEL / 비-EDIT=TSF
+        wchar_t cs[2] = { res.commitChar, L'\0' };
+        ok = CommitText(obj, pic, cs);
+    } else {
+        // 조합만(삽입 없음): 캐럿 rect 캡처만 (오버레이용) — 실패해도 문서는 그대로이므로
+        // 트랜잭션 성공/실패와 무관하다.
+        RequestEditSession(obj, pic, res);
+    }
+
+    EnterCriticalSection(&g_configLock);
+    bool show = obj->config.options.showPreview && res.preeditChar;
+    wchar_t face[32];
+    wcsncpy(face, obj->config.options.previewFont, 31); face[31] = L'\0';
+    int pvSize = obj->config.options.previewFontSize;
+    LeaveCriticalSection(&g_configLock);
+
+    if (show) {
+        RECT rc;
+        if (GetCaretScreenRect(obj, &rc)) {
+            // CUAS 낡은 좌표 보정(누적형): CUAS 앱은 커밋 삽입이 비동기라 rect가 늦게 전진한다.
+            // rect가 직전 원시값과 같으면 "정체" — 그 사이 발생한 커밋 수만큼 전각 폭을 누적 보정.
+            // rect가 실제로 움직이면 누적을 리셋. 네이티브 앱은 즉시 전진하므로 보정 미발동.
+            RECT raw = rc;
+            if (obj->prevChipValid &&
+                raw.left == obj->prevChipRect.left && raw.top == obj->prevChipRect.top) {
+                // 실패한 커밋(가득 찬 칸 등 — EM_REPLACESEL 이 무시됨)은 캐럿을 옮기지 않았으므로 세지 않는다.
+                //   세면 칸이 가득 찬 동안 칩이 커밋마다 한 칸씩 오른쪽으로 밀려났다(실기 2026-09-30, D4).
+                if (res.commitChar && ok) obj->chipPendingAdv += (raw.bottom - raw.top);
+            } else {
+                obj->chipPendingAdv = 0;
+            }
+            rc.left += obj->chipPendingAdv; rc.right += obj->chipPendingAdv;
+            obj->prevChipRect = raw;   // 비교는 항상 '원시' 좌표 기준
+            obj->prevChipValid = TRUE;
+            JamoDiag("CHIP raw=(%ld,%ld-%ld,%ld) adv=%d commit=%d src=%s",
+                     raw.left, raw.top, raw.right, raw.bottom, obj->chipPendingAdv,
+                     res.commitChar ? 1 : 0, obj->lastCaretValid ? "TextExt" : "GUITI");
+            wchar_t s[2] = { res.preeditChar, L'\0' };
+            PreeditOverlay_Show(&rc, s, face, pvSize);
+            return ok;
+        }
+        JamoDiag("CHIP no-rect (TextExt fail + GUIThreadInfo fail) -> hide");
+    }
+    obj->prevChipValid = FALSE;   // 표시 안 함 → 비교 기준 리셋
+    obj->chipPendingAdv = 0;
+    PreeditOverlay_Hide();   // preedit 없음/옵션 꺼짐/좌표 불명 → 숨김
+    return ok;
+}
+
+static void ResetComposition(JamotongTextService *obj);
+static bool OutputResultSeq(JamotongTextService *obj, ITfContext *pic, FsmResult res, BOOL isFlush);
+typedef enum { TRANS_WHY_FOCUS, TRANS_WHY_KEY, TRANS_WHY_EXTERNAL } TransWhy;
+static void Jamotong_Transition(JamotongTextService *obj, TransWhy why, ITfContext *pic);
+
+// 무간섭(직접 입력) 모드 토글 — 조합·팝업을 정리하고 레지스트리에 기록·발행한다.
+// 켜져 있는 동안 키 싱크는 해제 단축키 외 모든 키를 통과시킨다(원격 데스크톱 등).
+void Jamotong_SetPassthrough(JamotongTextService *obj, BOOL on) {
+    // 모드 경계 = 조합 경계. 밖에서 자판이 바뀔 때와 똑같이 접는다 (B3) — 예전에는 여기서만
+    // 타이머·합성 수식키·순차 보류를 안 건드려, 무간섭으로 들어간 뒤에도 남아 있었다.
+    Jamotong_Transition(obj, TRANS_WHY_EXTERNAL, NULL);
+    obj->passthrough = on;
+    WritePassthroughReg(on);
+    Compart_Publish(obj);    // compartment 에도 반영 (RFC-0012 Phase 1; HKCU 는 한 판 병행)
+    JamoDiag("PASSTHROUGH %s", on ? "ON" : "OFF");
+}
+
+// ── RFC-0008 W1-09: 조합 대상 기억과 대상에 묶인 보류 ────────────────────────────────────
+// 포커스 알림 시점엔 이미 새 창에 포커스가 있다. 그래서 '지금 포커스'가 아니라 조합을 시작한
+// 대상(창·문맥)에 남은 음절을 넣는다. 규칙(순수)은 transition.h.
+static void CompTarget_Clear(JamotongTextService *obj) {
+    ITfContext *context = obj->compTargetCtx;
+    obj->compTargetCtx = NULL;
+    obj->compTargetHwnd = NULL;
+    obj->compTargetFocusHwnd = NULL;
+    obj->compTargetOwner = (RiumOwnerBinding){0};
+    if (context) context->lpVtbl->Release(context);
+}
+
+static void CompTarget_Remember(JamotongTextService *obj, ITfContext *pic) {
+    if (!pic || obj->compTargetCtx) return;   // 조합마다 한 번 (ResetComposition 이 비운다)
+    HWND owner = GetFocus(); // Before AddRef or EDIT capability messages can reenter the host.
+    RiumOwnerBinding binding={0};
+    RiumOwner_Capture(&obj->inputOwner,&binding);
+    pic->lpVtbl->AddRef(pic);
+    // Keep this reference local until every host callback has completed. A
+    // nested key/focus callback may already have published a newer target.
+    if (obj->compTargetCtx || GetFocus()!=owner ||
+        !RiumOwner_AllowsWrite(&obj->inputOwner,&binding,FALSE)) {
+        pic->lpVtbl->Release(pic);
+        return;
+    }
+    HWND edit = EditCtl_FocusEditWindow();
+    if (obj->compTargetCtx || GetFocus()!=owner ||
+        !RiumOwner_AllowsWrite(&obj->inputOwner,&binding,FALSE)) {
+        pic->lpVtbl->Release(pic);
+        return;
+    }
+    obj->compTargetCtx = pic;
+    obj->compTargetFocusHwnd = owner;
+    obj->compTargetOwner = binding;
+    obj->compTargetHwnd = edit == owner ? edit : NULL;
+}
+
+void Jamotong_PendingClear(JamotongTextService *obj) {
+    ITfContext *context = obj->cpPendingCtx;
+    ++obj->cpPendingGeneration;
+    obj->cpPendingCtx = NULL;
+    obj->cpPendingHwnd = NULL;
+    obj->cpPendingFocusHwnd = NULL;
+    obj->cpPendingCommit = 0;
+    obj->pendingOwner = (RiumOwnerBinding){0};
+    if (context) context->lpVtbl->Release(context);
+}
+
+// Consumes a context reference already owned by compTargetCtx. No COM call may
+// occur between detaching that tuple and publishing this complete pending slot.
+static void Pending_Set(JamotongTextService *obj,wchar_t ch,HWND hwnd,HWND focus,
+                        ITfContext *ctx,const RiumOwnerBinding *binding) {
+    ++obj->cpPendingGeneration;
+    obj->cpPendingCommit=ch;
+    obj->cpPendingHwnd=hwnd;
+    obj->cpPendingFocusHwnd=focus;
+    obj->pendingOwner=*binding;
+    obj->cpPendingCtx=ctx;
+}
+
+static void Transition_FlushComposition(JamotongTextService *obj,const char *why) {
+    // A single occupied slot is backpressure, never permission to discard the FSM.
+    if (obj->cpPendingCommit || obj->cpPendingInFlight) return;
+    HWND eh=obj->compTargetHwnd;
+    int editOk=eh && IsWindow(eh) && GetWindowThreadProcessId(eh,NULL)==GetCurrentThreadId();
+    TransFlushAction a=Trans_FlushAction(JamoComp_IsActive(obj)?1:0,
+        obj->fsm.state!=STATE_EMPTY,editOk,obj->compTargetCtx!=NULL);
+    if(a==TRANS_NONE || a==TRANS_FINALIZE_INLINE)return;
+    wchar_t ch=Fsm_Flush(&obj->fsm);
+    if(!ch)return;
+    HWND focus=obj->compTargetFocusHwnd;
+    ITfContext *context=obj->compTargetCtx;
+    RiumOwnerBinding binding=obj->compTargetOwner;
+    obj->compTargetCtx=NULL;obj->compTargetHwnd=NULL;obj->compTargetFocusHwnd=NULL;
+    obj->compTargetOwner=(RiumOwnerBinding){0};
+    Pending_Set(obj,ch,editOk?eh:NULL,focus,context,&binding);
+    ULONG generation=obj->cpPendingGeneration;
+    wchar_t cs[2]={ch,L'\0'};
+    BOOL done=FALSE;
+    obj->cpPendingInFlight=TRUE;
+    if(a==TRANS_EDIT_REPLACE)
+        done=EditCtl_ReplaceSelectionOwned(eh,cs,obj,&binding,TRUE);
+    obj->cpPendingInFlight=FALSE;
+    // Host callbacks may cancel this slot and publish another. Never clear it.
+    if(done && generation==obj->cpPendingGeneration)Jamotong_PendingClear(obj);
+    JamoDiag("TRANS %s flush U+%04X action=%d done=%d",why,(unsigned)ch,(int)a,(int)done);
+}
+
+static bool RetryPendingAtOwnedFocus(JamotongTextService *obj, ITfContext *pic) {
+    if (obj->cpPendingInFlight) return false;
+    if (!obj->cpPendingCommit) return true;
+    if (!pic || !obj->cpPendingFocusHwnd || obj->cpPendingFocusHwnd != GetFocus() ||
+        (obj->cpPendingCtx && obj->cpPendingCtx != pic)) return false;
+    if (!RiumOwner_AllowsWrite(&obj->inputOwner,&obj->pendingOwner,TRUE)) return false;
+    wchar_t cs[2] = { obj->cpPendingCommit, L'\0' };
+    HWND owner = obj->cpPendingFocusHwnd;
+    HWND edit = obj->cpPendingHwnd;
+    ULONG generation = obj->cpPendingGeneration;
+    obj->cpPendingInFlight = TRUE;
+    bool inserted;
+    if (edit && edit == owner) {
+        inserted = EditCtl_ReplaceSelectionOwned(edit,cs,obj,&obj->pendingOwner,TRUE);
+    } else {
+        EditSessionData data={0};data.committed[0]=cs[0];
+        data.bindFocus=TRUE;data.focusOwner=owner;
+        data.bindInputOwner=TRUE;data.inputOwner=obj->pendingOwner;data.deferred=TRUE;
+        inserted = RequestEditSessionData(obj, pic, &data) == S_OK;
+    }
+    bool sameSlot = generation == obj->cpPendingGeneration;
+    if (inserted && sameSlot) Jamotong_PendingClear(obj);
+    obj->cpPendingInFlight = FALSE;
+    return inserted && sameSlot && !obj->cpPendingCommit;
+}
+
+/* Leaving a logical editor must not flush its unfinished text through a CUAS
+ * context that already points at a command surface. Move the existing context
+ * reference with the syllable; no application callback or write is needed. */
+static void OwnerQuarantine(JamotongTextService *obj) {
+    obj->inputOwnerBoundary=TRUE;
+    if (obj->pComposition || obj->cpPendingCommit || obj->fsm.state==STATE_EMPTY) return;
+    wchar_t pending=Fsm_Flush(&obj->fsm);
+    if (!pending) return;
+    ++obj->cpPendingGeneration;
+    obj->cpPendingCommit=pending;
+    obj->cpPendingHwnd=obj->compTargetHwnd;
+    obj->cpPendingFocusHwnd=obj->compTargetFocusHwnd;
+    obj->cpPendingCtx=obj->compTargetCtx;
+    obj->pendingOwner=obj->compTargetOwner;
+    obj->compTargetHwnd=NULL;obj->compTargetFocusHwnd=NULL;obj->compTargetCtx=NULL;
+    obj->compTargetOwner=(RiumOwnerBinding){0};
+}
+
+bool Jamotong_HasPendingTimers(void);
+static bool OwnerPassesCommand(JamotongTextService *obj, WPARAM key, UINT mods) {
+    RiumOwnerKind kind=RiumOwnerRuntime_AtBoundary(&obj->inputOwner,
+        !obj->pComposition && obj->fsm.state==STATE_EMPTY && !obj->cpPendingCommit &&
+        !obj->cpPendingInFlight && !obj->compFinalizePending && !Jamotong_InOurEdit() &&
+        !obj->compTargetCtx && !Jamotong_HasPendingTimers() &&
+        !obj->seqKb.pending[0] && !obj->seqKb.reading[0]);
+    if (kind!=RIUM_OWNER_COMMAND) return false;
+    OwnerQuarantine(obj);
+    if (key<'A' || key>'Z' || mods) return false;
+    UINT character=MapVirtualKeyExW((UINT)key,MAPVK_VK_TO_CHAR,GetKeyboardLayout(0));
+    return character==(UINT)key || character==(UINT)key+('a'-'A');
+}
+
+// 순차 입력(중국어·일본어)의 읽기도 포커스 이동·밖에서의 전환에서 잃지 않는다 — 읽기는 미리보기(오버레이)일 뿐
+//   문서에 없으므로, 한글 음절처럼 조합을 시작한 대상에 친 그대로 확정한다 (일본어 실기 2026-10-04: かな 가 사라졌다).
+static void Transition_FlushSeq(JamotongTextService *obj, const char *why) {
+    LayoutConfig *cur = Config_GetCurrentLayout(&obj->config);
+    if (!cur || cur->type != LAYOUT_TYPE_SEQUENCE || !cur->pSeqLayout) return;
+    if (!obj->seqKb.pending[0] && !obj->seqKb.reading[0]) return;
+    SeqResult r = SeqKb_Flush(&obj->seqKb, (const SeqLayout *)cur->pSeqLayout);
+    if (!r.committed[0]) return;
+    HWND eh = obj->compTargetHwnd;
+    bool editOk = eh && IsWindow(eh) && GetWindowThreadProcessId(eh, NULL) == GetCurrentThreadId();
+    BOOL done = FALSE;
+    if (editOk) {
+        done = EditCtl_ReplaceSelection(eh, r.committed) ? TRUE : FALSE;
+    } else if (obj->compTargetCtx) {
+        EditSessionData esd = {0};
+        lstrcpynW(esd.committed, r.committed, 121);
+        done = SUCCEEDED(RequestEditSessionDataEx(obj, obj->compTargetCtx, &esd, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE));
+    }
+    PreeditOverlay_Hide();
+    JamoDiag("TRANS %s seq flush %u chars done=%d", why, (unsigned)wcslen(r.committed), (int)done);
+}
+
+// compartment 통지 등 '밖'에서 자판이 바뀐 뒤의 공통 뒤처리. 키 싱크의 자판 전환 경로와 같은 순서:
+// 조합 경계(인라인 조합 확정·FSM/칩·모아치기 정리) → 언어바. (compartment 발행은 호출자가 한다.)
+// ── 조합 경계 전환 — 한 경로 (RFC-0008 W1-03) ────────────────────────────────────────────
+// 포커스 이동·자판 전환 키·언어바/표시기 전환이 모두 여기로 온다. 순서:
+//   ① 남은 음절 확정 — 키 이벤트 안(TRANS_WHY_KEY)이면 동기 출력, 밖이면 기억한 대상에(비동기/EDIT)
+//   ② 모아치기 hold 모디파이어 key-up (실패해도 반드시)  ③ FSM·칩·조합 대상 리셋  ④ 팝업 정리
+// 설정창 적용(Config_ApplyEdited)은 설정 스레드라 여기 오지 않는다 — 설정창이 포커스를 가져갈 때 ①이 이미 돈다.
+// 순차 변환 결과를 문서에 넣는다 (정의는 아래 조합 타이머 곁) — 경계 확정에서 먼저 쓴다.
+static void SeqApply(JamotongTextService *obj, ITfContext *pic, const SeqResult *r);
+static bool SeqOpenCandidates(JamotongTextService *obj, ITfContext *pic, const SeqLayout *sl, bool live);
+static bool SeqShowSegments(JamotongTextService *obj, ITfContext *pic, const SeqLayout *sl);
+
+static void UiCandHide(JamotongTextService *obj);
+static void UiCodeHide(JamotongTextService *obj);
+
+// ── 입력을 접는 단 하나의 길 (B3) ─────────────────────────────────────────────────
+// 경계는 여럿이다: 자판 전환·포커스 상실·밖에서의 전환·무간섭 모드 토글·Deactivate. 예전에는
+// 경계마다 무엇을 접을지 목록이 조금씩 달라, 어떤 길로 나가면 조합 판정 타이머가 살아 있거나
+// 합성 수식키가 눌린 채 남거나 헬퍼 창이 떠 있었다. **접는 일은 여기 한 곳에만 적는다.**
+//   확정(무엇을 문서에 남길지)은 경계마다 다르므로 부르는 쪽이 먼저 하고, 이 함수는 그 뒤에
+//   남은 상태와 화면을 비운다.
+static void Jamotong_FoldInput(JamotongTextService *obj) {
+    if (obj->cpPendingInFlight || (obj->cpPendingCommit && obj->fsm.state!=STATE_EMPTY)) return;
+    FsmContext beforeFsm=obj->fsm;
+    ITfContext *beforeTarget=obj->compTargetCtx;
+    ITfComposition *beforeComp=obj->pComposition;
+    RiumOwnerBinding beforeOwner=obj->compTargetOwner;
+    uint64_t beforeEpoch=obj->inputOwner.epoch;
+    Jamotong_ChordTimerCancel(obj);      // 늦은 콜백 금지 (RFC-0016 §7.1)
+    ChordKb_ReleaseAll(&obj->chordKb);   // 합성 Ctrl/Alt 가 대상 앱에 눌린 채 남지 않게 (W1-09)
+    if (obj->cpPendingInFlight || obj->compTargetCtx!=beforeTarget ||
+        obj->pComposition!=beforeComp || obj->inputOwner.epoch!=beforeEpoch ||
+        memcmp(&obj->compTargetOwner,&beforeOwner,sizeof beforeOwner) ||
+        memcmp(&obj->fsm,&beforeFsm,sizeof beforeFsm)) return;
+    SeqKb_Init(&obj->seqKb);             // 순차 변환의 보류·읽기
+    ResetComposition(obj);               // 인라인 Finalize + FSM·모아치기·칩·조합 대상
+    CodeInput_Hide();
+    if (CandidateUI_IsVisible()) JamoDiag("FOLD cancels candidates tid=%lu", (unsigned long)GetCurrentThreadId());
+    CandidateUI_Cancel();                // 콜백 경유로 pic 참조까지 정리
+    UiCodeHide(obj);                     // UWP 헬퍼가 그린 것들 (RFC-0015)
+    UiCandHide(obj);
+}
+
+static void Jamotong_Transition(JamotongTextService *obj, TransWhy why, ITfContext *pic) {
+    if (obj->cpPendingInFlight || (obj->cpPendingCommit && obj->fsm.state!=STATE_EMPTY)) return;
+    BOOL wasInline=JamoComp_IsActive(obj);
+    if (why == TRANS_WHY_KEY && pic) {
+        LayoutConfig *cur = Config_GetCurrentLayout(&obj->config);
+        if (cur && cur->type == LAYOUT_TYPE_SEQUENCE) {
+            // 순차 변환: 보류한 입력을 잃지 않도록 리터럴로 확정한다 (RFC-0016 §6.3)
+            SeqResult r = SeqKb_Flush(&obj->seqKb, (const SeqLayout*)cur->pSeqLayout);
+            if (r.committed[0]) SeqApply(obj, pic, &r);
+        } else if (obj->fsm.state != STATE_EMPTY) {
+            FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};
+            OutputResultSeq(obj, pic, res, TRUE);   // 키 이벤트 안 — 동기 세션 허용
+        }
+    } else {
+        Transition_FlushSeq(obj, why == TRANS_WHY_FOCUS ? "focus" : "ext-switch");
+        Transition_FlushComposition(obj, why == TRANS_WHY_FOCUS ? "focus" : "ext-switch");
+    }
+    // A callback may have begun another input transaction while the old one
+    // was being delivered. Its text/target belong to the nested transaction.
+    if (obj->cpPendingInFlight || (!wasInline && obj->fsm.state!=STATE_EMPTY) ||
+        (!wasInline && why!=TRANS_WHY_KEY && obj->compTargetCtx)) return;
+    Jamotong_FoldInput(obj);             // 접는 일은 한 곳에만 (B3)
+}
+
+// 밖(언어바 클릭·표시기·compartment 통지)에서 자판이 바뀔 때. 이름은 기존 호출부 호환.
+void Jamotong_FlushForExternalSwitch(JamotongTextService *obj) {
+    Jamotong_Transition(obj, TRANS_WHY_EXTERNAL, NULL);
+}
+
+static void DeferFallbackOnFocusChange(JamotongTextService *obj, ITfContext *pic) {
+    if (JamoComp_IsActive(obj)) return;
+    if (obj->fsm.state == STATE_EMPTY) {
+        if (!obj->seqKb.pending[0] && !obj->seqKb.reading[0]) CompTarget_Clear(obj);
+        return; // A completed syllable cannot own the next composition.
+    }
+    if (obj->compTargetCtx &&
+        (obj->compTargetCtx != pic || !obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus()))
+        Jamotong_Transition(obj, TRANS_WHY_FOCUS, NULL);
+}
+
+// 키(단축키·preserved key)로 자판을 돌릴 때 — 두 진입점이 같은 순서를 쓴다.
+static void RotateLayoutFromKey(JamotongTextService *obj, ITfContext *pic) {
+    Jamotong_Transition(obj, TRANS_WHY_KEY, pic);
+    Config_RotateLayout(&obj->config);
+    JamoDiag("ROTATE idx=%d/%d", obj->config.currentLayoutIndex, obj->config.layoutCount);
+    LangBar_Update(obj->pLangBarItem);
+    Compart_Publish(obj);
+}
+
+void Jamotong_OnLayoutSwitched(JamotongTextService *obj) {
+    Jamotong_FlushForExternalSwitch(obj);
+    LangBar_Update(obj->pLangBarItem);
+}
+
+// 조합 상태 전면 리셋 — FSM·모아치기(chord)·미리보기 칩 상태를 '한 곳에서' 비운다.
+// (프리뷰 숨김/칩 상태 리셋이 여러 경로에 흩어져 있어, 조합이 깨졌을 때 칩이 갇히거나
+// 상태가 어긋나던 문제의 단일 진입점 — 실기 2026-07-08. 표시 갱신은 OutputResult가 유일한
+// 표시 경로이고, 리셋은 이 함수가 유일한 정리 경로다.)
+// RFC-0010: 문서 인라인 조합이 남아 있으면 '확정'(텍스트 보존)하고 경로 캐시를 비운다 —
+// 포커스 이동 시 MS IME 관례(조합 텍스트 유지). Esc 취소는 호출 전에 JamoComp_Cancel.
+static void ResetComposition(JamotongTextService *obj) {
+    if (obj->cpPendingInFlight || (obj->cpPendingCommit && obj->fsm.state!=STATE_EMPTY)) return;
+    ITfContext *target=obj->compTargetCtx;
+    RiumOwnerBinding binding=obj->compTargetOwner;
+    FsmContext fsm=obj->fsm;
+    uint64_t epoch=obj->inputOwner.epoch;
+    if (JamoComp_Finalize(obj)!=S_OK) return;
+    if (obj->pComposition || obj->compTargetCtx!=target || obj->inputOwner.epoch!=epoch ||
+        memcmp(&obj->compTargetOwner,&binding,sizeof binding) ||
+        (obj->fsm.state!=STATE_EMPTY && memcmp(&obj->fsm,&fsm,sizeof fsm))) return;
+    Jamotong_ClearCompositionState(obj);
+}
+
+void Jamotong_ClearCompositionState(JamotongTextService *obj) {
+    JamoComp_ResetPathCache(obj);  // 컨텍스트 경로 캐시 무효화 (stale 포인터 방지)
+    Fsm_Init(&obj->fsm);
+    Chord_Init(&obj->chord);
+    obj->lastCaretValid = FALSE;
+    obj->prevChipValid = FALSE;
+    obj->chipPendingAdv = 0;
+    PreeditOverlay_Hide();
+    CompTarget_Clear(obj);         // 조합이 끝났다 — 다음 조합은 대상을 새로 기억한다 (W1-09)
+}
+
+// Supported TSF and CUAS contexts display composition inline. Unsupported or
+// behaviorally demoted contexts retain the visible commit-only fallback.
+//   isFlush=TRUE: res.commitChar는 '현재 조합의 확정'이다. 인라인 조합이 활성이면 그 텍스트가
+//   이미 문서 안에 있으므로 재삽입하지 않고 composition만 확정한다(재삽입=글자 중복).
+// 모아치기/코드/정적/플러그인 경로는 기존 OutputResult를 그대로 쓴다.
+static bool OutputResult(JamotongTextService *obj, ITfContext *pic, FsmResult res, BOOL isFlush);
+static bool OutputResultSeq(JamotongTextService *obj, ITfContext *pic, FsmResult res, BOOL isFlush) {
+    if (!isFlush && (obj->compFinalizePending || obj->compBoundaryWritten ||
+        (obj->pComposition && !JamoComp_OwnsFocus(obj, pic)))) return false;
+    CompTarget_Remember(obj, pic);   // 조합 대상 기억 (조합마다 한 번, RFC-0008 W1-09)
+    if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus() ||
+        !RiumOwner_AllowsWrite(&obj->inputOwner,&obj->compTargetOwner,FALSE)) return false;
+    // Check the context's interfaces, not the application or control class name.
+    JamoPathKind path = pic ? JamoComp_PathForContext(obj, pic) : JAMO_PATH_COMMIT;
+    if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus() ||
+        !RiumOwner_AllowsWrite(&obj->inputOwner,&obj->compTargetOwner,FALSE)) return false;
+    if (pic && path == JAMO_PATH_STANDARD) {
+        if (JamoComp_IsActive(obj) && isFlush) {
+            if (JamoComp_Finalize(obj) != S_OK) return false;
+            obj->prevChipValid = FALSE; obj->chipPendingAdv = 0;
+            PreeditOverlay_Hide();
+            return true;
+        }
+        if (!isFlush) {
+            HRESULT applyHr=JamoComp_Apply(obj, pic, res);
+            if (SUCCEEDED(applyHr)) {
+                obj->prevChipValid = FALSE; obj->chipPendingAdv = 0;
+                PreeditOverlay_Hide();   // 문서가 밑줄 preedit를 직접 표시한다
+                return true;
+            }
+            if (applyHr==E_PENDING) return false;
+            if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus()) return false;
+            // 실패: Apply가 rollback+강등까지 마쳤다 — 이 키 결과는 아래 기존 경로로 커밋.
+        }
+        // isFlush인데 인라인 조합이 없으면(첫 키 실패·외부 종료 직후 등) 기존 경로로 확정.
+    }
+    return OutputResult(obj, pic, res, isFlush);
+}
+
+// 유니코드 직접 입력용 16진수 헬퍼
+static inline bool IsHexW(wchar_t c) {
+    return (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'F') || (c >= L'a' && c <= L'f');
+}
+static inline unsigned HexValW(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return (unsigned)(c - L'0');
+    if (c >= L'A' && c <= L'F') return (unsigned)(c - L'A' + 10);
+    return (unsigned)(c - L'a' + 10);
+}
+
+// 한자 후보 콜백 문맥 — 상태는 서비스 인스턴스(obj->candCtx)가 갖는다(RFC-0008 W0-03).
+// 콜백에는 서비스 포인터만 넘긴다: 그래야 '어느 인스턴스의 후보인가'가 흐려지지 않는다.
+
+// ── UWP(AppContainer) 호스트 대응 ─────────────────────────────────────────────────
+// AppContainer 프로세스(작업표시줄 검색·설정 앱 등 UWP) 안에서 만든 TIP 소유 HWND 는 데스크톱에
+// 나타나지 않는다 — 창은 만들어지고 IsWindowVisible 도 TRUE 지만 화면에 합성되지 않는다(실기
+// 2026-09-19: 창을 셸 팝업 밖 좌표로 강제해도 보이지 않고, 다른 프로세스의 EnumWindows 에도
+// 잡히지 않는다). 대체 경로여야 할 UI element 도 이 호스트에서는 BeginUIElement 가 show=TRUE
+// (="네가 그려라")를 돌려주므로 호스트 렌더도 일어나지 않는다. 결과적으로 후보창이 아무 데도
+// 뜨지 않는다 → 후보창 없이 한자키로 후보를 순환 교체하는 경로로 강등한다.
+static bool HostIsAppContainer(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached != 0;
+    cached = 0;
+    HANDLE tok = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        DWORD isAC = 0, len = 0;
+        if (GetTokenInformation(tok, TokenIsAppContainer, &isAC, sizeof(isAC), &len) && isAC)
+            cached = 1;
+        CloseHandle(tok);
+    }
+    JamoDiag("HOST appcontainer=%d", cached);
+    return cached != 0;
+}
+
+// AppContainer(UWP) 호스트에서 자체 창 대신 헬퍼·순환으로 곧장 돌아가는가 (오너 결정 A9, 2026-09-30).
+//   기본은 자체 창이 먼저다 — 소유된 창은 작업표시줄 검색(AppContainer) 안에서도 보였다(실기 2026-09-30).
+//   RFC-0015 의 "합성되지 않는다"(2026-09-19)는 소유자 없는 창에서 잰 것이었다. 옵션을 끄면 예전 순서.
+static bool UwpDetour(const JamotongTextService *obj) {
+    return HostIsAppContainer() && !obj->config.options.uwpOwnWindow;
+}
+
+// 문서 뷰의 창 — 후보창 소유자의 대체값(포커스 창이 없을 때). 실패하면 NULL.
+static HWND ContextViewWindow(ITfContext *pic) {
+    HWND h = NULL;
+    ITfContextView *view = NULL;
+    if (pic && SUCCEEDED(pic->lpVtbl->GetActiveView(pic, &view)) && view) {
+        if (FAILED(view->lpVtbl->GetWnd(view, &h))) h = NULL;
+        view->lpVtbl->Release(view);
+    }
+    JamoDiag("VIEW wnd=%p focus=%p", (void*)h, (void*)GetFocus());
+    return h;
+}
+
+// 후보창 없는 순환 변환 상태 (한자키를 거듭 누르면 다음 후보로 교체)
+
+static void HanjaCycleReset(JamotongTextService *obj) { memset(&obj->hanjaCycle, 0, sizeof(obj->hanjaCycle)); }
+
+// RFC-0015: 데스크톱 호스트에서 TIP 이 살아날 때 UI 헬퍼가 없으면 띄운다.
+// AppContainer 안에서는 프로세스를 못 띄우므로 **데스크톱 쪽에서** 해 둬야 UWP 호스트가 쓸 수 있다.
+// 세션당 하나는 헬퍼 자신이 뮤텍스로 보장하므로 여기서는 중복을 걱정하지 않는다(조용히 종료된다).
+static void EnsureUiHelperRunning(void) {
+    if (HostIsAppContainer()) return;              // 여기선 띄울 수 없다
+    DWORD sid = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &sid)) sid = 0;
+    wchar_t mname[128];
+    _snwprintf(mname, 128, JAMO_UIIPC_MUTEX_FMT, (unsigned long)sid);
+    mname[127] = L'\0';
+    HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, mname);
+    if (m) { CloseHandle(m); return; }             // 이미 돈다
+
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(g_hInst, exe, MAX_PATH)) return;
+    wchar_t *slash = wcsrchr(exe, L'\\');
+    if (!slash) return;
+    *slash = L'\0';
+    wchar_t cmd[MAX_PATH + 32];
+    _snwprintf(cmd, MAX_PATH + 32, L"\"%ls\\jamotong.exe\" --ui-server", exe);
+    cmd[MAX_PATH + 31] = L'\0';
+
+    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        JamoDiag("UIHELPER spawned");
+    } else {
+        JamoDiag("UIHELPER spawn fail err=%lu", GetLastError());
+    }
+}
+
+static void ApplyHanjaChoice(JamotongTextService *obj, const wchar_t *str, int replaceLen);
+
+// ── RFC-0015: UWP 호스트에서 후보창을 데스크톱 헬퍼에 그리게 한다 ───────────────────────
+// 창은 헬퍼가 그리지만 **키는 여기서 먹는다**(헬퍼는 표시 전용). 헬퍼가 없으면 이 경로는
+// 아예 켜지지 않고 순환 변환으로 폴백한다.
+
+static void UiCandHide(JamotongTextService *obj) {
+    if (!obj->uiCand.active) return;
+    UiClient_Hide();
+    memset(&obj->uiCand, 0, sizeof(obj->uiCand));
+}
+
+// 후보 한 줄의 표시 문자열을 만든다(번호·글자·훈음·U+). 헬퍼는 사전을 모르므로 완성해 보낸다.
+static void UiCandFormat(wchar_t *out, int cch, int idx, const wchar_t *cand, bool special) {
+    const wchar_t *hun = NULL;
+    if (!special && cand && cand[0] && !cand[1]) hun = HunumDict_Find(cand[0]);
+    if (hun && hun[0])
+        _snwprintf(out, cch, L"%d. %ls  %ls  U+%04X", idx, cand, hun, (unsigned)cand[0]);
+    else if (cand && cand[0] && !cand[1])
+        _snwprintf(out, cch, L"%d. %ls  U+%04X", idx, cand, (unsigned)cand[0]);
+    else
+        _snwprintf(out, cch, L"%d. %ls", idx, cand ? cand : L"");
+    out[cch - 1] = L'\0';
+}
+
+static bool UiCandShow(JamotongTextService *obj, wchar_t **cands, int count, int replaceLen,
+                       bool special, int x, int y, int caretTop, const wchar_t *face, int fontSize) {
+    if (!UiClient_Available()) return false;
+    if (count > JAMO_UIIPC_MAX_CAND) count = JAMO_UIIPC_MAX_CAND;
+    wchar_t lines[JAMO_UIIPC_MAX_CAND][JAMO_UIIPC_MAX_CANDLEN];
+    const wchar_t *ptrs[JAMO_UIIPC_MAX_CAND];
+    for (int i = 0; i < count; i++) {
+        UiCandFormat(lines[i], JAMO_UIIPC_MAX_CANDLEN, (i % 9) + 1, cands[i], special);
+        ptrs[i] = lines[i];
+    }
+    if (!UiClient_Show(ptrs, count, 9, 0, x, y, caretTop, face, fontSize)) return false;
+    obj->uiCand.active = true;
+    obj->uiCand.cands = cands;
+    obj->uiCand.count = count;
+    obj->uiCand.sel = 0;
+    obj->uiCand.perPage = 9;
+    obj->uiCand.replaceLen = replaceLen;
+    JamoDiag("UICAND show count=%d", count);
+    return true;
+}
+
+// RFC-0015 Phase 2: 코드입력 상태를 헬퍼에 한 줄로 그린다(후보 1개짜리 목록으로 보낸다).
+// UWP 호스트에서는 팝업 창이 화면에 안 나타나므로, 창 없이 상태만 유지하고 표시는 헬퍼가 맡는다.
+
+static void UiCodeDraw(JamotongTextService *obj) {
+    const wchar_t *line = CodeInput_DisplayText();
+    const wchar_t *ptrs[1] = { line };
+    if (UiClient_Show(ptrs, 1, 1, 0, obj->uiCode.x, obj->uiCode.y, obj->uiCode.caretTop,
+                      obj->config.options.candFont, obj->config.options.candFontSize))
+        obj->uiCode.active = true;
+    else
+        obj->uiCode.active = false;
+}
+
+static void UiCodeHide(JamotongTextService *obj) {
+    if (!obj->uiCode.active) return;
+    UiClient_Hide();
+    obj->uiCode.active = false;
+}
+
+// 헬퍼 후보창이 떠 있는 동안의 키. 처리했으면 true(= 이 키는 앱에 안 간다).
+static bool UiCandHandleKey(JamotongTextService *obj, ITfContext *pic, UINT vk) {
+    if (!obj->uiCand.active) return false;
+    int page = obj->uiCand.sel / obj->uiCand.perPage;
+    switch (vk) {
+        case VK_ESCAPE:
+            UiCandHide(obj);
+            return true;
+        case VK_UP:
+            if (obj->uiCand.sel > 0) obj->uiCand.sel--;
+            UiClient_Update(obj->uiCand.sel, obj->uiCand.perPage);
+            return true;
+        case VK_DOWN:
+            if (obj->uiCand.sel + 1 < obj->uiCand.count) obj->uiCand.sel++;
+            UiClient_Update(obj->uiCand.sel, obj->uiCand.perPage);
+            return true;
+        case VK_PRIOR:
+            obj->uiCand.sel = (page > 0) ? (page - 1) * obj->uiCand.perPage : 0;
+            UiClient_Update(obj->uiCand.sel, obj->uiCand.perPage);
+            return true;
+        case VK_NEXT: {
+            int next = (page + 1) * obj->uiCand.perPage;
+            if (next < obj->uiCand.count) obj->uiCand.sel = next;
+            UiClient_Update(obj->uiCand.sel, obj->uiCand.perPage);
+            return true;
+        }
+        default: break;
+    }
+    int pick = -1;
+    if (vk >= '1' && vk <= '9') pick = page * obj->uiCand.perPage + (int)(vk - '1');
+    else if (vk == VK_RETURN || vk == VK_SPACE) pick = obj->uiCand.sel;
+    if (pick >= 0 && pick < obj->uiCand.count) {
+        wchar_t *chosen = obj->uiCand.cands[pick];
+        int rl = obj->uiCand.replaceLen;
+        UiCandHide(obj);
+        obj->candCtx.pic = pic;   // 이 호출 안에서만 쓴다 — AddRef/Release 하지 않는다
+        ApplyHanjaChoice(obj, chosen, rl);
+        obj->candCtx.pic = NULL;
+        JamoDiag("UICAND pick=%d", pick);
+        return true;
+    }
+    return false;
+}
+
+// 커서 앞 2~6자리 16진수를 그 코드포인트 문자로 바꾼다 (성공 시 true).
+// 한자키 경로와, 창을 띄울 수 없는 UWP 호스트의 코드입력 경로가 함께 쓴다.
+static bool TryReplaceHexCodepoint(JamotongTextService *obj, ITfContext *pic) {
+    wchar_t readBuf[32] = {0};
+    if (FAILED(RequestReadSessionString(obj, pic, readBuf, 10))) return false;
+    int len = (int)wcslen(readBuf);
+    int hs = len;
+    while (hs > 0 && IsHexW(readBuf[hs - 1])) hs--;
+    int hlen = len - hs;
+    if (hlen < 2 || hlen > 6) return false;
+    unsigned cp = 0;
+    for (int k = hs; k < len; k++) cp = cp * 16 + HexValW(readBuf[k]);
+    if (cp < 0x20 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+    wchar_t out[3];
+    if (cp <= 0xFFFF) {
+        out[0] = (wchar_t)cp; out[1] = L'\0';
+    } else {   // BMP 밖 → UTF-16 서로게이트 쌍
+        cp -= 0x10000;
+        out[0] = (wchar_t)(0xD800 + (cp >> 10));
+        out[1] = (wchar_t)(0xDC00 + (cp & 0x3FF));
+        out[2] = L'\0';
+    }
+    RequestReplaceSessionString(obj, pic, hlen, out);
+    JamoDiag("CODE hex replace hlen=%d", hlen);
+    return true;
+}
+
+// 후보 문자열을 문서에 반영한다 (후보창 경로와 순환 경로가 함께 쓴다).
+static void ApplyHanjaChoice(JamotongTextService *obj, const wchar_t *str, int replaceLen) {
+    HWND h = obj->candCtx.targetHwnd;   // 한자키 시점에 저장한 대상 EDIT (콜백 땐 포커스 이동으로 재조회 불가)
+
+    if (obj->candCtx.fromSelection) {
+        // 블록 선택 변환: 선택이 그대로 유지돼 있으므로(후보창=NOACTIVATE) EDIT 계열은
+        // EM_REPLACESEL로 선택 전체를 정확히 교체. 비-EDIT는 TSF 삽입=선택 교체.
+        //   EDIT 판정이 최종이다(B1) — 교체가 안 됐으면 사용자 선택을 그대로 두고 다시 넣지 않는다.
+        //   W1-02: 후보창을 띄운 뒤 선택이 바뀌었으면(사용자 의도 변경) 바꾸지 않는다. EDIT 만 검증 —
+        //   TSF 경로는 콜백이 키 이벤트 밖일 수 있어 동기 읽기가 거부되면 빈 값이 불일치로 오판된다.
+        if (h) {
+            wchar_t cur[32] = {0};
+            bool read = EditCtl_ReadSelection(h, cur, 31);
+            if (HanjaTxn_SelectionStillValid(obj->candCtx.word, read ? cur : NULL))
+                EditCtl_ReplaceSelection(h, str);
+            else
+                JamoDiag("HANJA selection changed - not replaced");
+        } else {
+            CommitText(obj, obj->candCtx.pic, str);
+        }
+    } else if (replaceLen > 0) {
+        // 커서 앞 단어/음절 변환: EDIT 계열이면 단어를 선택(읽기 검증)한 뒤 EM_REPLACESEL 교체.
+        if (h && obj->candCtx.word[0] && EditCtl_SelectWordBeforeCaret(h, obj->candCtx.word)) {
+            // 우리가 잡은 선택이다 — 교체가 안 됐으면 TSF 로 다시 바꾸지 않고(B1: 이중 적용 방지)
+            // 선택만 접어 다음 키가 그 단어를 덮지 않게 한다.
+            if (!EditCtl_ReplaceSelection(h, str)) EditCtl_CollapseSelectionToEnd(h);
+        } else {
+            RequestReplaceSessionString(obj, obj->candCtx.pic, replaceLen, str);   // 비-EDIT 네이티브
+        }
+    } else {
+        CommitText(obj, obj->candCtx.pic, str);   // 커밋전용 삽입(방어적 — 현재 경로는 replaceLen=1)
+    }
+    ResetComposition(obj);   // 조합 음절이 한자로 확정됨 → 조합·칩 상태 전면 리셋
+}
+
+static void OnHanjaSelected(int index, const wchar_t *str, void *ctx) {
+    (void)index;   // 콜백 시그니처상 받지만 실제 치환은 str로만 함
+    JamotongTextService *obj = (JamotongTextService*)ctx;
+    ApplyHanjaChoice(obj, str, CandidateUI_GetReplaceLen());
+    if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }   // 저장 시 AddRef한 것 해제
+}
+
+static void OnHanjaCancelled(void *ctx) {
+    JamotongTextService *obj = (JamotongTextService*)ctx;
+    if (obj && obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+}
+
+// ── 순차 입력의 후보 (RFC-0016 §6.4) ───────────────────────────────────────────────
+//   읽기는 우리 소유 preedit 이고, 고른 결과만 문서로 간다. 늦게 온 선택은 세대가 걸러 낸다.
+static SeqCandidates g_seqCands;          // 지금 띄운 묶음 (입력 스레드 하나가 쓴다)
+// 후보창은 **포인터 배열을 그대로 붙잡아** 그린다(복사하지 않는다) — 창이 살아 있는 동안 같이
+// 살아야 하므로 스택이 아니라 여기 둔다. (실기 2026-09-23: 스택 배열을 넘겨 한 줄만 보였다.)
+static wchar_t *g_seqCandPtrs[SEQ_MAX_CANDS];
+static wchar_t g_seqNotes[SEQ_MAX_CANDS][48];      // 후보 옆의 성조 병음 (0.66.0) — 창과 함께 산다
+static wchar_t *g_seqNotePtrs[SEQ_MAX_CANDS];
+static void SeqApply(JamotongTextService *obj, ITfContext *pic, const SeqResult *r);
+
+// 자판별 선택 (Layout Options 탭): 문장 후보·추천 단어
+static unsigned SeqFlags(JamotongTextService *obj) {
+    unsigned flags = SEQ_CONV_ALL;
+    const LayoutConfig *cur = Config_GetCurrentLayout(&obj->config);
+    if (cur && cur->optNoSentence) flags &= ~SEQ_CONV_SENTENCE;
+    if (cur && cur->optNoSuggest)  flags &= ~SEQ_CONV_PREDICT;
+    if (cur && cur->optFuzzy)      flags |= SEQ_CONV_FUZZY;
+    if (cur && cur->optNoEmoji)    flags |= SEQ_CONV_NOEMOJI;
+    return flags;
+}
+static void SeqReleaseCandCtx(JamotongTextService *obj) {
+    if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+}
+// 일본어 문절 편집 (0.73.0, RFC-0022 P2): 변환한 문장을 문절로 나눠 ←→ 로 옮기고 Shift+←→ 로 길이를 바꾸고 문절마다 후보를
+//   고른다. 읽기는 엔진에 그대로 있고, 화면(미리보기·후보창 머리줄)에는 바꾼 문장을 고치는 문절에 [ ] 를 둘러 보인다.
+//   확정은 언제나 엔진의 SeqKb_Flush 한 길 — 엔터·그 밖의 글쇠·포커스 이동 모두 보이는 문장(괄호 없이)을 넣는다.
+static SeqSegments g_seqSegs;     // 입력 스레드 하나가 쓴다 (g_seqCands 와 같다)
+static bool g_seqSegMode;
+static void SeqLeaveSegments(JamotongTextService *obj) {
+    if (!g_seqSegMode) return;
+    g_seqSegMode = false;
+    SeqKb_JaSegSync(&obj->seqKb, NULL);
+}
+// 후보창의 문절 글쇠 (창은 이미 닫혔다)
+static void OnSeqSegmentKey(UINT vkf, int index, void *ctx) {
+    JamotongTextService *obj = (JamotongTextService*)ctx;
+    if (!obj) return;
+    LayoutConfig *layout = Config_GetCurrentLayout(&obj->config);
+    ITfContext *pic = obj->candCtx.pic;
+    const SeqLayout *sl = (layout && layout->type == LAYOUT_TYPE_SEQUENCE) ? (const SeqLayout*)layout->pSeqLayout : NULL;
+    const UINT vk = vkf & 0xFFu;
+    const bool shift = (vkf & CAND_KEY_SHIFT) != 0;
+    if (!g_seqSegMode || !sl || !pic) { SeqLeaveSegments(obj); SeqReleaseCandCtx(obj); return; }
+    if ((vk == VK_LEFT || vk == VK_RIGHT) && shift) {            // 길이: 못 바꾸면 그대로 다시 보인다
+        SeqKb_JaSegResize(&obj->seqKb, sl, &g_seqSegs, vk == VK_RIGHT ? 1 : -1);
+        if (SeqShowSegments(obj, pic, sl)) return;
+    } else if (vk == VK_BACK || (vk >= VK_F6 && vk <= VK_F10)) {   // 읽기로 돌아간다 (F6~F10 은 이어서 읽기를 가나 꼴로)
+        SeqLeaveSegments(obj);
+        SeqResult cr; memset(&cr, 0, sizeof cr);
+        cr.eaten = true;
+        lstrcpynW(cr.composing, SeqKb_Reading(&obj->seqKb), (int)(sizeof cr.composing / sizeof cr.composing[0]));
+        SeqApply(obj, pic, &cr);
+    } else {
+        SeqKb_JaSegChoose(&obj->seqKb, &g_seqSegs, &g_seqCands, index);   // 하이라이트한 후보가 그 문절의 표기다
+        if (vk == VK_LEFT || vk == VK_RIGHT) {
+            SeqKb_JaSegMove(&g_seqSegs, vk == VK_RIGHT ? 1 : -1);
+            if (SeqShowSegments(obj, pic, sl)) return;
+        } else {                                                  // 엔터와 그 밖의 글쇠: 보이는 문장을 확정
+            SeqKb_JaSegSync(&obj->seqKb, &g_seqSegs);
+            SeqResult r = SeqKb_Flush(&obj->seqKb, sl);
+            g_seqSegMode = false;
+            if (r.eaten) SeqApply(obj, pic, &r);
+        }
+    }
+    SeqLeaveSegments(obj);
+    SeqReleaseCandCtx(obj);
+}
+// 중국어 병음 방식: 치는 동안 후보를 띄우고 고친다. 읽기가 비었거나 후보가 없으면 닫는다.
+static void SeqLiveRefresh(JamotongTextService *obj, ITfContext *pic, const SeqLayout *sl) {
+    if (!sl || !sl->zh) return;
+    if ((obj->seqKb.pending[0] || SeqKb_Reading(&obj->seqKb)[0]) && SeqOpenCandidates(obj, pic, sl, true)) return;
+    if (CandidateUI_IsVisible()) CandidateUI_Hide();
+    SeqReleaseCandCtx(obj);
+}
+// 후보창의 병음 방식 글쇠 (창은 이미 닫혔다): 엔터 = 친 로마자 그대로, Esc = 읽기를 지움, [ ] = 以词定字
+static void OnSeqCandidateKey(UINT vk, int index, void *ctx) {
+    JamotongTextService *obj = (JamotongTextService*)ctx;
+    if (!obj) return;
+    LayoutConfig *layout = Config_GetCurrentLayout(&obj->config);
+    ITfContext *pic = obj->candCtx.pic;
+    if (layout && layout->type == LAYOUT_TYPE_SEQUENCE && layout->pSeqLayout && pic) {
+        const SeqLayout *sl = (const SeqLayout*)layout->pSeqLayout;
+        SeqResult r; memset(&r, 0, sizeof r);
+        if (vk == VK_RETURN)      r = SeqKb_Flush(&obj->seqKb, sl);
+        else if (vk == VK_ESCAPE) r = SeqKb_Cancel(&obj->seqKb);
+        else                      r = SeqKb_ChoosePart(&obj->seqKb, sl, &g_seqCands, index, vk == VK_OEM_6);
+        if (r.eaten) SeqApply(obj, pic, &r);
+        if (SeqKb_Reading(&obj->seqKb)[0] && SeqOpenCandidates(obj, pic, sl, sl->zh != 0)) return;   // 以词定字 뒤 남은 읽기
+    }
+    SeqReleaseCandCtx(obj);
+}
+
+static void OnSeqCandidateSelected(int index, const wchar_t *str, void *ctx) {
+    (void)str;
+    JamotongTextService *obj = (JamotongTextService*)ctx;
+    if (!obj) return;
+    LayoutConfig *layout = Config_GetCurrentLayout(&obj->config);
+    if (layout && layout->type == LAYOUT_TYPE_SEQUENCE && layout->pSeqLayout) {
+        const SeqLayout *sl = (const SeqLayout*)layout->pSeqLayout;
+        if (g_seqSegMode) {   // 일본어 문절 편집: 숫자는 그 문절의 후보를 고르고 다음 문절로 (끝 문절이면 그 자리)
+            if (obj->candCtx.pic && SeqKb_JaSegChoose(&obj->seqKb, &g_seqSegs, &g_seqCands, index)) {
+                SeqKb_JaSegMove(&g_seqSegs, 1);
+                if (SeqShowSegments(obj, obj->candCtx.pic, sl)) return;
+            }
+            SeqLeaveSegments(obj);
+            SeqReleaseCandCtx(obj);
+            return;
+        }
+        SeqResult r = SeqKb_Choose(&obj->seqKb, sl, &g_seqCands, index);
+        if (r.eaten) SeqApply(obj, obj->candCtx.pic, &r);
+        // 앞부분만 바꿨으면 남은 읽기의 후보를 곧바로 다시 띄운다 (이어 치기 변환 — 중국어 병음의 문장).
+        //   후보창은 콜백 전에 닫혔다(candidate_ui.c SelectIndex). 문맥 참조는 새 후보창이 이어받는다.
+        if (r.eaten && SeqKb_Reading(&obj->seqKb)[0] && obj->candCtx.pic) {
+            ITfContext *pic = obj->candCtx.pic;
+            if (SeqOpenCandidates(obj, pic, sl, sl->zh != 0)) return;
+        }
+    }
+    if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+}
+static void OnSeqCandidateCancelled(void *ctx) {
+    JamotongTextService *obj = (JamotongTextService*)ctx;
+    if (!obj) return;
+    SeqLeaveSegments(obj);                               // 문절 편집이었으면 나간다 — 읽기로 돌아간다
+    SeqResult r = SeqKb_CancelCandidates(&obj->seqKb);   // 읽기는 그대로 남는다
+    if (r.eaten) SeqApply(obj, obj->candCtx.pic, &r);
+    if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+}
+
+// 읽기를 후보로 바꿔 후보창을 연다 (§6.4). 변환 글쇠와, 앞부분을 고른 뒤 남은 읽기의 이어 변환이 함께 쓴다.
+//   후보가 없으면 false — 엔진 상태는 그대로다.
+static bool SeqOpenCandidates(JamotongTextService *obj, ITfContext *pic, const SeqLayout *sl, bool live) {
+    SeqLeaveSegments(obj);
+    // live = 치는 동안 (중국어 방식): 쌍병의 반쯤 친 음절(보류)은 정착시키지 않고 조합에 그대로 보인다
+    if (!SeqKb_ConvertEx(&obj->seqKb, sl, SeqFlags(obj) | (live ? SEQ_CONV_LIVE : 0), &g_seqCands)) return false;
+    // 변환이 보류한 글자를 읽기로 정착시켰으므로 화면의 조합도 새로 그린다 —
+    // 아니면 후보를 고르는 동안 `にほn` 처럼 옛 글자가 남는다 (실기 2026-09-24).
+    SeqResult cr; memset(&cr, 0, sizeof cr);
+    cr.eaten = true;
+    lstrcpynW(cr.composing, SeqKb_Reading(&obj->seqKb), (int)(sizeof cr.composing / sizeof cr.composing[0]));
+    if (live) {   // 보류도 보인다
+        size_t n = wcslen(cr.composing);
+        lstrcpynW(cr.composing + n, obj->seqKb.pending, (int)(sizeof cr.composing / sizeof cr.composing[0] - n));
+    }
+    SeqApply(obj, pic, &cr);
+    for (int i = 0; i < g_seqCands.count; i++) g_seqCandPtrs[i] = g_seqCands.items[i];
+    RECT rc; int x = 0, y = 0, caretTop = 0;
+    if (GetCaretScreenRect(obj, &rc)) { x = rc.left; y = rc.bottom; caretTop = rc.top; }
+    if (obj->candCtx.pic != pic) {
+        if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+        if (pic) { pic->lpVtbl->AddRef(pic); obj->candCtx.pic = pic; }
+    }
+    CandidateUI_SetStyle(obj->config.options.candFont, obj->config.options.candFontSize);
+    if (!GetLiveCaretScreenRect(&obj->candAnchorRect)) obj->candAnchorRect = rc;
+    obj->candAnchorValid = TRUE;   // light dismiss 기준 (B10) — 살아 있는 캐럿 자리로
+    CandidateUI_SetPinyinKeys(sl->zh ? OnSeqCandidateKey : NULL);   // 중국어 병음 방식의 글쇠
+    CandidateUI_SetDigitsToInput(SeqKb_IsVMode(sl, SeqKb_Reading(&obj->seqKb)));   // V 모드: 숫자·- 는 식으로
+    {   // 머리줄 = 바꾸는 읽기 (보류도), 가로 후보줄 = 자판 선택 (RFC-0020 P2)
+        wchar_t title[SEQ_MAX_READING + SEQ_MAX_IN + 2];
+        lstrcpynW(title, SeqKb_Reading(&obj->seqKb), SEQ_MAX_READING + 1);
+        if (live) wcsncat(title, obj->seqKb.pending, SEQ_MAX_IN);
+        CandidateUI_SetTitle(title);
+        const LayoutConfig *cl0 = Config_GetCurrentLayout(&obj->config);
+        CandidateUI_SetHorizontal((sl->zh || sl->ja) && cl0 && cl0->optBar);
+    }
+    {   // 성조 병음 (자판 선택 Tones, 기본 켬)
+        const LayoutConfig *cur = Config_GetCurrentLayout(&obj->config);
+        bool tones = sl->zh && sl->tones && !(cur && cur->optNoTones);
+        for (int i = 0; i < g_seqCands.count; i++) {
+            g_seqNotes[i][0] = L'\0';
+            if (tones) SeqLayout_ToneOf(sl, g_seqCands.items[i], g_seqNotes[i], 48);
+            g_seqNotePtrs[i] = g_seqNotes[i];
+        }
+        CandidateUI_SetNotes(g_seqNotePtrs);   // 늘 준다 (성조가 없으면 빈 줄) — 부호값 주석은 한자 후보창에만 (일본어 실기 2026-10-04)
+    }
+    if (!CandidateUI_Show(x, y, caretTop, g_seqCandPtrs, g_seqCands.count, 0,
+                          OnSeqCandidateSelected, OnSeqCandidateCancelled, obj)) {
+        SeqKb_CancelCandidates(&obj->seqKb);   // 못 띄웠으면 읽기 그대로 (잃는 것 없음)
+        if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+    }
+    return true;
+}
+
+// 문절 편집의 화면: 고치는 문절의 후보창 + 바꾼 문장(고치는 문절에 [ ]). g_seqSegs 가 지금의 문절이다.
+static bool SeqShowSegments(JamotongTextService *obj, ITfContext *pic, const SeqLayout *sl) {
+    if (!SeqKb_JaSegCands(&obj->seqKb, sl, &g_seqSegs, &g_seqCands)) return false;
+    g_seqSegMode = true;
+    SeqKb_JaSegSync(&obj->seqKb, &g_seqSegs);
+    wchar_t show[SEQ_MAX_SEGS * (SEQ_MAX_OUT + 1) + 4];
+    SeqKb_JaSegText(&g_seqSegs, true, show, (int)(sizeof show / sizeof show[0]));
+    const wchar_t *view = show;   // 긴 문장: 고치는 문절이 보이게 그 조금 앞부터
+    const wchar_t *mark = wcschr(show, L'[');
+    if (wcslen(show) > 56 && mark && mark - show > 20) view = mark - 12;
+    SeqResult cr; memset(&cr, 0, sizeof cr);
+    cr.eaten = true;
+    lstrcpynW(cr.composing, view, (int)(sizeof cr.composing / sizeof cr.composing[0]));
+    SeqApply(obj, pic, &cr);
+    for (int i = 0; i < g_seqCands.count; i++) { g_seqCandPtrs[i] = g_seqCands.items[i]; g_seqNotes[i][0] = L'\0'; g_seqNotePtrs[i] = g_seqNotes[i]; }
+    RECT rc; int x = 0, y = 0, caretTop = 0;
+    if (GetCaretScreenRect(obj, &rc)) { x = rc.left; y = rc.bottom; caretTop = rc.top; }
+    if (obj->candCtx.pic != pic) {
+        if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+        if (pic) { pic->lpVtbl->AddRef(pic); obj->candCtx.pic = pic; }
+    }
+    CandidateUI_SetStyle(obj->config.options.candFont, obj->config.options.candFontSize);
+    if (!GetLiveCaretScreenRect(&obj->candAnchorRect)) obj->candAnchorRect = rc;
+    obj->candAnchorValid = TRUE;
+    CandidateUI_SetPinyinKeys(NULL);
+    CandidateUI_SetSegmentKeys(OnSeqSegmentKey);
+    CandidateUI_SetDigitsToInput(false);
+    CandidateUI_SetTitle(view);
+    {
+        const LayoutConfig *cl0 = Config_GetCurrentLayout(&obj->config);
+        CandidateUI_SetHorizontal(cl0 && cl0->optBar);
+    }
+    CandidateUI_SetNotes(g_seqNotePtrs);
+    if (!CandidateUI_Show(x, y, caretTop, g_seqCandPtrs, g_seqCands.count, 0,
+                          OnSeqCandidateSelected, OnSeqCandidateCancelled, obj)) {
+        SeqLeaveSegments(obj);
+        SeqKb_CancelCandidates(&obj->seqKb);
+        SeqReleaseCandCtx(obj);
+    }
+    return true;
+}
+
+// 104-key US QWERTY 기준으로 가상 키와 Shift 조합을 통해 영문 Base Char를 가져옵니다.
+static wchar_t GetQwertyChar(WPARAM vk, bool shift) {
+    return Layout_QwertyChar((unsigned)vk, shift ? 1 : 0);   // 공유 구현(layout.c) — TSF/IMM 일관
+}
+
+// Ctrl/Alt/Win 이 눌려 있는가 — 이 경우 키 입력은 애플리케이션 단축키(Ctrl+C 등)이므로
+// IME가 소비하지 않고 그대로 통과시켜야 한다. (Shift는 대문자/된소리라 텍스트 입력에 필요 → 제외)
+static bool HasCtrlAltWin(void) {
+    return (GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000) ||
+           (GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000);
+}
+
+// 한자/훈음 사전 lazy-load: 첫 한자 요청 시 1회만 시도(실패도 캐시 — 반복 IO 방지).
+// RFC-0008 W0-03 S3: 사전은 로드 뒤 불변이라 공유해도 되지만, **로드 자체**는 한 번만 돌아야
+// 한다. 플래그만 보면 두 입력 스레드가 동시에 들어와 둘 다 로드하고, 한쪽이 채우는 중인 표를
+// 다른 쪽이 읽을 수 있다. 이미 있는 설정 락으로 직렬화한다(재진입 가능하다).
+static void EnsureHanjaDicts(void) {
+    static bool s_tried = false;
+    if (s_tried) return;
+    EnterCriticalSection(&g_configLock);
+    if (s_tried) { LeaveCriticalSection(&g_configLock); return; }   // 기다리는 동안 남이 끝냈다
+    s_tried = true;
+    wchar_t dictPath[MAX_PATH];
+    if (GetModuleFileNameW(g_hInst, dictPath, MAX_PATH)) {
+        wchar_t *pSlash = wcsrchr(dictPath, L'\\');
+        if (pSlash) {
+            wcscpy(pSlash + 1, L"hanja.txt");
+            HanjaDict_Load(dictPath);
+            wcscpy(pSlash + 1, L"hanja_hunum.txt");   // 훈음(뜻·음) 표 — 후보창 표시용
+            HunumDict_Load(dictPath);
+        }
+    }
+    LeaveCriticalSection(&g_configLock);
+}
+
+// 조합 확정 후, 확정을 유발한 '비자모' 키를 실제 키 이벤트로 다시 보낸다(JAMO_SYNTH_MARK 표식).
+// 텍스트 삽입(편집세션)은 메모장류엔 되지만 PuTTY 같은 터미널엔 안 통함 → 실제 키를 재전달해야
+// 앱이 네이티브로 처리(스페이스·엔터·방향키·터미널 등). 재전달된 키는 OnKeyDown 진입부 가드로 통과.
+static void SendKeyThrough(WPARAM vk, LPARAM lParam) {
+    UINT sc = (UINT)((lParam >> 16) & 0xFF);
+    BOOL ext = (BOOL)((lParam >> 24) & 1);
+    INPUT in[2]; memset(in, 0, sizeof(in));
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = (WORD)vk; in[0].ki.wScan = (WORD)sc;
+    in[0].ki.dwFlags = ext ? KEYEVENTF_EXTENDEDKEY : 0;
+    in[0].ki.dwExtraInfo = JAMO_SYNTH_MARK;
+    in[1] = in[0]; in[1].ki.dwFlags |= KEYEVENTF_KEYUP;
+    // RFC-0008 W1-01: 들어간 개수를 본다. 0 = UIPI 등으로 막힘(더 할 수 없다 — 기록만),
+    // 1 = key-down 만 들어감 → key-up 이 빠지면 앱에 키가 눌린 채 남으므로 한 번 더 보낸다.
+    UINT n = SendInput(2, in, sizeof(INPUT));
+    if (n == 1) n += SendInput(1, &in[1], sizeof(INPUT));
+    if (n < 2) JamoDiag("RESEND SendInput inserted %u/2 err=%lu", n, (unsigned long)GetLastError());
+}
+
+// ── 경계키 '지연' 재전달 (실기 발견 2026-07-08: AkelPad 엔터가 마지막 음절을 소실) ─────────
+// CUAS 앱은 확정 음절의 문서 전달이 비동기라, 즉시 SendInput한 합성 경계키가 그 전달을
+// 추월해 음절이 사라진다(스페이스는 v0.11.0에서 단일삽입으로 해결; 엔터/방향키는 제어키라
+// 삽입 불가 → 재전달 유지가 불가피). 재전달을 ~30ms 늦춰 삽입이 앱에 닿을 시간을 준다.
+// 새 경계키가 그 안에 또 오면 보류분을 먼저 즉시 방출해 순서를 지킨다. (입력 스레드 전용)
+#define RESEND_DELAY_MS 30
+// 실제 재전달 실행. EDIT 계열(포커스 창이 EM_GETSEL에 정상 응답)이면 SendInput 대신
+// **그 창의 메시지 큐에 WM_KEYDOWN/UP을 직접 게시** — 같은 큐에 뒤이어 서므로 CUAS의
+// 확정문자 전달 메시지를 추월할 수 없다(순서 보장). SendInput은 시스템 입력 큐 경유라
+// 앱 큐와 순서가 안 맞을 수 있음(실기 2026-07-08: 30ms 지연으로도 AkelPad 엔터가 마지막
+// 음절을 소실). 비-EDIT(터미널 등)은 종전 SendInput 유지(PuTTY 검증됨).
+static bool IsEditFamily(HWND h) {
+    DWORD s = 0xFFFFFFFF, e = 0xFFFFFFFF;
+    SendMessageW(h, EM_GETSEL, (WPARAM)&s, (LPARAM)&e);
+    return s != 0xFFFFFFFF && e != 0xFFFFFFFF && s <= e;
+}
+
+static HWND FocusHwnd(void) {
+    GUITHREADINFO gti; memset(&gti, 0, sizeof(gti)); gti.cbSize = sizeof(gti);
+    return (GetGUIThreadInfo(0, &gti) && gti.hwndFocus) ? gti.hwndFocus : NULL;
+}
+
+// Capture before any composition commit can reenter the host.
+typedef struct { HWND hwnd; RiumOwnerBinding binding; } ResendTarget;
+static void CaptureResendTarget(JamotongTextService *obj, ResendTarget *target) {
+    target->hwnd=FocusHwnd();
+    RiumOwner_Capture(&obj->inputOwner,&target->binding);
+}
+static bool ResendOwnsTarget(JamotongTextService *obj,const ResendTarget *target) {
+    DWORD pid=0;
+    if (!obj || !target->hwnd || FocusHwnd()!=target->hwnd || !IsWindow(target->hwnd) ||
+        GetWindowThreadProcessId(target->hwnd,&pid)!=GetCurrentThreadId() || pid!=GetCurrentProcessId()) return false;
+    return RiumOwner_AllowsWrite(&obj->inputOwner,&target->binding,TRUE);
+}
+static void ResendKeyNow(JamotongTextService *obj,WPARAM vk,LPARAM lParam,const ResendTarget *target) {
+    if (!ResendOwnsTarget(obj,target)) return;
+    // EM_GETSEL calls host code; its result cannot carry ownership across reentry.
+    bool isEdit=IsEditFamily(target->hwnd);
+    if (!ResendOwnsTarget(obj,target)) return;
+    if (isEdit) {
+        LPARAM base=lParam & 0x01FF0000;
+        LPARAM rep=(lParam & 0xFFFF)?(lParam & 0xFFFF):1;
+        if (PostMessageW(target->hwnd,WM_KEYDOWN,vk,base|rep)) {
+            if (!PostMessageW(target->hwnd,WM_KEYUP,vk,base|0xC0000001))
+                JamoDiag("RESEND keyup post failed err=%lu",(unsigned long)GetLastError());
+            return;
+        }
+    }
+    if (ResendOwnsTarget(obj,target)) SendKeyThrough(vk,lParam);
+}
+static WPARAM g_pendResendVk;
+static LPARAM g_pendResendLp;
+static ResendTarget g_pendResendTarget;
+static UINT_PTR g_pendResendTimer;
+static JamotongTextService *g_pendResendOwner;
+static void DeliverPendingKeyResend(void) {
+    JamotongTextService *obj=g_pendResendOwner;
+    ResendTarget target=g_pendResendTarget;
+    WPARAM vk=g_pendResendVk;LPARAM lp=g_pendResendLp;
+    UINT_PTR timer=g_pendResendTimer;
+    // Detach before any host callback can schedule another reservation.
+    g_pendResendOwner=NULL;g_pendResendTimer=0;
+    g_pendResendTarget=(ResendTarget){0};
+    if(timer)KillTimer(NULL,timer);
+    if(!obj)return;
+    ITfTextInputProcessor *tip=(ITfTextInputProcessor*)&obj->lpVtblTIP;
+    tip->lpVtbl->AddRef(tip);
+    ResendKeyNow(obj,vk,lp,&target);
+    tip->lpVtbl->Release(tip);
+}
+static void CALLBACK ResendTimerProc(HWND hwnd,UINT msg,UINT_PTR id,DWORD time) {
+    (void)hwnd;(void)msg;(void)time;
+    if (id && id==g_pendResendTimer) DeliverPendingKeyResend();
+}
+static void FlushPendingKeyResend(JamotongTextService *obj) {
+    if (g_pendResendOwner==obj) DeliverPendingKeyResend();
+}
+
+static UINT_PTR g_chordTimer = 0;
+static JamotongTextService *g_chordTimerOwner = NULL;
+
+// 지금 자판이 쓰는 조합 표 — 조합 자판이면 그 표, 입력 자판이면 앞단 조합(RFC-0016 §6.3), 없으면 NULL.
+static const ChordLayout *CurrentChordTable(const LayoutConfig *layout) {
+    if (!layout) return NULL;
+    if (layout->type == LAYOUT_TYPE_CHORD) return (const ChordLayout*)layout->pChordLayout;
+    if (layout->type == LAYOUT_TYPE_SEQUENCE && layout->pSeqLayout)
+        return (const ChordLayout*)((const SeqLayout*)layout->pSeqLayout)->chord;
+    if (layout->type == LAYOUT_TYPE_HANGUL_CUSTOM && layout->pHangulLayout)
+        return (const ChordLayout*)((const HangulLayout*)layout->pHangulLayout)->chord;   // RFC-0007
+    return NULL;
+}
+
+static void ScheduleChordTick(JamotongTextService *obj);
+static void CALLBACK ChordTickProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time) {
+    (void)hwnd; (void)msg; (void)time;
+    KillTimer(NULL, id);
+    if (id != g_chordTimer) return;   // 이미 취소된 타이머의 늦은 콜백
+    g_chordTimer = 0;
+    JamotongTextService *obj = g_chordTimerOwner;
+    if (!obj) return;
+    EnterCriticalSection(&g_configLock);
+    LayoutConfig *layout = Config_GetCurrentLayout(&obj->config);
+    const ChordLayout *cl = CurrentChordTable(layout);
+    if (cl) ChordKb_Tick(&obj->chordKb, cl);
+    LeaveCriticalSection(&g_configLock);
+    ScheduleChordTick(obj);   // 아직 남은 판정이 있으면 다시 건다
+}
+static void Jamotong_ChordTimerCancel(JamotongTextService *obj) {
+    if (!g_chordTimer) return;
+    if (g_chordTimerOwner && g_chordTimerOwner != obj) return;
+    UINT_PTR t = g_chordTimer;
+    g_chordTimer = 0; g_chordTimerOwner = NULL;
+    KillTimer(NULL, t);
+}
+static void ScheduleChordTick(JamotongTextService *obj) {
+    EnterCriticalSection(&g_configLock);
+    LayoutConfig *layout = Config_GetCurrentLayout(&obj->config);
+    const ChordLayout *cl = CurrentChordTable(layout);
+    int ms = cl ? ChordKb_NextTickMs(&obj->chordKb, cl) : 0;
+    LeaveCriticalSection(&g_configLock);
+    Jamotong_ChordTimerCancel(obj);
+    if (ms <= 0) return;   // 타이머가 필요 없는 파일·상태에는 타이머를 만들지 않는다
+    g_chordTimerOwner = obj;
+    g_chordTimer = SetTimer(NULL, 0, (UINT)ms, ChordTickProc);
+    if (!g_chordTimer) g_chordTimerOwner = NULL;
+}
+
+// 앞단 조합이 낸 `symbol` 을 엔진에 넣고 문서에 반영한다 (RFC-0016 §6.3).
+//   싱크는 조합 인식기가 부르므로, 지금 어느 문맥에 쓰는지 여기 적어 둔다 (키 이벤트 안에서만 돈다).
+typedef struct { JamotongTextService *obj; ITfContext *pic; } SeqSymbolCtx;
+static void SeqSymbolSink(void *ctx, const wchar_t *sym);
+
+// 순차 변환 자판(RFC-0016 §6.3)의 결과를 문서에 넣는다. 플러그인 자판과 같은 모양이다:
+//   확정 글자는 삽입하고, 아직 보류 중인 입력은 문서가 아니라 캐럿 옆 미리보기 칩으로만 보여준다.
+static void SeqApply(JamotongTextService *obj, ITfContext *pic, const SeqResult *r) {
+    if (!pic) return;
+    if (r->composing[0]) CompTarget_Remember(obj, pic);   // 포커스가 떠나면 읽기를 넣을 대상 (Transition_FlushSeq)
+    SeqKb_NoteCommitted(&obj->seqKb, r->committed);   // 숫자 뒤의 . , 는 그대로 (중국어 문장부호)
+    // 한 번의 입력이 낳는 확정 글자는 편집 세션 한 칸(127자)보다 길 수 있다(보류를 한꺼번에
+    // 푸는 경우). 나눠 보내되 한 글자도 잃지 않는다.
+    const wchar_t *p = r->committed;
+    do {
+        EditSessionData esd = {0};
+        lstrcpynW(esd.committed, p, 121);
+        size_t take = wcslen(esd.committed);
+        // 나눌 자리가 서로게이트 쌍 가운데면 한 글자 앞으로 당긴다 — 반쪽짜리 코드 단위를 보내면
+        // 그 글자는 문서에서 깨진다 (BMP 밖 글자를 내는 표에서만 나오지만, 나누는 쪽이 책임진다).
+        if (take > 1 && p[take] != L'\0'
+            && esd.committed[take - 1] >= 0xD800 && esd.committed[take - 1] <= 0xDBFF) {
+            esd.committed[--take] = L'\0';
+        }
+        p += take;
+        // 확정 글자는 한글 확정과 같은 길로 넣는다(CommitText): EDIT 계열은 EM_REPLACESEL, 그 밖은 TSF 삽입.
+        //   AkelEdit 는 TSF 삽입을 받고도 앞의 두 글자만 남겼다 — 병음 문장 `我爱你` 가 `我爱` 로(실기 2026-10-02).
+        //   확정할 것이 없으면 캐럿 자리만 잰다(미리보기용) — 예전과 같은 빈 편집 세션.
+        if (esd.committed[0]) CommitText(obj, pic, esd.committed);
+        else RequestEditSessionData(obj, pic, &esd);
+    } while (*p);
+    RECT rc;
+    if (obj->config.options.showPreview && r->composing[0] && GetCaretScreenRect(obj, &rc))
+        PreeditOverlay_Show(&rc, r->composing, obj->config.options.previewFont,
+                            obj->config.options.previewFontSize);
+    else
+        PreeditOverlay_Hide();
+}
+
+// `text` 동작이 낸 글자열을 **문서 편집 경로**로 넣는다 (B11 잔여). 합성 유니코드 입력은 시스템
+// 입력 큐를 거치므로, 우리가 같은 순간에 넣은 확정 글자와 순서가 엉킬 수 있다. EDIT 계열이면
+// 선택 치환, 그 밖이면 TSF 편집 세션 — 한글 확정이 쓰는 그 길이다. pic 가 없으면(문맥 밖) 싱크를
+// 걸지 않으므로 조합 엔진이 예전처럼 합성 입력으로 보낸다(터미널도 그 길로 산다).
+static void ChordTextSink(void *ctx, const wchar_t *s) {
+    SeqSymbolCtx *c = (SeqSymbolCtx *)ctx;
+    if (!c || !c->obj || !c->pic || !s || !s[0]) return;
+    CommitText(c->obj, c->pic, s);
+}
+
+static void SeqSymbolSink(void *ctx, const wchar_t *sym) {
+    SeqSymbolCtx *s = (SeqSymbolCtx *)ctx;
+    if (!s || !s->obj || !sym || !sym[0]) return;
+    LayoutConfig *layout = Config_GetCurrentLayout(&s->obj->config);
+    if (!layout || layout->type != LAYOUT_TYPE_SEQUENCE) return;
+    SeqResult r = SeqKb_Symbol(&s->obj->seqKb, (const SeqLayout*)layout->pSeqLayout, sym);
+    if (r.committed[0] || r.composing[0]) SeqApply(s->obj, s->pic, &r);
+}
+
+// 한글 자판의 앞단 조합(RFC-0007)이 낸 `symbol` 을 오토마타에 넣는다. 글자마다 글쇠 하나를 친 것과
+//   같은 길이다 — 문서에 닿은 뒤에만 FSM 을 확정하고, 못 닿으면 그 글자는 없던 일로 되돌린다(W0-04).
+static void HangulSymbolSink(void *ctx, const wchar_t *sym) {
+    SeqSymbolCtx *s = (SeqSymbolCtx *)ctx;
+    if (!s || !s->obj || !sym) return;
+    JamotongTextService *obj = s->obj;
+    LayoutConfig *layout = Config_GetCurrentLayout(&obj->config);
+    if (!layout || layout->type != LAYOUT_TYPE_HANGUL_CUSTOM || !layout->pHangulLayout) return;
+    const HangulLayout *hl = (const HangulLayout*)layout->pHangulLayout;
+    for (const wchar_t *p = sym; *p; p++) {
+        FsmContext fsmBefore = obj->fsm;
+        FsmResult res = Fsm_ProcessSymbol(&obj->fsm, *p, hl);
+        JamoDiag("FSM sym=U+%04X commit=U+%04X preedit=U+%04X", (unsigned)*p, (unsigned)res.commitChar, (unsigned)res.preeditChar);
+        if (!(res.commitChar || res.preeditChar)) continue;
+        if (!OutputResultSeq(obj, s->pic, res, FALSE)) {
+            obj->fsm = fsmBefore;
+            JamoDiag("TXN rollback sym=U+%04X", (unsigned)*p);
+            FsmResult redraw = { 0, Fsm_PeekPreedit(&obj->fsm), true };
+            OutputResultSeq(obj, s->pic, redraw, FALSE);
+        }
+    }
+}
+// 앞단 조합의 `key` 동작 직전 (RFC-0007 한 손 자판의 편집·영문·이동 층). 보내는 키는 합성 입력이라 이 입력기를
+//   거치지 않으므로, 조합 중인 음절을 여기서 정리한다: 수식키 없는 Backspace 는 여느 한글 자판처럼 조합 안에서
+//   지우고(키를 보내지 않는다), 그 밖의 키는 음절을 먼저 확정한 뒤 보낸다 — 아니면 키가 음절을 앞지른다.
+static bool HangulKeySink(void *ctx, int vk, int mods) {
+    SeqSymbolCtx *c = (SeqSymbolCtx *)ctx;
+    if (!c || !c->obj || c->obj->fsm.state == STATE_EMPTY) return false;
+    JamotongTextService *obj = c->obj;
+    if (vk == VK_BACK && !mods) {
+        wchar_t pe = 0;
+        if (obj->config.options.jamoDelete) Fsm_Backspace(&obj->fsm, &pe);
+        else Fsm_Init(&obj->fsm);
+        FsmResult res = {0, pe, true};
+        OutputResultSeq(obj, c->pic, res, FALSE);
+        return true;
+    }
+    FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};
+    OutputResultSeq(obj, c->pic, res, TRUE);
+    return false;
+}
+
+// 앞단 조합의 `text` 동작: 조합 중인 음절을 먼저 확정한다 — 아니면 글자가 음절 앞에 끼어든다.
+static void HangulTextSink(void *ctx, const wchar_t *text) {
+    SeqSymbolCtx *c = (SeqSymbolCtx *)ctx;
+    if (!c || !c->obj || !c->pic || !text || !text[0]) return;
+    if (c->obj->fsm.state != STATE_EMPTY) {
+        FsmResult res = {Fsm_Flush(&c->obj->fsm), 0, false};
+        OutputResultSeq(c->obj, c->pic, res, TRUE);
+    }
+    CommitText(c->obj, c->pic, text);
+}
+
+// 타이머가 살아 있는 동안에는 DLL 을 내리면 안 된다 (dllmain.c 의 DllCanUnloadNow 가 묻는다).
+bool Jamotong_HasPendingTimers(void) { return g_pendResendTimer != 0 || g_chordTimer != 0; }
+
+static void ScheduleKeyResend(JamotongTextService *obj,WPARAM vk,LPARAM lParam,const ResendTarget *target) {
+    DeliverPendingKeyResend();
+    // A displaced delivery may have called host code or installed a new timer.
+    if (g_pendResendOwner || !ResendOwnsTarget(obj,target)) return;
+    g_pendResendVk=vk;g_pendResendLp=lParam;
+    g_pendResendOwner=obj;g_pendResendTarget=*target;
+    g_pendResendTimer=SetTimer(NULL,0,RESEND_DELAY_MS,ResendTimerProc);
+    if(!g_pendResendTimer)DeliverPendingKeyResend();
+}
+
+static wchar_t ToFullWidth(wchar_t c) {
+    if (c == L' ') return 0x3000;                         // 전각 공백
+    if (c >= 0x21 && c <= 0x7E) return (wchar_t)(c - 0x21 + 0xFF01);   // ! ~ → ！ ～
+    return c;
+}
+
+// 모디파이어/락/변환 키인가 — 조합 중 이런 키를 눌러도 조합을 확정하지 않는다(Shift로 대문자 등).
+static bool IsModifierOrLock(WPARAM vk) {
+    switch (vk) {
+        case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+        case VK_MENU: case VK_LMENU: case VK_RMENU:
+        case VK_LWIN: case VK_RWIN: case VK_APPS:
+        case VK_CAPITAL: case VK_NUMLOCK: case VK_SCROLL:
+        case VK_HANGUL: case VK_HANJA:
+            return true;
+    }
+    return false;
+}
+
+// ------------------------------------------------------------------
+// ITfKeyEventSink Implementation
+// ------------------------------------------------------------------
+
+static HRESULT STDMETHODCALLTYPE KES_QueryInterface(ITfKeyEventSink *pThis, REFIID riid, void **ppvObject) {
+    JamotongTextService *obj = IMPL_TO_OBJ(KES, pThis);
+    return obj->lpVtblTIP->QueryInterface((ITfTextInputProcessor*)obj, riid, ppvObject);
+}
+
+static ULONG STDMETHODCALLTYPE KES_AddRef(ITfKeyEventSink *pThis) {
+    JamotongTextService *obj = IMPL_TO_OBJ(KES, pThis);
+    return obj->lpVtblTIP->AddRef((ITfTextInputProcessor*)obj);
+}
+
+static ULONG STDMETHODCALLTYPE KES_Release(ITfKeyEventSink *pThis) {
+    JamotongTextService *obj = IMPL_TO_OBJ(KES, pThis);
+    return obj->lpVtblTIP->Release((ITfTextInputProcessor*)obj);
+}
+
+static HRESULT STDMETHODCALLTYPE KES_OnSetFocus(ITfKeyEventSink *pThis, BOOL fForeground) {
+    JamotongTextService *obj = IMPL_TO_OBJ(KES, pThis);
+    JamoDiag("KES focus fg=%d tid=%lu", (int)fForeground, (unsigned long)GetCurrentThreadId());
+    // 포커스 변경 시 조합 상태 전면 리셋 + 팝업들 정리 → 새 위치에서 깨끗이 시작.
+    // 후보창은 Cancel(콜백 경유)로 닫아 pic 참조가 정리되게 한다 — 열린 채 방치되던 '멈춤' 방지.
+    Jamotong_Transition(obj, TRANS_WHY_FOCUS, NULL);   // 남은 음절은 조합 대상에 확정 + 정리 (W1-09/W1-03)
+    // 무간섭 모드 상태 재읽기 — 다른 프로세스의 토글(메뉴/단축키)을 레지스트리로 따라간다.
+    {
+        BOOL pt = Jamotong_GetPassthroughReg();
+        if (pt != obj->passthrough) {
+            obj->passthrough = pt;
+            LangBar_Update(obj->pLangBarItem);
+        Compart_Publish(obj);   // 아이콘 "--" ↔ 자판 갱신
+        }
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE KES_OnTestKeyDown(ITfKeyEventSink *pThis, ITfContext *pic, WPARAM wParam, LPARAM lParam, BOOL *pfEaten) {
+    JamotongTextService *obj = IMPL_TO_OBJ(KES, pThis);
+    if (pfEaten) *pfEaten = FALSE;
+    if ((ULONG_PTR)GetMessageExtraInfo() == JAMO_SYNTH_MARK) return S_OK;   // 합성 입력 통과
+    // 단축키 판정에 쓰는 가상키/모디파이어는 이 호출 안에서 불변 — 한 번만 읽는다
+    // (Config_CurrentMods 는 GetKeyState 5회; 기능마다 다시 부르면 키 하나에 수십 회 syscall).
+    const UINT skVk = Config_ResolveVK(wParam, lParam);
+    const UINT skMods = Config_CurrentMods();
+
+    /* A verified command surface receives the original event before any old
+     * composition is flushed or retried against a shared CUAS context. */
+    if (OwnerPassesCommand(obj,wParam,skMods)) return S_OK;
+
+    // 앱이 이 문맥의 입력기를 껐다(KEYBOARD_DISABLED) → 아무 키도 건드리지 않는다 (RFC-0012 Phase 1).
+    Compart_ReadContextDisabled(obj, pic);   // RIUM: no stale focus cache on the first key
+    if (obj->ctxKeyboardDisabled) return S_OK;
+    DeferFallbackOnFocusChange(obj, pic);
+    if (obj->cpPendingCommit && wParam == VK_ESCAPE) {
+        if (pfEaten) *pfEaten=TRUE;
+        return S_OK; // Predict cancellation without retrying or inserting the pending text.
+    }
+    if (wParam == VK_ESCAPE && obj->pComposition && !JamoComp_OwnsFocus(obj,pic)) return S_OK;
+
+    // 밖에서 온 자판 전환 때 확정 못 한 음절이 있으면, 키 이벤트 안(동기 세션 허용)인 지금 먼저 넣는다.
+    // 포커스를 떠날 때 넣지 못한 음절도 여기서 — 단 **그 대상으로 돌아왔을 때만**, 한 번만(W1-09 Q2).
+    const bool pendingReady = RetryPendingAtOwnedFocus(obj, pic);
+
+    // 무간섭(직접 입력) 모드: 해제 단축키만 예측-소비하고 그 외 전부 통과 —
+    // 원격 데스크톱 클라이언트 등이 키를 그대로 받아 원격 IME가 처리하게 한다.
+    if (obj->passthrough) {
+        EnterCriticalSection(&g_configLock);
+        bool ptHit = Config_IsShortcut(&obj->config, SC_FN_PASSTHROUGH,
+                                       skVk, skMods);
+        LeaveCriticalSection(&g_configLock);
+        if (ptHit && pfEaten) *pfEaten = TRUE;
+        return S_OK;
+    }
+
+    // OnKeyDown과 동일 순서(맨 앞): 코드입력/후보창/한자키를 예측-소비해야 OnKeyDown이 호출됨.
+    // (TSF는 OnTestKeyDown이 TRUE로 표시한 키만 OnKeyDown 호출. 예측만 하고 부작용은 OnKeyDown에서.)
+    if (CodeInput_IsVisible()) {     // 코드 입력 팝업이 뜨면 모든 키를 소비
+        if (pfEaten) *pfEaten = TRUE;
+        return S_OK;
+    }
+    if (CandidateUI_IsVisible()) {   // 후보창이 뜨면 모든 키를 소비(HandleKey가 전부 true)
+        if (pfEaten) *pfEaten = TRUE;
+        return S_OK;
+    }
+    if (obj->uiCand.active) {   // RFC-0015: 헬퍼가 그리는 후보창 — 키는 여기서 먹는다
+        if (pfEaten) *pfEaten = TRUE;
+        return S_OK;
+    }
+
+    // 이하 config/레이아웃 접근 전체를 설정 스레드의 Config_ApplyEdited(레이아웃 free)와 직렬화.
+    // (기존엔 무락이라, 설정 적용 중 pHangulLayout/pChordLayout이 해제되는 순간 키가 오면 UAF.)
+    EnterCriticalSection(&g_configLock);
+    if (!pendingReady && wParam != VK_ESCAPE &&
+        !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods)) goto tk_done;
+    if (wParam != VK_ESCAPE && !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods) &&
+        !JamoComp_PrepareInput(obj, pic)) {
+        if (pfEaten) *pfEaten = JamoComp_OwnsFocus(obj, pic);
+        goto tk_done;
+    }
+
+    // 설정창 단축키 (설정 가능, 기본 Ctrl+Alt+K) 예측-소비 (OnKeyDown이 불려 설정창을 열도록).
+    if (Config_IsShortcut(&obj->config, SC_FN_SETTINGS, skVk, skMods)) {
+        if (pfEaten) *pfEaten = TRUE;
+        goto tk_done;
+    }
+
+    // 유니코드 코드 입력 단축키 (설정 가능, 기본 Ctrl+Alt+U) 예측-소비.
+    if (Config_IsShortcut(&obj->config, SC_FN_CODE, skVk, skMods)) {
+        if (pfEaten) *pfEaten = TRUE;
+        goto tk_done;
+    }
+
+    // 무간섭 모드 켜기 단축키 (설정 가능, 기본 없음) 예측-소비.
+    if (Config_IsShortcut(&obj->config, SC_FN_PASSTHROUGH, skVk, skMods)) {
+        if (pfEaten) *pfEaten = TRUE;
+        goto tk_done;
+    }
+
+    if (Config_IsShortcut(&obj->config, SC_FN_HANJA, skVk, skMods)
+        || wParam == VK_KANJI) {   // 한자/변환 트리거 키 (기본 VK_HANJA — IsModifierOrLock이라 아래선 못 잡음)
+        if (pfEaten) *pfEaten = TRUE;
+        goto tk_done;
+    }
+
+    // Check if it's a layout rotate shortcut
+    if (Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods)) {
+        if (pfEaten) *pfEaten = TRUE;
+        goto tk_done;
+    }
+
+    // Ctrl/Alt/Win 조합(Ctrl+C, Ctrl+A 등 앱 단축키): 조합 중이면 '여기서' 확정하고, 키는
+    // 소비하지 않고 통과 → 앱이 원래 타이밍·원래 이벤트로 기능키를 처리한다.
+    //   (RFC-0004 P0-1 개정, 실기 2026-07-08: eat+재전달 방식은 주입된 키가 이미 큐에 쌓인
+    //   사용자 입력(Ctrl 뗌 등)을 추월당해 Ctrl 없이 처리됨 → 'C'가 ㅊ로 오입력되는 재앙.
+    //   flush는 동기 편집세션이라 통과 전에 완료되고, 부작용은 조기 확정뿐이라 안전.)
+    if (HasCtrlAltWin()) {
+        if (obj->fsm.state != STATE_EMPTY) {
+            FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};
+            JamoDiag("TK  vk=%02X ctrl/alt/win flush-in-test commit=U+%04X", (unsigned)wParam, (unsigned)res.commitChar);
+            OutputResultSeq(obj, pic, res, TRUE);   // 음절 확정 (통과 전에 동기 완료)
+        }
+        if (obj->seqKb.pending[0]) {   // 순차 변환의 보류도 같은 자리에서 확정 (RFC-0016 §6.3)
+            LayoutConfig *cur = Config_GetCurrentLayout(&obj->config);
+            if (cur && cur->type == LAYOUT_TYPE_SEQUENCE) {
+                SeqResult fr = SeqKb_Flush(&obj->seqKb, (const SeqLayout*)cur->pSeqLayout);
+                SeqApply(obj, pic, &fr);
+            }
+        }
+        goto tk_done;   // pfEaten=FALSE — 앱이 단축키를 네이티브로 처리
+    }
+
+    {
+        LayoutConfig *layout = Config_GetCurrentLayout(&obj->config);
+
+        bool fullWidth = obj->config.options.fullWidth;
+        if (layout && layout->type == LAYOUT_TYPE_STATIC_MAP) {   // layout==NULL(layoutCount 0) 시 크래시 방지
+            bool isShift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            wchar_t qc = GetQwertyChar(wParam, isShift);
+            if (qc > 0 && qc < 256 && (layout->charMap[qc] != qc || fullWidth)) {
+                if (pfEaten) *pfEaten = TRUE;
+                goto tk_done;
+            }
+        }
+        if (layout && layout->type == LAYOUT_TYPE_PASSTHROUGH && fullWidth) {
+            bool isShift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            wchar_t qc = GetQwertyChar(wParam, isShift);
+            if (qc >= 0x20 && qc < 0x7F) { if (pfEaten) *pfEaten = TRUE; goto tk_done; }
+        }
+
+        if (layout && (layout->type == LAYOUT_TYPE_KOREAN_FSM || layout->type == LAYOUT_TYPE_HANGUL_CUSTOM)) {
+            // 조합 중 백스페이스는 우리가 처리하므로 예측-소비 (앱이 먼저 지우지 않도록).
+            // 모아치기 조합(obj->chord)은 fsm.state에 안 잡히므로 함께 검사.
+            if (wParam == VK_BACK && (obj->fsm.state != STATE_EMPTY || obj->chord.activeKeys > 0)) {
+                if (pfEaten) *pfEaten = TRUE;
+                goto tk_done;
+            }
+            // Esc = 조합 취소 탈출구 (순차 FSM·모아치기 공통) — 갇힌 조합/칩을 확실히 비운다.
+            if (wParam == VK_ESCAPE && (obj->fsm.state != STATE_EMPTY || obj->chord.activeKeys > 0)) {
+                if (pfEaten) *pfEaten = TRUE;
+                goto tk_done;
+            }
+            // 조합 중이면 비자모 키(F4·기능키 등)도 예측-소비 → OnKeyDown이 불려 조합을 확정한다.
+            // (TSF는 OnTestKeyDown이 TRUE인 키만 OnKeyDown 호출. F4는 선택도 안 바꿔 sink도 안 뜸.)
+            // 모디파이어/락 키는 제외(Shift로 대문자 등 조합 유지).
+            if ((obj->fsm.state != STATE_EMPTY) && !IsModifierOrLock(wParam)) {
+                if (pfEaten) *pfEaten = TRUE;
+                goto tk_done;
+            }
+            const HangulLayout *hl = (const HangulLayout*)layout->pHangulLayout;
+            bool isShift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            wchar_t qc = GetQwertyChar(wParam, isShift);
+            JamoType jt = JAMO_NONE;
+            if (qc > 0 && qc < 128)
+                jt = hl ? hl->keymap[(int)qc].type : Layout_MapKeyToJamo(qc, layout->kbdVariant).type;
+            if (hl && hl->chord && qc > 0 && qc < 128 && ((const ChordLayout*)hl->chord)->keyBit[(int)qc] >= 0)
+                jt = JAMO_CHO;                  // 앞단 조합의 글쇠 (RFC-0007) — 자모를 내는 것은 조합이다
+            if (jt != JAMO_NONE) {
+                if (pfEaten) *pfEaten = TRUE;   // 자모 키만 소비 (자판별로 판정)
+            }
+        } else if (layout && layout->type == LAYOUT_TYPE_SEQUENCE
+                   && layout->pSeqLayout && ((const SeqLayout*)layout->pSeqLayout)->chord) {
+            const ChordLayout *cl = (const ChordLayout*)((const SeqLayout*)layout->pSeqLayout)->chord;
+            bool isShift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            wchar_t qc = GetQwertyChar(wParam, isShift);
+            if (cl && qc > 0 && qc < 128 && cl->keyBit[(int)qc] >= 0) {
+                if (pfEaten) *pfEaten = TRUE;   // 앞단 조합의 글쇠 (§6.3)
+            }
+        } else if (layout && layout->type == LAYOUT_TYPE_SEQUENCE) {
+            const SeqLayout *sl = (const SeqLayout*)layout->pSeqLayout;
+            if (sl) SeqLayout_SelectScheme((SeqLayout *)sl, layout->optKeys);   // 쌍병: 자판 선택(Keys)의 글쇠 표
+            if (sl) obj->seqKb.noPunct = sl->ja && layout->optNoPunct;           // 일본어: 문장부호를 끈 자판 (0.70.0)
+            bool isShift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            wchar_t qc = GetQwertyChar(wParam, isShift);
+            bool pend = obj->seqKb.pending[0] != L'\0' || SeqKb_Reading(&obj->seqKb)[0] != L'\0';
+            if (sl && sl->convertVk && (UINT)wParam == (UINT)sl->convertVk && SeqKb_CanConvert(&obj->seqKb, sl)) {
+                if (pfEaten) *pfEaten = TRUE;   // 변환 글쇠 (§6.4)
+                goto tk_done;
+            }
+            // 보류가 있으면 글자가 아닌 글쇠(엔터·탭·화살표·사이띄개)도 예측-소비한다 — 그래야
+            // OnKeyDown 이 불려 보류를 확정하고, 원래 글쇠를 실제 이벤트로 다시 보낼 수 있다
+            // (한글 FSM 의 어절 경계 처리와 같은 규칙, RFC-0008 W0-02).
+            if (SeqKb_WouldEat(&obj->seqKb, sl, qc) || (pend && !IsModifierOrLock(wParam))) {
+                if (pfEaten) *pfEaten = TRUE;
+            } else if (sl && sl->zh && !layout->optNoPunct && SeqKb_IsPunct(sl, qc) && !HasCtrlAltWin()) {
+                if (pfEaten) *pfEaten = TRUE;   // 중국어 문장부호 (읽기가 없어도 바꾼다)
+            } else if (sl && sl->zh && !IsModifierOrLock(wParam)) {
+                // 응용이 그대로 받는 글쇠 — OnKeyDown 은 불리지 않으므로 여기서 기억한다: 숫자 뒤의 . , : 는 그대로(3.14),
+                //   사이띄개·엔터 뒤면 다시 중국어 꼴. 같은 값을 다시 적을 뿐이라 여러 번 불려도 같다.
+                obj->seqKb.lastCommit = (qc >= 0x21 && qc <= 0x7E) ? qc : 0;
+            }
+        } else if (layout && layout->type == LAYOUT_TYPE_CHORD) {
+            const ChordLayout *cl = (const ChordLayout*)layout->pChordLayout;
+            bool isShift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            wchar_t qc = GetQwertyChar(wParam, isShift);
+            if (cl && qc > 0 && qc < 128 && cl->keyBit[(int)qc] >= 0) {
+                if (pfEaten) *pfEaten = TRUE;   // 코드 글쇠 소비
+            }
+        }
+    }
+tk_done:
+    LeaveCriticalSection(&g_configLock);
+    return S_OK;
+}
+
+// 코드 입력 열기 (Ctrl+Alt+U — 키 경로와 preserved key 경로가 함께 쓴다).
+//   자체 팝업이 먼저다 — UWP(AppContainer) 에서도 소유된 창은 보인다(A9). 소유자는 후보창과 같은 규칙.
+//   자체 창을 쓰지 않거나(UwpOwnWindow=0) 못 만들면(AppContainer), 헬퍼가 그 줄을 그리고, 그것도 안 되면
+//   "16진수를 먼저 치고 이 키" 로 강등한다(0.19.1 동작). 창 없이 키만 먹는 상태로는 두지 않는다.
+static void OpenCodeInput(JamotongTextService *obj, ITfContext *pic) {
+    RECT rc; int x = 100, y = 100, top = 96;
+    if (pic) RequestCaretRect(obj, pic);   // 조합 전이라도 지금 캐럿 자리에 (B16) — 못 재면 예전 폴백
+    if (GetCaretScreenRect(obj, &rc)) { x = rc.left; y = rc.bottom + 4; top = rc.top; }
+    if (!UwpDetour(obj) && CodeInput_Show(x, y, top, ContextViewWindow(pic))) return;
+    if (!HostIsAppContainer()) return;             // 데스크톱에서 창을 못 만들었다 — 예전처럼 아무 일 없음
+    if (obj->config.options.useUiHelper && UiClient_Available()) {
+        obj->uiCode.x = x; obj->uiCode.y = y; obj->uiCode.caretTop = top;
+        CodeInput_ShowWindowless();
+        UiCodeDraw(obj);
+        if (!obj->uiCode.active) CodeInput_Hide();   // 헬퍼가 못 그렸다 → 열어 두지 않는다
+    }
+    if (!obj->uiCode.active) TryReplaceHexCodepoint(obj, pic);
+}
+
+// A9 의 물러서기: 데스크톱 헬퍼가 후보창을 그리게 하고(RFC-0015), 그것도 안 되면 한자키 순환으로.
+//   처리했으면 true — 문맥 참조(candCtx.pic)는 여기서 놓는다.
+static bool UwpCandFallback(JamotongTextService *obj, wchar_t **cands, int count, int replaceLen, bool special,
+                            int x, int y, int caretTop) {
+    if (obj->config.options.useUiHelper
+        && UiCandShow(obj, cands, count, replaceLen, special, x, y, caretTop,
+                      obj->config.options.candFont, obj->config.options.candFontSize)) {
+        if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+        return true;
+    }
+    if (obj->config.options.uwpHanjaCycle) {
+        ApplyHanjaChoice(obj, cands[0], replaceLen);
+        if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+        obj->hanjaCycle.active = true;
+        obj->hanjaCycle.cands = cands;   // 사전 소유 배열(수명은 사전이 보장)
+        obj->hanjaCycle.count = count;
+        obj->hanjaCycle.idx = 0;
+        obj->hanjaCycle.targetHwnd = obj->candCtx.targetHwnd;
+        wcsncpy(obj->hanjaCycle.applied, cands[0], 7); obj->hanjaCycle.applied[7] = L'\0';
+        JamoDiag("HANJA cycle start count=%d", count);
+        return true;
+    }
+    return false;
+}
+
+static HRESULT STDMETHODCALLTYPE KES_OnKeyDown(ITfKeyEventSink *pThis, ITfContext *pic, WPARAM wParam, LPARAM lParam, BOOL *pfEaten) {
+    JamotongTextService *obj = IMPL_TO_OBJ(KES, pThis);
+    if (pfEaten) *pfEaten = FALSE;
+    // 우리가 SendInput으로 넣은 합성 입력(코드 자판의 키/모디파이어 등)은 재처리하지 않고 통과
+    if ((ULONG_PTR)GetMessageExtraInfo() == JAMO_SYNTH_MARK) { JamoDiag("KD  vk=%02X SYNTH-pass", (unsigned)wParam); return S_OK; }
+    const UINT skVk = Config_ResolveVK(wParam, lParam);    // OnTestKeyDown 과 같은 이유로 1회만
+    const UINT skMods = Config_CurrentMods();
+    if (OwnerPassesCommand(obj,wParam,skMods)) return S_OK;
+    JamoDiag("KD  vk=%02X state=%d", (unsigned)wParam, (int)obj->fsm.state);
+
+    // 무간섭(직접 입력) 모드: 해제 단축키만 처리, 그 외 전부 통과 (OnTestKeyDown과 동일 판단).
+    Compart_ReadContextDisabled(obj, pic);   // RIUM: recheck if focus changed after preview
+    if (obj->ctxKeyboardDisabled) return S_OK;   // 앱이 끈 문맥 — 통과 (OnTestKeyDown 과 동일)
+    DeferFallbackOnFocusChange(obj, pic);
+    if (obj->cpPendingCommit && wParam == VK_ESCAPE) {
+        Jamotong_PendingClear(obj);
+        if (pfEaten) *pfEaten=TRUE;
+        return S_OK;
+    }
+    if (wParam == VK_ESCAPE && obj->pComposition && !JamoComp_OwnsFocus(obj,pic)) return S_OK;
+    if (obj->passthrough) {
+        EnterCriticalSection(&g_configLock);
+        bool ptHit = Config_IsShortcut(&obj->config, SC_FN_PASSTHROUGH,
+                                       skVk, skMods);
+        LeaveCriticalSection(&g_configLock);
+        if (ptHit) {
+            Jamotong_SetPassthrough(obj, FALSE);
+            LangBar_Update(obj->pLangBarItem);
+        Compart_Publish(obj);
+            if (pfEaten) *pfEaten = TRUE;
+        }
+        return S_OK;
+    }
+
+    bool isShift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+    // 유니코드 코드 입력 팝업 키 라우팅 (열려 있으면 모든 키 소비; Enter 확정 시 문자 삽입)
+    if (CodeInput_IsVisible()) {
+        unsigned cp = 0;
+        bool wasEsc = ((UINT)wParam == VK_ESCAPE);
+        CodeInput_HandleKey((UINT)wParam, isShift, &cp);
+        if (obj->uiCode.active) {   // 창 없는(UWP) 모드: 매 키마다 헬퍼가 그린 줄을 갱신
+            if (cp || wasEsc || !CodeInput_IsVisible()) UiCodeHide(obj);
+            else UiCodeDraw(obj);
+        }
+        if (cp) {
+            EditSessionData esd = {0};
+            if (cp <= 0xFFFF) { esd.committed[0] = (wchar_t)cp; }
+            else {   // BMP 밖 → UTF-16 서로게이트 쌍
+                unsigned v = cp - 0x10000;
+                esd.committed[0] = (wchar_t)(0xD800 + (v >> 10));
+                esd.committed[1] = (wchar_t)(0xDC00 + (v & 0x3FF));
+            }
+            RequestEditSessionData(obj, pic, &esd);
+        }
+        if (pfEaten) *pfEaten = TRUE;
+        return S_OK;
+    }
+    // Hanja UI interception (후보창 키 라우팅 — config 미접근이라 락 밖)
+    if (CandidateUI_IsVisible()) {
+        if (CandidateUI_HandleKey((UINT)wParam)) {
+            if (pfEaten) *pfEaten = TRUE;
+            return S_OK;
+        }
+    }
+    if (obj->uiCand.active) {   // RFC-0015: 헬퍼 후보창의 탐색·선택 키
+        if (UiCandHandleKey(obj, pic, (UINT)wParam)) {
+            if (pfEaten) *pfEaten = TRUE;
+            return S_OK;
+        }
+        UiCandHide(obj);   // 후보와 무관한 키 → 후보창을 닫고 그 키는 평소대로 처리
+    }
+
+    // 여기부터 live config(한자키 설정·현재 레이아웃)를 읽고 플러그인/레이아웃을 쓰므로, 설정
+    // 스레드의 Config_ApplyEdited(레이아웃 free)와 직렬화한다. 재진입 락이라 내부의
+    // Config_RotateLayout 등과 중첩돼도 안전. 이후 모든 경로는 kd_done으로 해제.
+    EnterCriticalSection(&g_configLock);
+    if (wParam != VK_ESCAPE && !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods) &&
+        !RetryPendingAtOwnedFocus(obj, pic)) goto kd_done;
+    if (wParam != VK_ESCAPE && !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods) &&
+        !JamoComp_PrepareInput(obj, pic)) {
+        if (pfEaten) *pfEaten = JamoComp_OwnsFocus(obj, pic);
+        goto kd_done;
+    }
+
+    // 설정창 단축키 (설정 가능, 기본 Ctrl+Alt+K — Win11 모던 설정엔 IME "옵션" 버튼이 없어 단축키로 연다).
+    if (Config_IsShortcut(&obj->config, SC_FN_SETTINGS, skVk, skMods)) {
+        SettingsUI_Show(&obj->config);
+        if (pfEaten) *pfEaten = TRUE;
+        goto kd_done;
+    }
+
+    // 무간섭 모드 켜기 (설정 가능한 단축키, 기본 없음 — 우클릭 메뉴로도 토글).
+    if (Config_IsShortcut(&obj->config, SC_FN_PASSTHROUGH, skVk, skMods)) {
+        if (obj->fsm.state != STATE_EMPTY) {
+            FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};
+            OutputResultSeq(obj, pic, res, TRUE);   // 조합 중이면 먼저 확정
+        }
+        Jamotong_SetPassthrough(obj, TRUE);
+        LangBar_Update(obj->pLangBarItem);
+        Compart_Publish(obj);
+        if (pfEaten) *pfEaten = TRUE;
+        goto kd_done;
+    }
+
+    // 코드 입력 트리거 (설정 가능한 단축키, 기본 Ctrl+Alt+U) — 조합 중이면 먼저 확정하고 캐럿 근처에 팝업.
+    if (Config_IsShortcut(&obj->config, SC_FN_CODE, skVk, skMods)) {
+        if (obj->fsm.state != STATE_EMPTY) {
+            FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};
+            OutputResultSeq(obj, pic, res, TRUE);
+        }
+        EnsureHanjaDicts();   // RFC-0008 W2-10: 코드 입력 줄의 훈음은 사전이 있어야 보인다 (한자를 먼저 안 썼어도)
+        OpenCodeInput(obj, pic);
+        if (pfEaten) *pfEaten = TRUE;
+        goto kd_done;
+    }
+
+    // 순환 변환(UWP)은 한자키를 연달아 누르는 동안만 살아 있다 — 다른 키가 오면 그 자리에서 끝난다.
+    if (obj->hanjaCycle.active
+        && !(Config_IsShortcut(&obj->config, SC_FN_HANJA, skVk, skMods) || wParam == VK_KANJI))
+        HanjaCycleReset(obj);
+
+    // Hanja trigger (설정된 한자 키 목록 — 기본 VK_HANJA, 복수 지정 가능). VK_KANJI는 항상 허용.
+    if ((Config_IsShortcut(&obj->config, SC_FN_HANJA, skVk, skMods)
+         || wParam == VK_KANJI) && !CandidateUI_IsVisible()) {
+        // 순환 변환 중(UWP 호스트)의 한자키 = 다음 후보로 교체. 사전 재조회 없이 목록을 돈다.
+        if (obj->hanjaCycle.active && obj->hanjaCycle.count > 0) {
+            obj->hanjaCycle.idx = (obj->hanjaCycle.idx + 1) % obj->hanjaCycle.count;
+            const wchar_t *next = obj->hanjaCycle.cands[obj->hanjaCycle.idx];
+            int prevLen = (int)wcslen(obj->hanjaCycle.applied);
+                obj->candCtx.fromSelection = false;
+            obj->candCtx.targetHwnd = obj->hanjaCycle.targetHwnd;
+            obj->candCtx.pic = pic;   // AddRef 하지 않는다 — 이 호출 안에서만 쓰고 Release 도 안 한다
+            ApplyHanjaChoice(obj, next, prevLen);
+            obj->candCtx.pic = NULL;
+            wcsncpy(obj->hanjaCycle.applied, next, 7); obj->hanjaCycle.applied[7] = L'\0';
+            JamoDiag("HANJA cycle idx=%d/%d", obj->hanjaCycle.idx, obj->hanjaCycle.count);
+            if (pfEaten) *pfEaten = TRUE;
+            goto kd_done;
+        }
+        EnsureHanjaDicts();   // lazy-load (첫 한자 요청 시 1회)
+        wchar_t searchStr[64] = {0};
+        int replaceLen = 0;
+        bool special = false;
+        bool fromSelection = false;   // 블록 선택 변환 여부 (EM_REPLACESEL 교체 경로 선택)
+
+        // 조합 중 변환의 '커밋 후 교체' 흐름은 교체가 실제로 되는 호스트에서만 안전하다.
+        // EDIT 계열(EM_REPLACESEL)과 인라인 조합(TSF range 교체)은 교체 가능. 그 외
+        // commit 전용 호스트(PuTTY류 터미널)는 range 편집이 안 되어 '가'를 먼저 커밋하면
+        // 선택한 한자가 그 뒤에 덧붙었다("가家" — 실기 2026-07-24, 백로그 예고 이슈).
+        // → 교체 불가 호스트는 커밋하지 않고 조합(칩)을 유지한 채 후보를 띄우고,
+        //   선택 시 한자만 삽입(replaceLen=0), 취소 시 조합이 그대로 이어진다(원본 보존).
+        //   RFC-0008 W1-02: EDIT 계열(CUAS)도 '먼저 넣고 나중에 교체'는 전달 순서가 비동기라
+        //   원문+한자가 남거나 앞 글자만 바뀔 수 있다 → 확정 전용 경로는 전부 원문 보류(조합 유지).
+        //   교체는 인라인 조합(음절이 이미 문서 안 조합)에서만. 정책 = hanja_txn.c.
+        bool canReplace = HanjaTxn_Mode(obj->fsm.state != STATE_EMPTY, JamoComp_IsActive(obj) ? 1 : 0)
+                          == HANJA_COMMIT_THEN_REPLACE;
+        bool keepComposing = false;   // 교체 불가 호스트: 조합 유지 중 변환
+
+        if (obj->fsm.state == STATE_CHO) {
+            // 단일 자음 + 한자키 → 특수문자 표 (호환 자모로 조회).
+            // 교체 가능 호스트: 자음을 '문서에 먼저 커밋' → 취소 시 원본 보존(실기 2026-07-08),
+            // 선택 시 커밋 글자를 교체(replaceLen=1).
+            wchar_t ch = Layout_ChoToCompatJamo(obj->fsm.cho);
+            searchStr[0] = ch; searchStr[1] = L'\0';
+            special = true;
+            if (canReplace) {
+                Fsm_Init(&obj->fsm);
+                FsmResult res = {ch, 0, false};
+                // RFC-0010: 인라인 조합 활성이면 자모가 이미 문서에 있다 — 확정만(재삽입 금지)
+                OutputResultSeq(obj, pic, res, TRUE);   // 문서에 자모 커밋
+                replaceLen = 1;
+            } else {
+                keepComposing = true;   // 커밋·리셋 없이 후보만 — 선택=삽입, 취소=조합 계속
+                replaceLen = 0;
+            }
+        } else if (obj->fsm.state != STATE_EMPTY) {
+            // 조합 중 음절 + 한자키.
+            wchar_t syl = ComposeHangul(obj->fsm.cho, obj->fsm.jung, obj->fsm.jong);
+            searchStr[0] = syl; searchStr[1] = L'\0';
+            if (canReplace) {
+                Fsm_Init(&obj->fsm);
+                FsmResult res = {syl, 0, false};
+                // RFC-0010: 인라인 조합 활성이면 음절이 이미 문서에 있다 — 확정만(재삽입 금지)
+                OutputResultSeq(obj, pic, res, TRUE);   // 문서에 음절 커밋
+                replaceLen = 1;
+            } else {
+                keepComposing = true;
+                replaceLen = 0;
+            }
+        } else {
+            // [RFC-0003] 블록 선택 텍스트 변환 — 선택이 있으면 최우선.
+            //   선택 교체 = InsertTextAtSelection 삽입(타이핑 덮어쓰기와 동일 경로)이라
+            //   커밋 전용 원칙·CUAS 앱과 호환. 사전 미등재 선택이면 무동작(우아한 강등).
+            wchar_t selBuf[24] = {0};
+            RequestReadSelectionString(obj, pic, selBuf, 16);
+            if (selBuf[0]) {
+                wchar_t **selCands; int selCount;
+                if (HanjaDict_Find(selBuf, &selCands, &selCount)) {
+                    wcsncpy(searchStr, selBuf, 63); searchStr[63] = L'\0';   // 음절(1자)/단어 공용 사전
+                    fromSelection = true;
+                } else if (!selBuf[1] && SpecialChar_Find(selBuf[0], &selCands, &selCount)) {
+                    searchStr[0] = selBuf[0]; searchStr[1] = L'\0';          // 단일 문자: 특수문자 표 폴백
+                    special = true;
+                    fromSelection = true;
+                }
+                replaceLen = 0;   // EDIT 계열은 EM_REPLACESEL, 비-EDIT는 삽입=선택 교체
+            } else {
+            // 유니코드 직접 입력: 커서 앞 2~6자리 16진수 → 해당 코드포인트 문자로 치환
+            if (TryReplaceHexCodepoint(obj, pic)) {
+                if (pfEaten) *pfEaten = TRUE;
+                goto kd_done;
+            }
+            wchar_t readBuf[32] = {0};
+            if (SUCCEEDED(RequestReadSessionString(obj, pic, readBuf, 10))) {
+                int len = wcslen(readBuf);
+                // 단어 단위 한자 변환 (커서 앞 텍스트 — 교체는 range 편집이라 네이티브 앱 한정)
+                for (int i = 0; i < len; i++) {
+                    wchar_t **cands;
+                    int count;
+                    if (HanjaDict_Find(readBuf + i, &cands, &count)) {
+                        wcscpy(searchStr, readBuf + i);
+                        replaceLen = len - i;
+                        break;
+                    }
+                }
+            }
+            }   // [RFC-0003] 선택 없음 분기 끝
+        }
+
+        if (searchStr[0]) {
+            wchar_t **cands = NULL;
+            int count = 0;
+            bool found = special ? SpecialChar_Find(searchStr[0], &cands, &count)
+                                 : HanjaDict_Find(searchStr, &cands, &count);
+            JamoDiag("HANJA canReplace=%d keepComposing=%d found=%d", (int)canReplace,
+                     (int)keepComposing, (int)found);
+            if (found) {
+                        obj->candCtx.fromSelection = fromSelection;
+                obj->candCtx.targetHwnd = EditCtl_FocusEditWindow();   // 대상 EDIT 저장(콜백 시점 재조회 불가)
+                wcsncpy(obj->candCtx.word, searchStr, 31); obj->candCtx.word[31] = L'\0';   // 교체 검증용 원문
+                // 후보창은 비동기(즉시 반환) — 나중 콜백에서 pic를 쓰므로 AddRef로 수명 고정(UAF 방지).
+                // 이전 후보가 남아 있으면(방어적) 먼저 해제.
+                if (obj->candCtx.pic) obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic);
+                obj->candCtx.pic = pic;
+                if (pic) pic->lpVtbl->AddRef(pic);
+
+                RECT rcSel;   // 위치: 선택/캐럿 rect(방금 세션서 캡처) → GUIThreadInfo 폴백
+                int x = 100, y = 100, caretTop = 96;
+                // 둘 다 없으면(조합 없는 COMMIT 경로·고전 캐럿 없는 편집기) 지금 캐럿을 TSF 로 재 본다 — 화면 구석
+                //   (100,100)에 뜨던 것(B14, 메모장 새 탭). 코드 입력창과 같은 방법(B16).
+                if (!GetCaretScreenRect(obj, &rcSel) && pic) RequestCaretRect(obj, pic);
+                if (GetCaretScreenRect(obj, &rcSel)) { x = rcSel.left; y = rcSel.bottom + 4; caretTop = rcSel.top; }
+
+                // 후보창 글꼴/크기는 설정을 따른다 (전 요소 단일 글꼴 — candidate_ui.c)
+                // UWP(AppContainer) 호스트: 후보창을 띄워도 화면에 나타나지 않는다(위 HostIsAppContainer
+                // 주석). 첫 후보를 바로 적용하고, 한자키를 다시 누르면 다음 후보로 교체한다.
+                if (UwpDetour(obj) && UwpCandFallback(obj, cands, count, replaceLen, special, x, y, caretTop)) {
+                    if (pfEaten) *pfEaten = TRUE;
+                    goto kd_done;
+                }
+                CandidateUI_SetStyle(obj->config.options.candFont, obj->config.options.candFontSize);
+                if (!GetLiveCaretScreenRect(&obj->candAnchorRect)) obj->candAnchorRect = rcSel;
+                obj->candAnchorValid = TRUE;   // light dismiss 기준 (B10) — 살아 있는 캐럿 자리로
+                CandidateUI_SetViewWindow(ContextViewWindow(pic));
+                CandidateUI_SetTitle(searchStr);   // 머리줄: 한자로 바꿀 한글 (RFC-0020 P2)
+                if (!CandidateUI_Show(x, y, caretTop, cands, count, replaceLen, OnHanjaSelected, OnHanjaCancelled, obj)) {
+                    JamoDiag("HANJA candidate window failed to show");
+                    // A9: UWP 에서 자체 창을 못 만들면 헬퍼 → 순환으로 물러선다.
+                    if (!(HostIsAppContainer()
+                          && UwpCandFallback(obj, cands, count, replaceLen, special, x, y, caretTop))) {
+                        // 표시 실패(W1-08): 콜백이 안 불리므로 여기서 문맥 참조를 놓는다. 원문 보류(W1-02)면
+                        // 조합이 그대로 남아 잃는 것이 없다.
+                        if (obj->candCtx.pic) { obj->candCtx.pic->lpVtbl->Release(obj->candCtx.pic); obj->candCtx.pic = NULL; }
+                    }
+                }
+                if (pfEaten) *pfEaten = TRUE;
+                goto kd_done;
+            }
+        }
+    }
+
+    // Handle layout rotation
+    if (Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods)) {
+        RotateLayoutFromKey(obj, pic);   // 조합 경계 전환 한 경로 (W1-03)
+        if (pfEaten) *pfEaten = TRUE;
+        goto kd_done;
+    }
+
+    // Ctrl/Alt/Win 조합(앱 단축키): 확정은 OnTestKeyDown의 flush-in-test가 담당하고 키는
+    // 통과되므로 보통 여기 도달하지 않는다. 도달하면(호스트가 Test 없이 KeyDown만 주는 등)
+    // 방어적으로 확정만 하고 통과. 재전달·eat 금지 — 주입 키가 큐의 사용자 입력에 추월당해
+    // 자모로 오입력되던 실기 재앙(2026-07-08, ㅊ/ㅍ) 재발 방지.
+    if (HasCtrlAltWin()) {
+        if (obj->fsm.state != STATE_EMPTY) {
+            FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};
+            OutputResultSeq(obj, pic, res, TRUE);   // 현재 음절 확정
+        }
+        goto kd_done;   // pfEaten=FALSE 유지 → 앱이 단축키 직접 처리
+    }
+
+    LayoutConfig *layout = Config_GetCurrentLayout(&obj->config);
+    
+    bool fullWidth = obj->config.options.fullWidth;
+    if (layout && layout->type == LAYOUT_TYPE_STATIC_MAP) {
+        wchar_t qc = GetQwertyChar(wParam, isShift);
+        if (qc > 0 && qc < 256) {
+            wchar_t mappedChar = layout->charMap[qc];
+            // 리매핑됐거나(≠원본) 전각 모드면 가로채서 출력 (전각이면 전각 문자로 변환)
+            if (mappedChar != 0 && (mappedChar != qc || fullWidth)) {
+                if (pfEaten) *pfEaten = TRUE;
+                FsmResult res = {0};
+                res.commitChar = fullWidth ? ToFullWidth(mappedChar) : mappedChar;
+                OutputResult(obj, pic, res, FALSE);
+                goto kd_done;
+            }
+        }
+    }
+    // 영문 패스스루 + 전각 모드: 출력 가능한 ASCII를 전각으로 변환해 커밋
+    if (layout && layout->type == LAYOUT_TYPE_PASSTHROUGH && fullWidth) {
+        wchar_t qc = GetQwertyChar(wParam, isShift);
+        if (qc >= 0x20 && qc < 0x7F) {
+            if (pfEaten) *pfEaten = TRUE;
+            FsmResult res = {0}; res.commitChar = ToFullWidth(qc);
+            OutputResult(obj, pic, res, FALSE);
+            goto kd_done;
+        }
+    }
+
+    if (layout && layout->type == LAYOUT_TYPE_SEQUENCE) {
+        // 순차 변환 자판: 친 글자열을 표대로 바꾼다 (로마자→가나류). 보류는 미리보기로만 보인다.
+        const SeqLayout *sl = (const SeqLayout*)layout->pSeqLayout;
+        if (sl) SeqLayout_SelectScheme((SeqLayout *)sl, layout->optKeys);   // 쌍병: 자판 선택(Keys)의 글쇠 표
+        if (sl) obj->seqKb.noPunct = sl->ja && layout->optNoPunct;           // 일본어: 문장부호를 끈 자판 (0.70.0)
+        if (sl && sl->chord) {
+            // §6.3: 앞단 조합이 먼저 결정한다. 그 결과 `symbol` 만 엔진으로 들어가고(싱크),
+            // text/key 같은 동작은 예전처럼 실제 입력으로 나간다. 같은 글쇠를 둘이 겹쳐 먹지 않는다.
+            SeqSymbolCtx sctx = { obj, pic };
+            ChordKb_SetSymbolSink(&obj->chordKb, SeqSymbolSink, &sctx);
+            if (pic) ChordKb_SetTextSink(&obj->chordKb, ChordTextSink, &sctx);
+            wchar_t keyChar = GetQwertyChar(wParam, isShift);
+            bool eaten = ChordKb_KeyDown(&obj->chordKb, (const ChordLayout*)sl->chord, (UINT)wParam, keyChar);
+            ScheduleChordTick(obj);
+            ChordKb_SetSymbolSink(&obj->chordKb, NULL, NULL);   // 문맥은 이 키 이벤트 동안만 산다
+            ChordKb_SetTextSink(&obj->chordKb, NULL, NULL);
+            if (eaten && pfEaten) *pfEaten = TRUE;
+            goto kd_done;
+        }
+        if (sl) {
+            SeqResult r;
+            if (sl->convertVk && (UINT)wParam == (UINT)sl->convertVk && SeqKb_CanConvert(&obj->seqKb, sl)) {
+                // 일본어 (0.73.0): 문절 둘 이상으로 갈리는 읽기는 문절 편집으로 — 문장 후보를 끈 자판은 예전 목록
+                if (sl->ja && (SeqFlags(obj) & SEQ_CONV_SENTENCE) && SeqKb_JaSegments(&obj->seqKb, sl, &g_seqSegs)
+                    && SeqShowSegments(obj, pic, sl)) {
+                    if (pfEaten) *pfEaten = TRUE;
+                    goto kd_done;
+                }
+                // §6.4: 읽기를 후보로 바꾼다. 후보가 없으면 이 글쇠는 응용의 것이다.
+                if (SeqOpenCandidates(obj, pic, sl, false)) {
+                    if (pfEaten) *pfEaten = TRUE;
+                    goto kd_done;
+                }
+                // 후보가 없었다 — 엔진 상태는 그대로다. 이 글쇠는 응용의 것이므로 아래 경계
+                // 경로로 떨어뜨린다(보류·읽기를 먼저 확정하고 원래 글쇠를 다시 보낸다).
+            }
+            if (sl->zh && wParam != VK_BACK && wParam != VK_ESCAPE && !HasCtrlAltWin()) {
+                // 중국어 병음 방식: 엔진이 받지 않는 글자 글쇠(문장부호·숫자·대문자…). 읽기가 있으면 가장 그럴듯한
+                //   변환을 먼저 확정하고, 문장부호는 중국어 꼴로 (搜狗·Microsoft 병음과 같은 동작).
+                wchar_t qc = GetQwertyChar(wParam, isShift);
+                bool hasReading = obj->seqKb.pending[0] || SeqKb_Reading(&obj->seqKb)[0];
+                bool separator = qc == SEQ_SEPARATOR && hasReading;
+                if (qc >= 0x21 && qc <= 0x7E && !separator && !SeqKb_WouldEat(&obj->seqKb, sl, qc)) {
+                    bool punct = !layout->optNoPunct && SeqKb_IsPunct(sl, qc);
+                    if (hasReading || punct) {
+                        SeqResult fr; memset(&fr, 0, sizeof fr);
+                        if (hasReading) fr = SeqKb_CommitBest(&obj->seqKb, sl, SeqFlags(obj));
+                        SeqKb_NoteCommitted(&obj->seqKb, fr.committed);
+                        wchar_t pb[8];
+                        if (!(punct && SeqKb_Punct(&obj->seqKb, sl, qc, pb, 8))) { pb[0] = qc; pb[1] = L'\0'; }
+                        size_t n = wcslen(fr.committed);
+                        if (n + wcslen(pb) < sizeof fr.committed / sizeof fr.committed[0]) wcscat(fr.committed, pb);
+                        fr.composing[0] = L'\0';
+                        fr.eaten = true;
+                        if (CandidateUI_IsVisible()) CandidateUI_Hide();
+                        SeqReleaseCandCtx(obj);
+                        SeqApply(obj, pic, &fr);
+                        if (pfEaten) *pfEaten = TRUE;
+                        goto kd_done;
+                    }
+                }
+            }
+            if (sl->ja && wParam >= VK_F6 && wParam <= VK_F10 && !HasCtrlAltWin()
+                && (obj->seqKb.pending[0] || SeqKb_Reading(&obj->seqKb)[0])) {
+                // 일본어 방식 (0.70.0): F6 히라가나, F7 가타카나, F8 반각 가타카나, F9 전각 로마자, F10 반각 로마자로 확정
+                SeqResult fr = SeqKb_Flush(&obj->seqKb, sl);   // 보류까지 읽기로 — fr.committed 가 읽기 전체다
+                wchar_t kf[SEQ_MAX_READING * 4 + 1];
+                static const int forms[] = { SEQ_KANA_HIRAGANA, SEQ_KANA_KATAKANA, SEQ_KANA_HALF, SEQ_KANA_ROMAJI_FULL, SEQ_KANA_ROMAJI };
+                if (SeqKb_KanaForm(fr.committed, forms[wParam - VK_F6], kf, (int)(sizeof kf / sizeof kf[0]))
+                    && wcslen(kf) < sizeof fr.committed / sizeof fr.committed[0])
+                    wcscpy(fr.committed, kf);
+                fr.composing[0] = L'\0';
+                fr.eaten = true;
+                if (CandidateUI_IsVisible()) CandidateUI_Hide();
+                SeqReleaseCandCtx(obj);
+                SeqApply(obj, pic, &fr);
+                if (pfEaten) *pfEaten = TRUE;
+                goto kd_done;
+            }
+            if (sl->ja && wParam != VK_BACK && wParam != VK_ESCAPE && !HasCtrlAltWin()) {
+                // 일본어 방식: 엔진이 받지 않는 글자 글쇠(숫자·끈 문장부호…)가 읽기 뒤에 오면 읽기를 친 그대로 확정하고 그 글자를
+                //   잇는다 — 읽기를 띄워 둔 채 글자만 앱으로 가면 조합이 꼬인다(실기 2026-10-04).
+                wchar_t qc = GetQwertyChar(wParam, isShift);
+                bool hasReading = obj->seqKb.pending[0] || SeqKb_Reading(&obj->seqKb)[0];
+                if (hasReading && qc >= 0x21 && qc <= 0x7E && !SeqKb_WouldEat(&obj->seqKb, sl, qc)) {
+                    SeqResult fr = SeqKb_Flush(&obj->seqKb, sl);
+                    size_t n = wcslen(fr.committed);
+                    if (n + 2 <= sizeof fr.committed / sizeof fr.committed[0]) { fr.committed[n] = qc; fr.committed[n + 1] = L'\0'; }
+                    fr.composing[0] = L'\0';
+                    fr.eaten = true;
+                    if (CandidateUI_IsVisible()) CandidateUI_Hide();
+                    SeqReleaseCandCtx(obj);
+                    SeqApply(obj, pic, &fr);
+                    if (pfEaten) *pfEaten = TRUE;
+                    goto kd_done;
+                }
+            }
+            if (wParam == VK_BACK)        r = SeqKb_Backspace(&obj->seqKb, sl);
+            else if (wParam == VK_ESCAPE) r = SeqKb_Cancel(&obj->seqKb);
+            else {
+                wchar_t qc = GetQwertyChar(wParam, isShift);
+                if ((qc < 0x21 || qc > 0x7E) && !IsModifierOrLock(wParam)
+                    && (obj->seqKb.pending[0] || SeqKb_Reading(&obj->seqKb)[0])) {
+                    // 보류한 글자뿐 아니라 **읽기(우리 소유 preedit)** 도 여기서 확정한다 —
+                    // 엔터·탭·화살표에 읽기가 사라지면 안 된다 (실기 2026-09-23에서 발견).
+                    // 엔터·탭·화살표·사이띄개처럼 표 밖의 글쇠는 응용의 것이다. 보류를 먼저
+                    // 확정하고, 원래 글쇠는 실제 이벤트로 다시 보낸다 (한글 어절 경계와 같은 길 —
+                    // 편집세션 삽입이 안 통하는 터미널·방향키도 이 길이라야 제대로 산다).
+                    SeqResult fr = SeqKb_Flush(&obj->seqKb, sl);
+                    // 사이띄개만은 **한 번의 삽입**으로 보낸다 (한글 FSM 과 같은 길). 공백은 제어키가
+                    // 아니라 문자라 삽입으로 전달되고, 가장 잦은 경계 글쇠다 — 확정과 공백을 한 편집
+                    // 세션에 넣으면 30ms 재전송과 확정이 경합할 창 자체가 없다. 엔터·탭·방향키는
+                    // 제어키라 앱이 네이티브로 받아야 하므로 지금처럼 재전송한다.
+                    if (wParam == VK_SPACE) {
+                        size_t n = wcslen(fr.committed);
+                        if (n + 2 <= sizeof fr.committed / sizeof fr.committed[0]) {
+                            fr.committed[n] = L' ';
+                            fr.committed[n + 1] = L'\0';
+                            SeqApply(obj, pic, &fr);
+                            if (pfEaten) *pfEaten = TRUE;
+                            goto kd_done;
+                        }
+                        // 자리가 없을 만큼 길면(병적인 표) 예전 길로 — 한 글자도 잃지 않는다
+                    }
+                    if (wParam == VK_RETURN && (sl->zh || sl->ja)) {   // 중국어·일본어 방식: 엔터는 읽기만 확정 (줄은 바꾸지 않는다)
+                        SeqApply(obj, pic, &fr);
+                        SeqLiveRefresh(obj, pic, sl);
+                        if (pfEaten) *pfEaten = TRUE;
+                        goto kd_done;
+                    }
+                    ResendTarget resendTarget;CaptureResendTarget(obj,&resendTarget);
+                    SeqApply(obj, pic, &fr);
+                    ScheduleKeyResend(obj, wParam, lParam,&resendTarget);
+                    if (pfEaten) *pfEaten = TRUE;
+                    goto kd_done;
+                }
+                if (!qc) goto kd_done;
+                r = SeqKb_Key(&obj->seqKb, sl, qc);
+            }
+            if (r.committed[0] || r.eaten) SeqApply(obj, pic, &r);
+            if (r.eaten && pfEaten) *pfEaten = TRUE;
+            if (r.eaten) SeqLiveRefresh(obj, pic, sl);   // 중국어 병음 방식: 치는 동안 후보
+        }
+        goto kd_done;
+    }
+
+    if (layout && layout->type == LAYOUT_TYPE_CHORD) {
+        // 일반 코드 자판(ARTSEY류): KeyDown에서 눌린 글쇠 누적만, 동작은 KES_OnKeyUp(모두 해제 시).
+        const ChordLayout *cl = (const ChordLayout*)layout->pChordLayout;
+        wchar_t keyChar = GetQwertyChar(wParam, isShift);
+        bool eaten = ChordKb_KeyDown(&obj->chordKb, cl, (UINT)wParam, keyChar);
+        ScheduleChordTick(obj);                  // 3판: 가만히 있어도 hold 가 켜지도록 (§7.1)
+        if (eaten && pfEaten) *pfEaten = TRUE;   // 코드 글쇠가 아니면 통과(pfEaten=FALSE)
+        goto kd_done;
+    }
+
+    if (layout && (layout->type == LAYOUT_TYPE_KOREAN_FSM || layout->type == LAYOUT_TYPE_HANGUL_CUSTOM)) {
+        const HangulLayout *hl = (const HangulLayout*)layout->pHangulLayout;
+        // Esc = 조합 취소 (확정하지 않고 비움) — MS IME 관례이자, 상태가 어긋난 조합/칩의
+        // 확실한 탈출구(순차 FSM·모아치기 공통. 실기 2026-07-08 '갇힌 글자' 대응).
+        if (wParam == VK_ESCAPE && (obj->fsm.state != STATE_EMPTY || obj->chord.activeKeys > 0)) {
+            JamoComp_Cancel(obj);   // RFC-0010: 인라인 조합 텍스트를 문서에서 제거 (취소 관례)
+            ResetComposition(obj);
+            if (pfEaten) *pfEaten = TRUE;
+            goto kd_done;
+        }
+        if (hl && hl->moachigi) {
+            // 모아치기(동시치기): KeyDown에서 자모를 누적하고 조합 중 글자만 보여준다.
+            // 확정은 눌린 글쇠가 모두 떨어지는 KES_OnKeyUp에서 이루어진다.
+            if (wParam == VK_BACK && (obj->fsm.state != STATE_EMPTY || obj->chord.activeKeys > 0)) {
+                ResetComposition(obj);   // 조합 중 백스페이스 → 조합 비움 (chord는 fsm.state에 안 잡힘)
+                if (pfEaten) *pfEaten = TRUE;
+                goto kd_done;
+            }
+            wchar_t keyChar = GetQwertyChar(wParam, isShift);
+            ChordResult cr = Chord_KeyDown(&obj->chord, hl, (UINT)wParam, keyChar);
+            if (cr.eaten) {
+                if (pfEaten) *pfEaten = TRUE;
+                if (cr.composing) { FsmResult res = {0, cr.composing, true}; OutputResult(obj, pic, res, FALSE); }
+                goto kd_done;
+            }
+            // 자모 아님 → 아래 공통 처리로 진행하지 않고 통과 (space 등은 앱으로)
+        } else {
+            if (wParam == VK_BACK && obj->fsm.state != STATE_EMPTY) {   // 조합 중 백스페이스
+                wchar_t pe = 0;
+                if (obj->config.options.jamoDelete) {
+                    Fsm_Backspace(&obj->fsm, &pe);          // 자소 단위: 마지막 자모만 제거
+                } else {
+                    Fsm_Init(&obj->fsm);                     // 음절 단위: 조합 전체 삭제
+                }
+                FsmResult res = {0, pe, true};               // pe==0 이면 조합 비움
+                OutputResultSeq(obj, pic, res, FALSE);
+                if (pfEaten) *pfEaten = TRUE;
+                goto kd_done;
+            }
+            if (hl && hl->chord) {
+                // 앞단 조합 (RFC-0007): 함께 누른 글쇠가 먼저 결정하고, 그 `symbol` 이 오토마타로 들어간다
+                //   (모두 떼는 KeyUp 에서). 조합 글쇠가 아니면 아래 보통 한글 글쇠 길로 간다.
+                SeqSymbolCtx sctx = { obj, pic };
+                ChordKb_SetSymbolSink(&obj->chordKb, HangulSymbolSink, &sctx);
+                if (pic) ChordKb_SetTextSink(&obj->chordKb, HangulTextSink, &sctx);
+                if (pic) ChordKb_SetKeySink(&obj->chordKb, HangulKeySink, &sctx);
+                wchar_t ck = GetQwertyChar(wParam, isShift);
+                bool ceaten = ChordKb_KeyDown(&obj->chordKb, (const ChordLayout*)hl->chord, (UINT)wParam, ck);
+                ScheduleChordTick(obj);
+                ChordKb_SetSymbolSink(&obj->chordKb, NULL, NULL);
+                ChordKb_SetTextSink(&obj->chordKb, NULL, NULL);
+                ChordKb_SetKeySink(&obj->chordKb, NULL, NULL);
+                if (ceaten) {
+                    if (pfEaten) *pfEaten = TRUE;
+                    goto kd_done;
+                }
+            }
+            LayoutResult lr = {JAMO_NONE, 0};
+            wchar_t keyChar = GetQwertyChar(wParam, isShift);   // a~z + 숫자/기호 (세벌식/사용자 자판용)
+            if (keyChar > 0 && keyChar < 128) lr = hl ? hl->keymap[(int)keyChar] : Layout_MapKeyToJamo(keyChar, layout->kbdVariant);
+            if (lr.type != JAMO_NONE) {
+                // RFC-0008 W0-04: 문서에 실제로 들어간 뒤에만 FSM 을 확정한다.
+                // FsmContext 는 POD 라 이 스냅샷 하나로 이전 상태가 온전히 보존된다.
+                FsmContext fsmBefore = obj->fsm;
+                FsmResult res = Fsm_ProcessKey(&obj->fsm, keyChar, layout->kbdVariant, hl);
+                if (pfEaten) *pfEaten = res.eaten;
+                JamoDiag("FSM key=%c commit=U+%04X preedit=U+%04X", (char)keyChar, (unsigned)res.commitChar, (unsigned)res.preeditChar);
+                if (res.commitChar || res.preeditChar) {
+                    if (!OutputResultSeq(obj, pic, res, FALSE)) {
+                        // 출력이 문서에 닿지 못했다 → 그 키는 없던 일로 되돌린다.
+                        // 키는 그대로 소비한다: 여기서 앱에 흘리면 조합 중에 원문자가 박혀 더 나쁘다.
+                        obj->fsm = fsmBefore;
+                        JamoDiag("TXN rollback key=%c", (char)keyChar);
+                        // 출력은 커밋이 실패해도 새 조합(실패한 키의 preedit)을 이미 그렸다 —
+                        // 복원된 상태로 다시 그린다. 안 그러면 화면('나')과 FSM('간')이 어긋나
+                        // 다음 키가 보이는 것과 다르게 먹는다(실기 2026-09-21, EDIT 가득 찬 칸).
+                        FsmResult redraw = { 0, Fsm_PeekPreedit(&obj->fsm), true };
+                        OutputResultSeq(obj, pic, redraw, FALSE);
+                    }
+                }
+                goto kd_done;
+            } else if (!IsModifierOrLock(wParam) && obj->fsm.state != STATE_EMPTY) {
+                // [실험] 스페이스 경계: 확정 음절+공백을 '한 번의 삽입'으로 처리(재전달 없음).
+                //   CUAS(AkelPad)에서 합성 경계키와 결과문자 전달이 경합해 마지막 음절이
+                //   소실되는 현상 대응 — 삽입 경로 하나로 직렬화하면 경합 자체가 없다.
+                //   (공백은 '문자'라 터미널 포함 삽입으로 전달 가능. 엔터/방향키는 제어키라 기존 재전달 유지)
+                if (wParam == VK_SPACE) {
+                    wchar_t c = Fsm_PeekPreedit(&obj->fsm);
+                    JamoDiag("FLUSH+SPACE commit=U+%04X", (unsigned)c);
+                    if (JamoComp_IsActive(obj)) {
+                        // Write and finalize the last syllable plus space in one TSF transaction.
+                        if (JamoComp_CommitWithSpace(obj, c) != S_OK) {
+                            if (pfEaten) *pfEaten = TRUE;
+                            goto kd_done;
+                        }
+                    } else {
+                        wchar_t buf[3]; int n = 0;
+                        if (c) buf[n++] = c;
+                        buf[n++] = L' '; buf[n] = L'\0';
+                        if (!CommitText(obj, pic, buf)) {
+                            if (pfEaten) *pfEaten = TRUE;
+                            goto kd_done;
+                        }
+                    }
+                    Fsm_Flush(&obj->fsm);
+                    obj->prevChipValid = FALSE; obj->chipPendingAdv = 0;
+                    PreeditOverlay_Hide();   // 조합 종료 → 미리보기 제거
+                    if (pfEaten) *pfEaten = TRUE;
+                    goto kd_done;
+                }
+                // 그 외 비자모 키: 조합만 확정하고, 원래 키는 실제 이벤트로 재전달 → 앱이 네이티브 처리.
+                // (편집세션 텍스트 삽입은 터미널(PuTTY 등)엔 안 통함. 방향키 이동·엔터·터미널 모두 지원.)
+                FsmResult res = {Fsm_PeekPreedit(&obj->fsm), 0, false};
+                JamoDiag("FLUSH commit=U+%04X then resend vk=%02X (delayed)", (unsigned)res.commitChar, (unsigned)wParam);
+                ResendTarget resendTarget;CaptureResendTarget(obj,&resendTarget);
+                if (!OutputResultSeq(obj, pic, res, TRUE)) {
+                    if (pfEaten) *pfEaten = TRUE;
+                    goto kd_done;
+                }
+                Fsm_Flush(&obj->fsm);
+                ScheduleKeyResend(obj, wParam, lParam,&resendTarget);   // 지연 재전달 — CUAS 전달 경합 방지 (AkelPad 엔터 소실)
+                if (pfEaten) *pfEaten = TRUE;   // 원본 소비(재전달본이 대신 처리)
+            }
+        }
+    } else {
+        // Passthrough or other layouts
+        // If there is an active FSM composition (shouldn't happen here, but safe to flush)
+        if (obj->fsm.state != STATE_EMPTY) {
+            FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};
+            OutputResultSeq(obj, pic, res, TRUE);
+        }
+    }
+
+kd_done:
+    LeaveCriticalSection(&g_configLock);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE KES_OnTestKeyUp(ITfKeyEventSink *pThis, ITfContext *pic, WPARAM wParam, LPARAM lParam, BOOL *pfEaten) {
+    (void)pic; (void)lParam;
+    JamotongTextService *obj = IMPL_TO_OBJ(KES, pThis);
+    if (pfEaten) *pfEaten = FALSE;
+    // 모아치기/코드 자판으로 먹은 글쇠의 해제는 소비해야 OnKeyUp에서 확정 처리를 할 수 있다.
+    if (wParam < 256 && (obj->chord.keyDown[wParam] || obj->chordKb.keyDown[wParam])) {
+        if (pfEaten) *pfEaten = TRUE;
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE KES_OnKeyUp(ITfKeyEventSink *pThis, ITfContext *pic, WPARAM wParam, LPARAM lParam, BOOL *pfEaten) {
+    (void)lParam;
+    JamotongTextService *obj = IMPL_TO_OBJ(KES, pThis);
+    if (pfEaten) *pfEaten = FALSE;
+    if (wParam >= 256) return S_OK;
+
+    // 한글 모아치기: 눌린 글쇠가 모두 떨어지면 음절 확정 (키 이벤트는 입력 스레드에서 직렬 처리됨)
+    if (obj->chord.keyDown[wParam]) {
+        ChordResult cr = Chord_KeyUp(&obj->chord, (UINT)wParam);
+        if (cr.eaten) {
+            if (pfEaten) *pfEaten = TRUE;
+            if (cr.commit) { FsmResult res = {cr.commit, 0, true}; OutputResult(obj, pic, res, FALSE); }
+        }
+        return S_OK;
+    }
+
+    // 일반 코드 자판(ARTSEY류)과 입력 자판의 앞단 조합: 모두 떨어지면 동작 수행
+    if (obj->chordKb.keyDown[wParam]) {
+        EnterCriticalSection(&g_configLock);
+        LayoutConfig *layout = Config_GetCurrentLayout(&obj->config);
+        const ChordLayout *cl = NULL;
+        SeqSymbolCtx sctx = { obj, pic };
+        if (layout && layout->type == LAYOUT_TYPE_CHORD) cl = (const ChordLayout*)layout->pChordLayout;
+        else if (layout && layout->type == LAYOUT_TYPE_SEQUENCE && layout->pSeqLayout) {
+            cl = (const ChordLayout*)((const SeqLayout*)layout->pSeqLayout)->chord;
+            if (cl) ChordKb_SetSymbolSink(&obj->chordKb, SeqSymbolSink, &sctx);   // §6.3
+        }
+        bool hangulFront = false;
+        if (layout && layout->type == LAYOUT_TYPE_HANGUL_CUSTOM && layout->pHangulLayout) {   // RFC-0007
+            cl = (const ChordLayout*)((const HangulLayout*)layout->pHangulLayout)->chord;
+            if (cl) { ChordKb_SetSymbolSink(&obj->chordKb, HangulSymbolSink, &sctx); hangulFront = true; }
+        }
+        if (cl && pic) {   // `text` 는 문서로 (한글 앞단은 조합 중인 음절을 먼저 확정한다)
+            if (hangulFront) {
+                ChordKb_SetTextSink(&obj->chordKb, HangulTextSink, &sctx);
+                ChordKb_SetKeySink(&obj->chordKb, HangulKeySink, &sctx);
+            }
+            else ChordKb_SetTextSink(&obj->chordKb, ChordTextSink, &sctx);
+        }
+        bool eaten = ChordKb_KeyUp(&obj->chordKb, cl, (UINT)wParam);
+        ChordKb_SetSymbolSink(&obj->chordKb, NULL, NULL);
+        ChordKb_SetTextSink(&obj->chordKb, NULL, NULL);
+        ChordKb_SetKeySink(&obj->chordKb, NULL, NULL);
+        LeaveCriticalSection(&g_configLock);
+        ScheduleChordTick(obj);
+        if (eaten && pfEaten) *pfEaten = TRUE;
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE KES_OnPreservedKey(ITfKeyEventSink *pThis, ITfContext *pic, REFGUID rguid, BOOL *pfEaten) {
+    JamotongTextService *obj = IMPL_TO_OBJ(KES, pThis);
+    if (pfEaten) *pfEaten = FALSE;
+    int fn = Preserved_Lookup(obj, rguid);
+    if (fn < 0) return S_OK;                      // 우리 명령이 아님
+    JamoDiag("PRESERVED-KEY fn=%d", fn);
+    // OnKeyDown 의 해당 분기와 같은 동작·같은 락 규율 (preserved key 는 sink 이전에 매니저가 보낸다)
+    EnterCriticalSection(&g_configLock);
+    DeferFallbackOnFocusChange(obj, pic);
+    switch (fn) {
+        case SC_FN_SETTINGS:
+            SettingsUI_Show(&obj->config);
+            break;
+        case SC_FN_CODE: {
+            if (obj->fsm.state != STATE_EMPTY) {
+                FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};
+                OutputResultSeq(obj, pic, res, TRUE);
+            }
+            EnsureHanjaDicts();   // W2-10 (preserved key 경로도 같다)
+            OpenCodeInput(obj, pic);   // OnKeyDown 쪽 SC_FN_CODE 분기와 같은 길
+            break;
+        }
+        case SC_FN_PASSTHROUGH: {
+            if (obj->fsm.state != STATE_EMPTY) {
+                FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};
+                OutputResultSeq(obj, pic, res, TRUE);
+            }
+            Jamotong_SetPassthrough(obj, obj->passthrough ? FALSE : TRUE);   // 토글 (sink 경로는 켜기 전용 + 해제 전용이 나뉘어 있음)
+            LangBar_Update(obj->pLangBarItem);
+            Compart_Publish(obj);
+            break;
+        }
+        case SC_FN_ROTATE:
+            RotateLayoutFromKey(obj, pic);   // 키 싱크 경로와 같은 전환 (W1-03)
+            break;
+        default: break;
+    }
+    LeaveCriticalSection(&g_configLock);
+    if (pfEaten) *pfEaten = TRUE;
+    return S_OK;
+}
+
+static ITfKeyEventSinkVtbl KeyEventSinkVtbl = {
+    KES_QueryInterface,
+    KES_AddRef,
+    KES_Release,
+    KES_OnSetFocus,
+    KES_OnTestKeyDown,
+    KES_OnTestKeyUp,   // 순서 수정: OnTestKeyUp이 OnKeyDown보다 앞 (TSF ITfKeyEventSink 규약)
+    KES_OnKeyDown,
+    KES_OnKeyUp,
+    KES_OnPreservedKey
+};
+
+
+// ------------------------------------------------------------------
+// ITfTextInputProcessor Implementation
+// ------------------------------------------------------------------
+
+static const GUID kIID_ITfThreadMgrEventSink   = { 0xaa80e80e, 0x2021, 0x11d2, { 0x93, 0xe0, 0x00, 0x60, 0xb0, 0x67, 0xb8, 0x6e } };
+static const GUID kIID_ITfTextEditSink         = { 0x8127d409, 0xccd3, 0x4683, { 0x96, 0x7a, 0xb4, 0x3d, 0x5b, 0x48, 0x2b, 0xf7 } };
+static const GUID kIID_ITfTextLayoutSink       = { 0x2af2d06a, 0xdd5b, 0x4927, { 0xa0, 0xb4, 0x54, 0xf1, 0x9c, 0x91, 0xfa, 0xde } };
+
+static HRESULT STDMETHODCALLTYPE TIP_QueryInterface(ITfTextInputProcessor *pThis, REFIID riid, void **ppvObject) {
+    JamotongTextService *obj = (JamotongTextService*)pThis;
+    if (!ppvObject) return E_INVALIDARG;
+
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_ITfTextInputProcessor) ||
+        IsEqualIID(riid, &kIID_ITfTextInputProcessorEx)) {   // Ex 지원 (RFC-0013 A)
+        *ppvObject = &obj->lpVtblTIP;
+    } else if (IsEqualIID(riid, &IID_ITfKeyEventSink)) {
+        *ppvObject = &obj->lpVtblKES;
+    } else if (IsEqualIID(riid, &IID_ITfCompositionSink)) {
+        *ppvObject = &obj->lpVtblCompSink;   // RFC-0010 인라인 조합 외부 종료 sink
+    } else if (IsEqualIID(riid, &IID_ITfDisplayAttributeProvider_J)) {
+        *ppvObject = &obj->lpVtblDAP;   // composition display attribute provider
+    } else if (IsEqualIID(riid, &IID_ITfFunctionProvider)) {
+        *ppvObject = &obj->lpVtblFuncProv;   // 설정 "옵션" 노출
+    } else if (IsEqualIID(riid, &IID_ITfFnConfigure_J) || IsEqualIID(riid, &IID_ITfFunction_J)) {
+        *ppvObject = &obj->lpVtblFnConfig;   // "옵션" → 설정창
+    } else if (IsEqualIID(riid, &kIID_ITfTextEditSink)) {
+        *ppvObject = &obj->lpVtblTES;        // RFC-0008 W2-04: 한 객체의 모든 인터페이스가 서로 QI 된다
+    } else if (IsEqualIID(riid, &kIID_ITfTextLayoutSink)) {
+        *ppvObject = &obj->lpVtblTLS;        // 문서 배치 싱크 (light dismiss)
+    } else if (IsEqualIID(riid, &kIID_ITfThreadMgrEventSink)) {
+        *ppvObject = &obj->lpVtblTMES;
+    } else if (Compart_QueryInterface(obj, riid, ppvObject)) {
+        return S_OK;                         // compartment 통지 sink (AddRef 는 그쪽에서)
+    } else {
+        *ppvObject = NULL;
+        return E_NOINTERFACE;
+    }
+
+    obj->lpVtblTIP->AddRef(pThis);
+    return S_OK;
+}
+
+static ULONG STDMETHODCALLTYPE TIP_AddRef(ITfTextInputProcessor *pThis) {
+    JamotongTextService *obj = (JamotongTextService*)pThis;
+    return InterlockedIncrement(&obj->refCount);
+}
+
+static ULONG STDMETHODCALLTYPE TIP_Release(ITfTextInputProcessor *pThis) {
+    JamotongTextService *obj = (JamotongTextService*)pThis;
+    ULONG res = InterlockedDecrement(&obj->refCount);
+    if (res == 0) {
+        Config_Free(&obj->config);   // 레이아웃 리소스(플러그인 DLL/컨텍스트·name) 해제 — live의 유일 소유자
+        InterlockedDecrement(&g_DllRefCount);
+        HeapFree(GetProcessHeap(), 0, obj);
+    }
+    return res;
+}
+
+// ── ITfThreadMgrEventSink + ITfTextEditSink (문서 관여) ───────────────────────────
+//   NavilIME 등 표준 TIP은 이 싱크들을 붙여 포커스 문서에 '관여'한다. 이게 없으면 CUAS(AkelPad
+//   등 IMM32 브리지)가 우리 조합을 미소유로 보고 세션 후 확정·종료시키는 것으로 보인다.
+//   (msctf.h에 선언만 있고 uuid 라이브러리에 없을 수 있어 IID를 직접 정의)
+static const GUID kIID_ITfSource               = { 0x4ea48a35, 0x60ae, 0x446f, { 0x8f, 0xd6, 0xe6, 0xa8, 0xd8, 0x24, 0x59, 0xf7 } };
+
+static void AdviseTextEditSink(JamotongTextService *obj, ITfContext *pContext);
+
+// ITfTextEditSink
+static HRESULT STDMETHODCALLTYPE TES_QueryInterface(ITfTextEditSink *pThis, REFIID riid, void **ppv) {
+    JamotongTextService *obj = IMPL_TO_OBJ(TES, pThis);
+    if (!ppv) return E_INVALIDARG;
+    // RFC-0008 W2-04: IUnknown 은 TIP 의 정식 포인터 — 모든 QI 를 TIP 에 맡긴다(동일성·대칭).
+    return obj->lpVtblTIP->QueryInterface((ITfTextInputProcessor*)obj, riid, ppv);
+}
+static ULONG STDMETHODCALLTYPE TES_AddRef(ITfTextEditSink *pThis)  { JamotongTextService *obj = IMPL_TO_OBJ(TES, pThis); return obj->lpVtblTIP->AddRef((ITfTextInputProcessor*)obj); }
+static ULONG STDMETHODCALLTYPE TES_Release(ITfTextEditSink *pThis) { JamotongTextService *obj = IMPL_TO_OBJ(TES, pThis); return obj->lpVtblTIP->Release((ITfTextInputProcessor*)obj); }
+static HRESULT STDMETHODCALLTYPE TES_OnEndEdit(ITfTextEditSink *pThis, ITfContext *pic, TfEditCookie ec, ITfEditRecord *pRec) {
+    (void)pThis; (void)pic; (void)ec;
+    // 딴 데를 누르거나 캐럿을 옮기면 후보창을 닫는다 (light dismiss, B10 / RFC-0008 W2-03).
+    //   앱 **안에서** 오는 신호를 쓴다 — 전역 마우스 훅은 모든 앱에 훅을 심는 값이 너무 크고,
+    //   원격 데스크톱에서는 검증도 안 된다(2026-09-24 에 그 길로 만들었다가 되돌렸다).
+    //   우리 편집이 낸 선택 변화는 세지 않는다(확정할 때마다 후보창이 닫히면 안 된다).
+    //   ★실측(2026-09-24, 메모장): 캐럿을 클릭으로 옮겨도 이 싱크가 **아예 오지 않는다**.
+    //   그래서 메모장류에서는 아직 안 닫힌다 — 이 길은 싱크를 주는 호스트에서만 듣는다.
+    //   B10 에 열어 둔다: 다음 후보는 ITfTextLayoutSink::OnLayoutChange 인데, 스크롤에도 오므로
+    //   캐럿 자리를 비교해 진짜 이동일 때만 닫아야 한다.
+    if (pRec && CandidateUI_IsVisible() && !Jamotong_InOurEdit()) {
+        BOOL selChanged = FALSE;
+        if (SUCCEEDED(pRec->lpVtbl->GetSelectionStatus(pRec, &selChanged)) && selChanged)
+            CandidateUI_Cancel();
+    }
+    return S_OK;
+}
+static ITfTextEditSinkVtbl g_TESVtbl = { TES_QueryInterface, TES_AddRef, TES_Release, TES_OnEndEdit };
+
+// ── ITfTextLayoutSink — 문서 배치가 바뀌면 캐럿 자리를 다시 본다 (light dismiss, B10) ──
+// 편집 싱크만으로는 모자랐다: 메모장은 캐럿을 클릭으로 옮겨도 OnEndEdit 을 울리지 않는다
+// (2026-09-24 실측). 배치 싱크는 캐럿·줄 배치가 바뀔 때마다 오므로, 후보창을 띄울 때 적어 둔
+// 캐럿 자리와 지금 자리를 견주어 **정말 옮겨졌을 때만** 닫는다(스크롤·창 이동도 여기로 온다 —
+// 그때도 후보창은 제 자리를 잃으므로 닫는 편이 맞다).
+static HRESULT STDMETHODCALLTYPE TLS_QueryInterface(ITfTextLayoutSink *pThis, REFIID riid, void **ppv) {
+    JamotongTextService *obj = IMPL_TO_OBJ(TLS, pThis);
+    return obj->lpVtblTIP->QueryInterface((ITfTextInputProcessor*)obj, riid, ppv);
+}
+static ULONG STDMETHODCALLTYPE TLS_AddRef(ITfTextLayoutSink *pThis)  { JamotongTextService *obj = IMPL_TO_OBJ(TLS, pThis); return obj->lpVtblTIP->AddRef((ITfTextInputProcessor*)obj); }
+static ULONG STDMETHODCALLTYPE TLS_Release(ITfTextLayoutSink *pThis) { JamotongTextService *obj = IMPL_TO_OBJ(TLS, pThis); return obj->lpVtblTIP->Release((ITfTextInputProcessor*)obj); }
+static HRESULT STDMETHODCALLTYPE TLS_OnLayoutChange(ITfTextLayoutSink *pThis, ITfContext *pic, TsLayoutCode lcode, ITfContextView *pView) {
+    JamotongTextService *obj = IMPL_TO_OBJ(TLS, pThis);
+    (void)pic; (void)pView;
+    if (!CandidateUI_IsVisible() || Jamotong_InOurEdit()) return S_OK;
+    if (lcode == TS_LC_DESTROY) { CandidateUI_Cancel(); return S_OK; }
+    if (!obj->candAnchorValid) return S_OK;
+    RECT now;
+    if (GetLiveCaretScreenRect(&now)) {                       // 고전 캐럿이 있는 앱은 바로 견준다
+        const LONG slack = 3;                                 // 글꼴 렌더링 오차만큼은 같은 자리로
+        if (labs(now.left - obj->candAnchorRect.left) > slack ||
+            labs(now.top  - obj->candAnchorRect.top)  > slack)
+            CandidateUI_Cancel();                             // 캐럿이 옮겨졌다 → 후보창은 남의 자리
+        return S_OK;
+    }
+    // 메모장 같은 최신 편집기는 고전 캐럿이 아예 없다(실측: hwndCaret=0). TSF 로 재 본다.
+    if (pic) RequestCaretMoveProbe(obj, pic);
+    return S_OK;
+}
+static ITfTextLayoutSinkVtbl g_TLSVtbl = { TLS_QueryInterface, TLS_AddRef, TLS_Release, TLS_OnLayoutChange };
+
+// ITfThreadMgrEventSink
+static HRESULT STDMETHODCALLTYPE TMES_QueryInterface(ITfThreadMgrEventSink *pThis, REFIID riid, void **ppv) {
+    JamotongTextService *obj = IMPL_TO_OBJ(TMES, pThis);
+    if (!ppv) return E_INVALIDARG;
+    // RFC-0008 W2-04: IUnknown 은 TIP 의 정식 포인터 — 모든 QI 를 TIP 에 맡긴다(동일성·대칭).
+    return obj->lpVtblTIP->QueryInterface((ITfTextInputProcessor*)obj, riid, ppv);
+}
+static ULONG STDMETHODCALLTYPE TMES_AddRef(ITfThreadMgrEventSink *pThis)  { JamotongTextService *obj = IMPL_TO_OBJ(TMES, pThis); return obj->lpVtblTIP->AddRef((ITfTextInputProcessor*)obj); }
+static ULONG STDMETHODCALLTYPE TMES_Release(ITfThreadMgrEventSink *pThis) { JamotongTextService *obj = IMPL_TO_OBJ(TMES, pThis); return obj->lpVtblTIP->Release((ITfTextInputProcessor*)obj); }
+static HRESULT STDMETHODCALLTYPE TMES_OnInitDocumentMgr(ITfThreadMgrEventSink *pThis, ITfDocumentMgr *p)   { (void)pThis; (void)p; return S_OK; }
+static HRESULT STDMETHODCALLTYPE TMES_OnUninitDocumentMgr(ITfThreadMgrEventSink *pThis, ITfDocumentMgr *p) { (void)pThis; (void)p; return S_OK; }
+static HRESULT STDMETHODCALLTYPE TMES_OnSetFocus(ITfThreadMgrEventSink *pThis, ITfDocumentMgr *pdimFocus, ITfDocumentMgr *pdimPrev) {
+    JamotongTextService *obj = IMPL_TO_OBJ(TMES, pThis);
+    (void)pdimPrev;
+#ifdef JAMO_DIAG
+    {   // 무엇이 문서 포커스를 가져갔나 — 2026-10-02 실기에서 시험 도구의 콘솔 창이 후보창을 닫고 있었다
+        HWND fg = GetForegroundWindow(); DWORD pid = 0; wchar_t cls[64] = L"";
+        if (fg) { GetWindowThreadProcessId(fg, &pid); GetClassNameW(fg, cls, 64); }
+        JamoDiag("TMES focus dim=%p prev=%p tid=%lu fg-pid=%lu self=%lu fg-class=%ls", (void*)pdimFocus, (void*)pdimPrev,
+                 (unsigned long)GetCurrentThreadId(), (unsigned long)pid, (unsigned long)GetCurrentProcessId(), cls);
+    }
+#endif
+    ITfContext *pCtx = NULL;
+    if (pdimFocus && SUCCEEDED(pdimFocus->lpVtbl->GetTop(pdimFocus, &pCtx)) && pCtx) {
+        AdviseTextEditSink(obj, pCtx);        // 새 포커스 컨텍스트에 텍스트편집 싱크 부착
+        Compart_ReadContextDisabled(obj, pCtx);   // 앱이 이 문맥의 입력기를 껐는가 (RFC-0012 Phase 1)
+        pCtx->lpVtbl->Release(pCtx);
+    } else {
+        AdviseTextEditSink(obj, NULL);
+        Compart_ReadContextDisabled(obj, NULL);
+    }
+    Jamotong_Transition(obj, TRANS_WHY_FOCUS, NULL);   // 떠나는 문서에 확정 + 정리 (W1-09/W1-03)
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE TMES_OnPushContext(ITfThreadMgrEventSink *pThis, ITfContext *pic) { (void)pThis; (void)pic; return S_OK; }
+static HRESULT STDMETHODCALLTYPE TMES_OnPopContext(ITfThreadMgrEventSink *pThis, ITfContext *pic)  { (void)pThis; (void)pic; return S_OK; }
+static ITfThreadMgrEventSinkVtbl g_TMESVtbl = {
+    TMES_QueryInterface, TMES_AddRef, TMES_Release,
+    TMES_OnInitDocumentMgr, TMES_OnUninitDocumentMgr, TMES_OnSetFocus, TMES_OnPushContext, TMES_OnPopContext
+};
+
+// 텍스트편집 싱크를 (이전 것 해제 후) 주어진 컨텍스트에 부착. pContext=NULL이면 해제만.
+static void AdviseTextEditSink(JamotongTextService *obj, ITfContext *pContext) {
+    if (obj->pTESContext) {
+        ITfSource *pSrc = NULL;
+        if (SUCCEEDED(obj->pTESContext->lpVtbl->QueryInterface(obj->pTESContext, &kIID_ITfSource, (void**)&pSrc))) {
+            pSrc->lpVtbl->UnadviseSink(pSrc, obj->tesCookie);
+            if (obj->tlsCookie != TF_INVALID_COOKIE) pSrc->lpVtbl->UnadviseSink(pSrc, obj->tlsCookie);
+            obj->tlsCookie = TF_INVALID_COOKIE;
+            pSrc->lpVtbl->Release(pSrc);
+        }
+        obj->pTESContext->lpVtbl->Release(obj->pTESContext);
+        obj->pTESContext = NULL; obj->tesCookie = TF_INVALID_COOKIE;
+    }
+    if (!pContext) return;
+    ITfSource *pSrc = NULL;
+    if (SUCCEEDED(pContext->lpVtbl->QueryInterface(pContext, &kIID_ITfSource, (void**)&pSrc))) {
+        if (SUCCEEDED(pSrc->lpVtbl->AdviseSink(pSrc, &kIID_ITfTextEditSink, (IUnknown*)&obj->lpVtblTES, &obj->tesCookie))) {
+            obj->pTESContext = pContext; pContext->lpVtbl->AddRef(pContext);
+        }
+        // 배치 싱크도 같은 문서에 (실패해도 입력에는 지장이 없다 — light dismiss 만 못 한다)
+        if (FAILED(pSrc->lpVtbl->AdviseSink(pSrc, &kIID_ITfTextLayoutSink, (IUnknown*)&obj->lpVtblTLS, &obj->tlsCookie)))
+            obj->tlsCookie = TF_INVALID_COOKIE;
+        pSrc->lpVtbl->Release(pSrc);
+    }
+}
+
+static void AdviseThreadMgrEventSink(JamotongTextService *obj) {
+    ITfSource *pSrc = NULL;
+    if (obj->threadMgr && SUCCEEDED(obj->threadMgr->lpVtbl->QueryInterface(obj->threadMgr, &kIID_ITfSource, (void**)&pSrc))) {
+        pSrc->lpVtbl->AdviseSink(pSrc, &kIID_ITfThreadMgrEventSink, (IUnknown*)&obj->lpVtblTMES, &obj->tmesCookie);
+        pSrc->lpVtbl->Release(pSrc);
+    }
+    // 이미 포커스 문서가 있으면 지금 텍스트편집 싱크 부착 (OnSetFocus가 이후 갱신)
+    if (obj->threadMgr) {
+        ITfDocumentMgr *pdim = NULL;
+        if (SUCCEEDED(obj->threadMgr->lpVtbl->GetFocus(obj->threadMgr, &pdim)) && pdim) {
+            ITfContext *pCtx = NULL;
+            if (SUCCEEDED(pdim->lpVtbl->GetTop(pdim, &pCtx)) && pCtx) { AdviseTextEditSink(obj, pCtx); pCtx->lpVtbl->Release(pCtx); }
+            pdim->lpVtbl->Release(pdim);
+        }
+    }
+}
+static void UnadviseThreadMgrEventSink(JamotongTextService *obj) {
+    AdviseTextEditSink(obj, NULL);
+    ITfSource *pSrc = NULL;
+    if (obj->threadMgr && obj->tmesCookie != TF_INVALID_COOKIE
+        && SUCCEEDED(obj->threadMgr->lpVtbl->QueryInterface(obj->threadMgr, &kIID_ITfSource, (void**)&pSrc))) {
+        pSrc->lpVtbl->UnadviseSink(pSrc, obj->tmesCookie);
+        pSrc->lpVtbl->Release(pSrc);
+        obj->tmesCookie = TF_INVALID_COOKIE;
+    }
+}
+
+// RFC-0008 W1-04: 결과를 돌려준다 — 키 싱크 없이는 입력을 하나도 못 받는다(활성화 필수 단계).
+static HRESULT AdviseKeyEventSink(JamotongTextService *obj) {
+    if (!obj->threadMgr) return E_UNEXPECTED;
+    ITfKeystrokeMgr *pKeystrokeMgr = NULL;
+    HRESULT hr = obj->threadMgr->lpVtbl->QueryInterface(obj->threadMgr, &IID_ITfKeystrokeMgr, (void**)&pKeystrokeMgr);
+    if (FAILED(hr) || !pKeystrokeMgr) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = pKeystrokeMgr->lpVtbl->AdviseKeyEventSink(pKeystrokeMgr, obj->clientId, (ITfKeyEventSink*)&obj->lpVtblKES, TRUE);
+    pKeystrokeMgr->lpVtbl->Release(pKeystrokeMgr);
+    return hr;
+}
+
+static void UnadviseKeyEventSink(JamotongTextService *obj) {
+    if (obj->threadMgr) {
+        ITfKeystrokeMgr *pKeystrokeMgr = NULL;
+        if (SUCCEEDED(obj->threadMgr->lpVtbl->QueryInterface(obj->threadMgr, &IID_ITfKeystrokeMgr, (void**)&pKeystrokeMgr))) {
+            pKeystrokeMgr->lpVtbl->UnadviseKeyEventSink(pKeystrokeMgr, obj->clientId);
+            pKeystrokeMgr->lpVtbl->Release(pKeystrokeMgr);
+        }
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE TIP_Deactivate(ITfTextInputProcessor *pThis);   // 활성화 실패 되돌리기용
+
+// Ex 를 구현하면 TSF 는 Activate 대신 ActivateEx 만 부른다(문서 명시) — 초기화는 이 한 함수로 모은다 (RFC-0013 A).
+static HRESULT TIP_ActivateCommon(ITfTextInputProcessor *pThis, ITfThreadMgr *ptim, TfClientId tid, DWORD dwFlags) {
+#ifdef RIUM_FIXTURE_ONLY
+    // Development builds must never consume input in an existing user app.
+    wchar_t fixturePath[MAX_PATH];
+    DWORD fixtureLength = GetModuleFileNameW(NULL, fixturePath, MAX_PATH);
+    if (!fixtureLength || fixtureLength >= MAX_PATH) return E_ACCESSDENIED;
+    const wchar_t *base = wcsrchr(fixturePath, L'\\');
+    if (!base || wcscmp(base + 1, L"RiumImeFixture.exe") != 0) return E_ACCESSDENIED;
+#endif
+    JamotongTextService *obj = IMPL_TO_OBJ(TIP, pThis);
+    obj->activateFlags = dwFlags;
+    RiumOwnerRuntime_Attach(&obj->inputOwner);
+    JamoDiag("ACTIVATE flags=0x%08lX tid=%lu", (unsigned long)dwFlags, (unsigned long)GetCurrentThreadId());
+    obj->threadMgr = ptim;
+    obj->threadMgr->lpVtbl->AddRef(obj->threadMgr);
+    obj->clientId = tid;
+
+    // RFC-0008 W1-04: 키 싱크는 필수 — 실패하면 "켜졌는데 입력을 안 받는" 상태를 남기지 않도록 지금까지
+    // 붙인 것을 모두 떼고(Deactivate 는 부분 상태에서도 안전하다) 실패를 돌려준다. 아래 나머지는 부가
+    // 기능이라 실패해도 그 기능만 빠진 채 계속 간다.
+    HRESULT hrKey = AdviseKeyEventSink(obj);
+    if (FAILED(hrKey)) {
+        JamoDiag("ACTIVATE key sink failed hr=0x%08lX - rolled back", (unsigned long)hrKey);
+        TIP_Deactivate(pThis);
+        return hrKey;
+    }
+    Preserved_Register(obj);   // 문맥 무관 명령키 예약 (RFC-0013 C; 불가/실패 항목은 sink 폴백)
+    AdviseThreadMgrEventSink(obj);   // 문서 포커스/편집 싱크 부착 (CUAS 조합유지 목적)
+    // RIUM controls live in the input-indicator menu, with no settings window.
+
+    obj->daAtom = DA_RegisterAtom(ptim);   // composition display-attribute atom (per thread)
+    obj->passthrough = Jamotong_GetPassthroughReg();   // 무간섭 모드 초기 상태 (프로세스 간 공유)
+    UiElem_Attach(obj);    // RFC-0012 Phase 3: UIElementMgr 게이트 (없으면 기존 동작)
+    if (obj->config.options.useUiHelper) EnsureUiHelperRunning();   // RFC-0015 (데스크톱 호스트에서만)
+    Compart_Attach(obj);   // RFC-0012 Phase 1: OPENCLOSE/CONVERSION 발행 + OPENCLOSE 통지 구독 (킬스위치 UseCompartments)
+
+    // 최초 1회 전역 초기화: 후보창 윈도 클래스 등록(없으면 CreateWindowEx 실패 → 후보창 안 뜸).
+    // 한자/훈음 사전은 여기서 로드하지 않는다 — TIP은 텍스트를 쓰는 모든 프로세스에 로드되므로
+    // 활성화마다 파일 IO를 하면 낭비. 첫 한자 요청 시 EnsureHanjaDicts()가 1회 로드(RFC-0004 §6.1).
+    {
+        CandidateUI_Initialize();   // 없으면 등록 (W2-05: DllCanUnloadNow 가 해제했을 수 있다)
+    }
+
+    // 언어 바 아이템 등록
+    ITfLangBarItemMgr *pLangBarMgr = NULL;
+    if (SUCCEEDED(ptim->lpVtbl->QueryInterface(ptim, &IID_ITfLangBarItemMgr, (void**)&pLangBarMgr))) {
+        obj->pLangBarItem = LangBar_Create(obj);
+        if (obj->pLangBarItem) {
+            pLangBarMgr->lpVtbl->AddItem(pLangBarMgr, (ITfLangBarItem*)obj->pLangBarItem);
+        }
+        pLangBarMgr->lpVtbl->Release(pLangBarMgr);
+    }
+
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE TIP_Activate(ITfTextInputProcessor *pThis, ITfThreadMgr *ptim, TfClientId tid) {
+    return TIP_ActivateCommon(pThis, ptim, tid, 0);
+}
+
+static HRESULT STDMETHODCALLTYPE TIP_ActivateEx(ITfTextInputProcessor *pThis, ITfThreadMgr *ptim, TfClientId tid, DWORD dwFlags) {
+    return TIP_ActivateCommon(pThis, ptim, tid, dwFlags);
+}
+
+static HRESULT STDMETHODCALLTYPE TIP_Deactivate(ITfTextInputProcessor *pThis) {
+    JamotongTextService *obj = IMPL_TO_OBJ(TIP, pThis);
+    JamoDiag("DEACTIVATE tid=%lu", (unsigned long)GetCurrentThreadId());
+
+    // 설정창 스레드 종료 후 조인 — 이걸 안 하면 설정창이 (곧 해제될) obj->config를 계속 참조해 UAF.
+    SettingsUI_Shutdown();
+
+    // RFC-0008 W0-02: 보류 중인 경계키 재전송을 지금 방출하고 타이머를 끈다.
+    FlushPendingKeyResend(obj);
+
+    // 진행 중이던 상태·화면을 접는다 — 자판 전환·무간섭 토글과 **같은 한 곳**을 쓴다 (B3).
+    // 후보창은 Cancel(콜백 경유)로 닫혀 pic 참조와 obj->candCtx.obj(raw 서비스 포인터)까지 정리된다 —
+    // 열린 채 Deactivate 되면 콜백이 해제된 서비스를 만질 수 있다(RFC-0004 P1-1 UAF).
+    Jamotong_FoldInput(obj);
+    JamoComp_Release(obj);   // RFC-0010: 남은 인라인 조합 확정(텍스트 보존) + 참조/캐시 정리
+    CompTarget_Clear(obj);        // W1-09 대상·보류가 쥔 문맥 참조를 놓는다
+    Jamotong_PendingClear(obj);
+    Fsm_Init(&obj->fsm);
+    Chord_Init(&obj->chord);
+    PreeditOverlay_Uninitialize();
+    CodeInput_Uninitialize();
+
+    // 언어 바 아이템 해제. 셸이 아이템 참조를 우리 Release 이후까지 잡고 있을 수 있으므로,
+    // 먼저 pService 역참조를 끊는다(아이템 메서드들이 NULL 체크로 no-op) — 서비스 해제 후 UAF 방지.
+    if (obj->pLangBarItem && obj->threadMgr) {
+        ITfLangBarItemMgr *pLangBarMgr = NULL;
+        if (SUCCEEDED(obj->threadMgr->lpVtbl->QueryInterface(obj->threadMgr, &IID_ITfLangBarItemMgr, (void**)&pLangBarMgr))) {
+            pLangBarMgr->lpVtbl->RemoveItem(pLangBarMgr, (ITfLangBarItem*)obj->pLangBarItem);
+            pLangBarMgr->lpVtbl->Release(pLangBarMgr);
+        }
+        obj->pLangBarItem->pService = NULL;
+        obj->pLangBarItem->lpVtblButton->Release((ITfLangBarItemButton*)obj->pLangBarItem);
+        obj->pLangBarItem = NULL;
+    }
+    
+    UiElem_Detach(obj);
+    Compart_Detach(obj);     // compartment sink 해제 (threadMgr 해제 전)
+    Preserved_Unregister(obj);
+    FuncConfig_Unadvise(obj);
+    UnadviseThreadMgrEventSink(obj);
+    UnadviseKeyEventSink(obj);
+
+    if (obj->threadMgr) {
+        obj->threadMgr->lpVtbl->Release(obj->threadMgr);
+        obj->threadMgr = NULL;
+    }
+    obj->clientId = 0;
+    return S_OK;
+}
+
+static JamoTIPExVtbl TextInputProcessorVtbl = {
+    TIP_QueryInterface,
+    TIP_AddRef,
+    TIP_Release,
+    TIP_Activate,
+    TIP_Deactivate,
+    TIP_ActivateEx   // 부모 5 뒤 (상속 vtbl 순서 — T009/T010 선례)
+};
+
+// ------------------------------------------------------------------
+// Instance Creation
+// ------------------------------------------------------------------
+
+HRESULT JamotongTextService_Create(IUnknown *pUnkOuter, REFIID riid, void **ppvObject) {
+    if (pUnkOuter) return CLASS_E_NOAGGREGATION;
+    if (!ppvObject) return E_INVALIDARG;
+
+    JamotongTextService *obj = (JamotongTextService*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(JamotongTextService));
+    if (!obj) return E_OUTOFMEMORY;
+
+    obj->lpVtblTIP = &TextInputProcessorVtbl;
+    obj->lpVtblKES = &KeyEventSinkVtbl;
+    obj->lpVtblDAP = &g_JamotongDAPVtbl;
+    obj->lpVtblTMES = &g_TMESVtbl;
+    obj->lpVtblTES = &g_TESVtbl;
+    obj->lpVtblTLS = &g_TLSVtbl;
+    obj->tlsCookie = TF_INVALID_COOKIE;
+    obj->tmesCookie = TF_INVALID_COOKIE;
+    obj->tesCookie = TF_INVALID_COOKIE;
+    obj->pTESContext = NULL;
+    JamoComp_Init(obj);     // RFC-0010 인라인 조합 sink/상태 초기화
+    FuncConfig_Init(obj);   // ITfFunctionProvider/ITfFnConfigure vtbl (설정 "옵션")
+    obj->refCount = 1;
+    Config_LoadDefault(&obj->config);
+    {   // 저장된 사용자 설정이 있으면 덮어씀(설정 "옵션"·활성화 모두 현재값 반영)
+        wchar_t cfgPath[MAX_PATH];
+        if (Config_UserPath(cfgPath, MAX_PATH)) Config_LoadFromFile(&obj->config, cfgPath);
+    }
+    Rium_ApplyPolicy(&obj->config);
+    Fsm_Init(&obj->fsm);
+    Chord_Init(&obj->chord);
+    ChordKb_Init(&obj->chordKb);
+    InterlockedIncrement(&g_DllRefCount);
+
+    HRESULT hr = obj->lpVtblTIP->QueryInterface((ITfTextInputProcessor*)obj, riid, ppvObject);
+    obj->lpVtblTIP->Release((ITfTextInputProcessor*)obj);
+    return hr;
+}

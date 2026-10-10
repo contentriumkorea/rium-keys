@@ -1,0 +1,430 @@
+// jdict.c — 읽기 전용 이진 사전: 매핑해서 그대로 읽고, 정렬된 키를 이진 탐색한다 (RFC-0016 P5).
+//   파일 구조는 jdict.h 에 적혀 있다. 여기서는 (1) 열면서 범위를 검사하고, (2) 고를 때 전수 점검하고,
+//   (3) 엔진이 묻는 세 가지(정확 일치·더 긴 후보·앞쪽 최장 일치)에 답한다.
+#include "jdict.h"
+#include <windows.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define JD_HEADER_BYTES 64
+#define JD_REC_BYTES    12
+#define JD_MAX_COUNT    JDICT_MAX_ENTRIES
+
+typedef struct JDict {
+    HANDLE   file, mapping;
+    const unsigned char *base;
+    size_t   size;
+    unsigned count, kind, maxKeyLen, maxValLen, flags, crc;
+    unsigned offIndex, offKeys, offVals, keyBytes, valBytes;
+    unsigned offCosts;                  // 판 3 의 비용 블록 (없으면 0)
+    unsigned offPos;                    // 판 4 의 품사 블록 (없으면 0) — 항목마다 u16 lid, u16 rid
+    unsigned format;                    // 파일의 판
+    // 꼬리의 이름/라이선스/판 — 파일에는 길이 붙은 문자열이라 형식은 원래 길이 제한이 없다.
+    // 자리는 넉넉히 잡는다: 라이선스 한 줄에 출처와 전문 파일 이름이 함께 들어가야 한다
+    // (오너 지적 2026-09-24). 사전 하나에 1KB 도 안 되는 값이다.
+    wchar_t  name[128], license[256], version[64];
+} JDict;
+
+static unsigned Rd32(const unsigned char *p) {   // 리틀엔디안 — 파일이 어느 기계에서 구워졌든 같게 읽는다
+    return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+}
+static unsigned Rd16(const unsigned char *p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
+static bool g_lightOpen;   // 가벼운 열기 (입력기 DLL, RFC-0020 F3)
+void JDict_SetLightOpen(bool on) { g_lightOpen = on; }
+
+static const unsigned char *RecAt(const JDict *d, int i) { return d->base + d->offIndex + (size_t)i * JD_REC_BYTES; }
+// 항목 하나의 범위는 **읽을 때마다** 확인한다 (RFC-0020 F3): 입력기는 열 때 색인을 전수로 훑지 않으므로(가벼운 열기),
+//   상한 항목은 빈 키·빈 값으로 보인다 — 엉뚱한 후보가 될 뿐 파일 밖을 읽지 않는다. 몇 번의 비교라 값싸다.
+static const char *KeyAt(const JDict *d, int i, int *len) {
+    const unsigned char *r = RecAt(d, i);
+    unsigned ko = Rd32(r), kl = Rd16(r + 8);
+    if (kl == 0 || kl > d->maxKeyLen || ko > d->keyBytes || ko + kl > d->keyBytes) { *len = 0; return (const char *)(d->base + d->offKeys); }
+    *len = (int)kl;
+    return (const char *)(d->base + d->offKeys + ko);
+}
+static const jdchar *ValAt(const JDict *d, int i, int *len) {
+    const unsigned char *r = RecAt(d, i);
+    unsigned vo = Rd32(r + 4), vl = Rd16(r + 10);
+    if (vl == 0 || vl > JDICT_MAX_VALUE || vo > d->valBytes || vo + vl * 2u > d->valBytes || (vo & 1u) != 0) {
+        *len = 0; return (const jdchar *)(const void *)(d->base + d->offVals);
+    }
+    *len = (int)vl;
+    return (const jdchar *)(const void *)(d->base + d->offVals + vo);
+}
+
+// 찾는 키를 UTF-8 로 (순차 사전의 키는 ASCII 이지만, 다른 종류를 대비해 한 곳에서 변환한다)
+static int KeyToUtf8(const wchar_t *key, char *out, int cap) {
+    int n = 0;
+    for (const wchar_t *p = key; *p; p++) {
+        unsigned cp = (unsigned)*p;
+        if (cp >= 0xD800 && cp <= 0xDBFF && p[1] >= 0xDC00 && p[1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + ((unsigned)p[1] - 0xDC00); p++;
+        }
+        if (cp < 0x80) { if (n + 1 > cap) return -1; out[n++] = (char)cp; }
+        else if (cp < 0x800) { if (n + 2 > cap) return -1; out[n++] = (char)(0xC0 | (cp >> 6)); out[n++] = (char)(0x80 | (cp & 0x3F)); }
+        else if (cp < 0x10000) { if (n + 3 > cap) return -1; out[n++] = (char)(0xE0 | (cp >> 12)); out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[n++] = (char)(0x80 | (cp & 0x3F)); }
+        else { if (n + 4 > cap) return -1; out[n++] = (char)(0xF0 | (cp >> 18)); out[n++] = (char)(0x80 | ((cp >> 12) & 0x3F)); out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[n++] = (char)(0x80 | (cp & 0x3F)); }
+    }
+    return n;
+}
+// 바이트 사전식 비교 (짧은 쪽이 앞) — 구울 때와 찾을 때가 같은 규칙을 써야 한다
+static int CmpBytes(const char *a, int an, const char *b, int bn) {
+    int n = an < bn ? an : bn;
+    int c = n ? memcmp(a, b, (size_t)n) : 0;
+    if (c) return c;
+    return an == bn ? 0 : (an < bn ? -1 : 1);
+}
+// key 이상인 첫 항목의 자리 (없으면 count)
+static int LowerBound(const JDict *d, const char *key, int klen) {
+    int lo = 0, hi = (int)d->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2, mlen = 0;
+        const char *mk = KeyAt(d, mid, &mlen);
+        if (CmpBytes(mk, mlen, key, klen) < 0) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+int JDict_MaxKeyBytes(int kind) {
+    return kind == JDICT_KIND_CANDIDATES ? JDICT_MAX_KEY_CANDIDATES : JDICT_MAX_KEY;
+}
+
+// ── 열기 ───────────────────────────────────────────────────────────────────────────
+static bool CheckLayout(JDict *d) {
+    const unsigned char *h = d->base;
+    if (d->size < JD_HEADER_BYTES) return false;
+    if (Rd32(h + 56) != (unsigned)d->size) return false;          // 잘렸거나 덧붙었다
+    d->count     = Rd32(h + 16);
+    d->offIndex  = Rd32(h + 20);
+    d->offKeys   = Rd32(h + 24);
+    d->offVals   = Rd32(h + 28);
+    d->keyBytes  = Rd32(h + 32);
+    d->valBytes  = Rd32(h + 36);
+    d->maxKeyLen = Rd32(h + 40);
+    d->maxValLen = Rd32(h + 44);
+    d->flags     = Rd32(h + 48);
+    d->crc       = Rd32(h + 52);
+    if (d->count == 0 || d->count > JD_MAX_COUNT) return false;
+    unsigned maxKey = (unsigned)JDict_MaxKeyBytes((int)d->kind);
+    if (d->maxKeyLen == 0 || d->maxKeyLen > maxKey) return false;
+    if (d->maxValLen == 0 || d->maxValLen > JDICT_MAX_VALUE) return false;
+    // 판 1 의 자리는 고정이다 — 이 배치가 아니면 우리가 구운 파일이 아니다
+    if (d->offIndex != JD_HEADER_BYTES) return false;
+    if (d->offKeys != d->offIndex + d->count * JD_REC_BYTES) return false;
+    if (d->offVals != ((d->offKeys + d->keyBytes + 1u) & ~1u)) return false;
+    if ((d->valBytes & 1u) != 0) return false;
+    unsigned offMeta = d->offVals + d->valBytes;
+    if (offMeta > d->size) return false;
+    // 색인 전수 범위 검사 — 도구·시험은 한다. 입력기(가벼운 열기, RFC-0020 F3)는 건너뛴다: 50만 항목이면 색인만 6MB 이고
+    //   그걸 앱마다 다 읽어 들였다. 항목의 범위는 KeyAt/ValAt 이 읽을 때마다 본다.
+    for (unsigned i = 0; !g_lightOpen && i < d->count; i++) {
+        const unsigned char *r = d->base + d->offIndex + (size_t)i * JD_REC_BYTES;
+        unsigned ko = Rd32(r), vo = Rd32(r + 4), kl = Rd16(r + 8), vl = Rd16(r + 10);
+        if (kl == 0 || kl > maxKey || vl == 0 || vl > JDICT_MAX_VALUE) return false;
+        if (ko > d->keyBytes || ko + kl > d->keyBytes) return false;
+        if (vo > d->valBytes || vo + vl * 2u > d->valBytes || (vo & 1u) != 0) return false;
+    }
+    // 꼬리의 이름/라이선스/판 (각각 u16 길이 + UTF-16LE)
+    unsigned cap[3] = { 128, 256, 64 };
+    wchar_t *out[3] = { d->name, d->license, d->version };
+    unsigned at = offMeta;
+    for (int f = 0; f < 3; f++) {
+        out[f][0] = L'\0';
+        if (at + 2 > d->size) return false;
+        unsigned len = Rd16(d->base + at);
+        at += 2;
+        if (at + len * 2u > d->size) return false;
+        unsigned keep = len < cap[f] - 1 ? len : cap[f] - 1;
+        for (unsigned i = 0; i < keep; i++) out[f][i] = (wchar_t)Rd16(d->base + at + i * 2u);
+        out[f][keep] = L'\0';
+        at += len * 2u;
+    }
+    d->offCosts = 0;
+    d->offPos = 0;
+    if ((d->flags & JDICT_FLAG_POS) && !(d->flags & JDICT_FLAG_COSTS)) return false;   // 품사는 비용과 함께만
+    if (d->flags & JDICT_FLAG_COSTS) {   // 판 3: 꼬리 뒤에 항목마다 u16 비용, 판 4: 그 뒤에 항목마다 u16 lid·rid
+        if (d->format < 3 || d->kind != JDICT_KIND_CANDIDATES || (at & 1u) != 0) return false;
+        size_t want = (size_t)at + (size_t)d->count * 2u;
+        if (d->flags & JDICT_FLAG_POS) {
+            if (d->format < 4) return false;
+            d->offPos = (unsigned)want;
+            want += (size_t)d->count * 4u;
+        }
+        if (want != d->size) return false;
+        d->offCosts = at;
+        return true;
+    }
+    return at == d->size;
+}
+
+JDict *JDict_Open(const wchar_t *path, JDictError *err) {
+    JDictError dummy;
+    if (!err) err = &dummy;
+    *err = JDICT_OK;
+    JDict *d = (JDict *)calloc(1, sizeof(JDict));
+    if (!d) { *err = JDICT_E_MEMORY; return NULL; }
+    d->file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (d->file == INVALID_HANDLE_VALUE) { free(d); *err = JDICT_E_OPEN; return NULL; }
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(d->file, &sz) || sz.QuadPart < JD_HEADER_BYTES || sz.QuadPart > 0x7FFFFFFF) {
+        CloseHandle(d->file); free(d); *err = JDICT_E_LAYOUT; return NULL;
+    }
+    d->size = (size_t)sz.QuadPart;
+    d->mapping = CreateFileMappingW(d->file, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!d->mapping) { CloseHandle(d->file); free(d); *err = JDICT_E_OPEN; return NULL; }
+    d->base = (const unsigned char *)MapViewOfFile(d->mapping, FILE_MAP_READ, 0, 0, 0);
+    if (!d->base) { CloseHandle(d->mapping); CloseHandle(d->file); free(d); *err = JDICT_E_OPEN; return NULL; }
+    if (memcmp(d->base, "JMTDICT\0", 8) != 0) { JDict_Close(d); *err = JDICT_E_MAGIC; return NULL; }
+    unsigned fv = Rd32(d->base + 8);
+    if (fv < JDICT_FORMAT_MIN || fv > JDICT_FORMAT_VERSION) { JDict_Close(d); *err = JDICT_E_VERSION; return NULL; }
+    d->kind = Rd32(d->base + 12);   // 자리 검사는 종류마다 다른 키 한도를 쓴다
+    d->format = fv;
+    if (!CheckLayout(d)) { JDict_Close(d); *err = JDICT_E_LAYOUT; return NULL; }
+    return d;
+}
+
+void JDict_Close(JDict *d) {
+    if (!d) return;
+    if (d->base) UnmapViewOfFile(d->base);
+    if (d->mapping) CloseHandle(d->mapping);
+    if (d->file && d->file != INVALID_HANDLE_VALUE) CloseHandle(d->file);
+    free(d);
+}
+
+int            JDict_Count(const JDict *d)     { return d ? (int)d->count : 0; }
+int            JDict_Kind(const JDict *d)      { return d ? (int)d->kind : 0; }
+int            JDict_MaxKeyLen(const JDict *d) { return d ? (int)d->maxKeyLen : 0; }
+const wchar_t *JDict_Name(const JDict *d)      { return d ? d->name : L""; }
+const wchar_t *JDict_License(const JDict *d)   { return d ? d->license : L""; }
+
+const wchar_t *JDict_ErrorText(JDictError e) {
+    switch (e) {
+        case JDICT_OK:         return L"ok";
+        case JDICT_E_OPEN:     return L"the dictionary file cannot be opened";
+        case JDICT_E_MAGIC:    return L"this is not a Jamotong dictionary file";
+        case JDICT_E_VERSION:  return L"this dictionary was built for a newer Jamotong";
+        case JDICT_E_LAYOUT:   return L"the dictionary file is damaged (its parts do not fit the file)";
+        case JDICT_E_CRC:      return L"the dictionary content does not match its checksum";
+        case JDICT_E_ORDER:    return L"the dictionary entries are not in order";
+        case JDICT_E_KEY:      return L"the dictionary has a key this engine cannot type";
+        case JDICT_E_MEMORY:   return L"out of memory";
+    }
+    return L"unknown error";
+}
+
+// ── 전수 점검 (자판을 고를 때 한 번) ───────────────────────────────────────────────
+// 표 방식 CRC-32/IEEE. 비트마다 도는 판은 100MB 당 1초라 큰 사전에서 고르는 순간이 멈춘다.
+unsigned JDict_Crc32(const void *data, unsigned long len) {
+    static unsigned tbl[256];
+    static int ready = 0;
+    if (!ready) {   // 표는 값이 정해져 있어 여러 스레드가 같이 만들어도 결과가 같다
+        for (unsigned i = 0; i < 256; i++) {
+            unsigned c = i;
+            for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (unsigned)(-(int)(c & 1)));
+            tbl[i] = c;
+        }
+        ready = 1;
+    }
+    const unsigned char *p = (const unsigned char *)data;
+    unsigned c = 0xFFFFFFFFu;
+    for (unsigned long i = 0; i < len; i++) c = tbl[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+bool JDict_Verify(const JDict *d, JDictError *err) {
+    JDictError dummy;
+    if (!err) err = &dummy;
+    *err = JDICT_OK;
+    if (!d) { *err = JDICT_E_LAYOUT; return false; }
+    if (JDict_Crc32(d->base + JD_HEADER_BYTES, (unsigned long)(d->size - JD_HEADER_BYTES)) != d->crc) { *err = JDICT_E_CRC; return false; }
+    int prevLen = 0;
+    const char *prev = NULL;
+    for (unsigned i = 0; i < d->count; i++) {
+        int klen = 0;
+        const char *k = KeyAt(d, (int)i, &klen);
+        int cmp = prev ? CmpBytes(prev, prevLen, k, klen) : -1;
+        // 순차 사전은 키가 꼭 커져야 하고, 후보 사전은 같은 키가 이어질 수 있다 (§6.4)
+        if (cmp > 0 || (cmp == 0 && d->kind != JDICT_KIND_CANDIDATES)) { *err = JDICT_E_ORDER; return false; }
+        if (d->kind == JDICT_KIND_SEQUENCE)
+            for (int j = 0; j < klen; j++)
+                if ((unsigned char)k[j] < 0x21 || (unsigned char)k[j] > 0x7E) { *err = JDICT_E_KEY; return false; }
+        prev = k; prevLen = klen;
+    }
+    return true;
+}
+
+// ── 찾기 ───────────────────────────────────────────────────────────────────────────
+int JDict_CopyValue(const jdchar *val, int valLen, wchar_t *out, int cap) {
+    if (!val || !out || valLen < 0 || valLen + 1 > cap) return -1;
+    for (int i = 0; i < valLen; i++) out[i] = (wchar_t)val[i];
+    out[valLen] = L'\0';
+    return valLen;
+}
+
+bool JDict_Exact(const JDict *d, const wchar_t *key, const jdchar **val, int *valLen) {
+    if (!d || !key || !*key) return false;
+    char kb[JDICT_MAX_KEY_CANDIDATES + 4];
+    int kn = KeyToUtf8(key, kb, (int)sizeof(kb));
+    if (kn <= 0) return false;
+    int at = LowerBound(d, kb, kn);
+    if (at >= (int)d->count) return false;
+    int klen = 0;
+    const char *k = KeyAt(d, at, &klen);
+    if (klen != kn || memcmp(k, kb, (size_t)kn) != 0) return false;
+    if (val || valLen) {
+        int vlen = 0;
+        const jdchar *v = ValAt(d, at, &vlen);
+        if (val) *val = v;
+        if (valLen) *valLen = vlen;
+    }
+    return true;
+}
+
+bool JDict_Candidates(const JDict *d, const wchar_t *key, int *first, int *count) {
+    if (!d || !key || !*key) return false;
+    char kb[JDICT_MAX_KEY_CANDIDATES + 4];
+    int kn = KeyToUtf8(key, kb, (int)sizeof(kb));
+    if (kn <= 0) return false;
+    int at = LowerBound(d, kb, kn);
+    int n = 0;
+    while (at + n < (int)d->count) {   // 같은 키가 이어지는 만큼이 후보다 (구울 때 차례를 지킨다)
+        int klen = 0;
+        const char *k = KeyAt(d, at + n, &klen);
+        if (klen != kn || memcmp(k, kb, (size_t)kn) != 0) break;
+        n++;
+    }
+    if (n == 0) return false;
+    if (first) *first = at;
+    if (count) *count = n;
+    return true;
+}
+
+int JDict_Completions(const JDict *d, const wchar_t *key, int *out, int max, int scanLimit) {
+    if (!d || !key || !*key || !out || max <= 0) return 0;
+    char kb[JDICT_MAX_KEY_CANDIDATES + 4];
+    int kn = KeyToUtf8(key, kb, (int)sizeof(kb));
+    if (kn <= 0) return 0;
+    int at = LowerBound(d, kb, kn), n = 0;
+    int bestCost[64];
+    if (max > 64) max = 64;
+    for (int i = at, seen = 0; i < (int)d->count && seen < scanLimit; i++, seen++) {
+        int klen = 0;
+        const char *k = KeyAt(d, i, &klen);
+        if (klen < kn || memcmp(k, kb, (size_t)kn) != 0) break;   // 앞부분이 다르면 구간이 끝났다
+        if (klen == kn) continue;                                 // 같은 키는 읽기 그대로의 후보다 (여기 아님)
+        int c = d->offCosts ? (int)Rd16(d->base + d->offCosts + (size_t)i * 2u) : seen;
+        if (n < max) { out[n] = i; bestCost[n] = c; n++; }
+        else if (c < bestCost[n - 1]) { out[n - 1] = i; bestCost[n - 1] = c; }
+        else continue;
+        for (int j = n - 1; j > 0 && bestCost[j] < bestCost[j - 1]; j--) {   // 싼 차례로 끼워 넣기
+            int tc = bestCost[j]; bestCost[j] = bestCost[j - 1]; bestCost[j - 1] = tc;
+            int ti = out[j]; out[j] = out[j - 1]; out[j - 1] = ti;
+        }
+    }
+    return n;
+}
+
+bool JDict_HasCosts(const JDict *d) { return d && d->offCosts != 0; }
+bool JDict_HasPos(const JDict *d) { return d && d->offPos != 0; }
+bool JDict_PosAt(const JDict *d, int index, int *lid, int *rid) {
+    if (!d || !d->offPos || index < 0 || index >= (int)d->count) return false;
+    const unsigned char *p = d->base + d->offPos + (size_t)index * 4u;
+    *lid = (int)Rd16(p); *rid = (int)Rd16(p + 2);
+    return true;
+}
+
+// ── 연결 비용 파일 (.jdc, RFC-0022) ───────────────────────────────────────────────────
+//   머리 32바이트: "JMTCONN\0" | 판(1·2) | N | 단위 | crc32(머리 뒤 전부) | 파일 크기 | 예약, 그 뒤 N×N 바이트 [rid][lid].
+//   값 × 단위 = 비용. 매핑해 두고 범위를 보며 읽는다(범위 밖 id 는 가장 비싸게).
+//   판 2 (0.73.0, 문절 편집): 표 뒤에 품사 종류 N 바이트(JCONN_CLASS_*) — 낱말을 문절로 묶는 데 쓴다. 판 1 은 종류가 없다.
+typedef struct JConn { HANDLE file, mapping; const unsigned char *base; size_t size; unsigned n, step, crc; bool cls; } JConn;
+void JConn_Close(JConn *c) {
+    if (!c) return;
+    if (c->base) UnmapViewOfFile(c->base);
+    if (c->mapping) CloseHandle(c->mapping);
+    if (c->file && c->file != INVALID_HANDLE_VALUE) CloseHandle(c->file);
+    free(c);
+}
+JConn *JConn_Open(const wchar_t *path, bool verify, JDictError *err) {
+    JDictError dummy;
+    if (!err) err = &dummy;
+    JConn *c = (JConn *)calloc(1, sizeof(JConn));
+    if (!c) { *err = JDICT_E_MEMORY; return NULL; }
+    c->file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (c->file == INVALID_HANDLE_VALUE) { free(c); *err = JDICT_E_OPEN; return NULL; }
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(c->file, &sz) || sz.QuadPart < 32 || sz.QuadPart > 0x7FFFFFFF) { CloseHandle(c->file); free(c); *err = JDICT_E_LAYOUT; return NULL; }
+    c->size = (size_t)sz.QuadPart;
+    c->mapping = CreateFileMappingW(c->file, NULL, PAGE_READONLY, 0, 0, NULL);
+    c->base = c->mapping ? (const unsigned char *)MapViewOfFile(c->mapping, FILE_MAP_READ, 0, 0, 0) : NULL;
+    if (!c->base) { JConn_Close(c); *err = JDICT_E_OPEN; return NULL; }
+    if (memcmp(c->base, "JMTCONN\0", 8) != 0) { JConn_Close(c); *err = JDICT_E_MAGIC; return NULL; }
+    unsigned ver = Rd32(c->base + 8);
+    if (ver != 1 && ver != 2) { JConn_Close(c); *err = JDICT_E_VERSION; return NULL; }
+    c->cls = ver == 2;
+    c->n = Rd32(c->base + 12); c->step = Rd32(c->base + 16); c->crc = Rd32(c->base + 20);
+    if (c->n == 0 || c->n > 8192 || c->step == 0 || c->step > 1024 || Rd32(c->base + 24) != c->size
+        || (size_t)32 + (size_t)c->n * c->n + (c->cls ? c->n : 0) != c->size) { JConn_Close(c); *err = JDICT_E_LAYOUT; return NULL; }
+    if (verify && JDict_Crc32(c->base + 32, (unsigned long)(c->size - 32)) != c->crc) { JConn_Close(c); *err = JDICT_E_CRC; return NULL; }
+    return c;
+}
+int JConn_Ids(const JConn *c) { return c ? (int)c->n : 0; }
+bool JConn_HasClass(const JConn *c) { return c && c->cls; }
+int JConn_Class(const JConn *c, int id) {
+    if (!c || !c->cls || id < 0 || (unsigned)id >= c->n) return 0;
+    return c->base[32 + (size_t)c->n * c->n + (size_t)id];
+}
+int JConn_Cost(const JConn *c, int rid, int lid) {
+    if (!c || rid < 0 || lid < 0 || (unsigned)rid >= c->n || (unsigned)lid >= c->n) return 255 * (c ? (int)c->step : 64);
+    return (int)c->base[32 + (size_t)rid * c->n + (size_t)lid] * (int)c->step;
+}
+int JDict_CostAt(const JDict *d, int index) {
+    if (!d || !d->offCosts || index < 0 || index >= (int)d->count) return -1;
+    return (int)Rd16(d->base + d->offCosts + (size_t)index * 2u);
+}
+
+bool JDict_CandidateAt(const JDict *d, int index, const jdchar **val, int *valLen) {
+    if (!d || index < 0 || index >= (int)d->count) return false;
+    int vlen = 0;
+    const jdchar *v = ValAt(d, index, &vlen);
+    if (val) *val = v;
+    if (valLen) *valLen = vlen;
+    return true;
+}
+
+bool JDict_HasLonger(const JDict *d, const wchar_t *key) {
+    if (!d || !key || !*key) return false;
+    char kb[JDICT_MAX_KEY_CANDIDATES + 4];
+    int kn = KeyToUtf8(key, kb, (int)sizeof(kb));
+    if (kn <= 0) return false;
+    int at = LowerBound(d, kb, kn);
+    // 같은 키가 있으면 그 다음부터 — 접두가 같고 더 긴 것은 바로 뒤에 온다 (바이트 정렬)
+    if (at < (int)d->count) {
+        int klen = 0;
+        const char *k = KeyAt(d, at, &klen);
+        if (klen == kn && memcmp(k, kb, (size_t)kn) == 0) at++;
+    }
+    if (at >= (int)d->count) return false;
+    int klen = 0;
+    const char *k = KeyAt(d, at, &klen);
+    return klen > kn && memcmp(k, kb, (size_t)kn) == 0;
+}
+
+bool JDict_LongestPrefix(const JDict *d, const wchar_t *buf, int *keyLen,
+                         const jdchar **val, int *valLen) {
+    if (!d || !buf || !*buf) return false;
+    int n = (int)wcslen(buf);
+    if (n > (int)d->maxKeyLen) n = (int)d->maxKeyLen;
+    // 긴 쪽부터 정확 일치로 물어본다 — 키 길이 한도가 32 라 최악도 32번의 이진 탐색이다.
+    wchar_t probe[JDICT_MAX_KEY + 1];
+    for (int len = n; len >= 1; len--) {
+        if (len > JDICT_MAX_KEY) continue;
+        wmemcpy(probe, buf, (size_t)len);
+        probe[len] = L'\0';
+        if (JDict_Exact(d, probe, val, valLen)) {
+            if (keyLen) *keyLen = len;
+            return true;
+        }
+    }
+    return false;
+}

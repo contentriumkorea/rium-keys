@@ -50,5 +50,6 @@ Check("sample before transition rejected",!Policy.AfterTransition(100,120));
 Check("sample during transition rejected",!Policy.AfterTransition(150,120));
 Check("sample after transition accepted",Policy.AfterTransition(220,120));
 Check("Premiere source monitor recognized",Policy.KnownWorkspace("Adobe Premiere Pro","ControlType.Pane/Source Monitor/"));
+Check("Premiere root alone cannot establish shortcut safety",!Policy.KnownWorkspace("Adobe Premiere Pro","ControlType.Window:Premiere Pro/"));
 if(failures.Count>0)throw new Exception(string.Join(", ",failures));
 Console.WriteLine("All policy/key-message checks passed.");

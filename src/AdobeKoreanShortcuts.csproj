@@ -4,7 +4,7 @@
   <UseWindowsForms>true</UseWindowsForms><UseWPF>true</UseWPF>
   <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
   <AssemblyName>RiumKeys</AssemblyName><ApplicationManifest>app.manifest</ApplicationManifest>
-  <ApplicationIcon>rium-keys.ico</ApplicationIcon><Product>RIUM Keys</Product><Company>Contentrium</Company><Version>1.1.1</Version>
+  <ApplicationIcon>rium-keys.ico</ApplicationIcon><Product>CONTENTRIUM Keys</Product><Title>CONTENTRIUM Keys</Title><Company>Contentrium</Company><Version>1.1.1</Version>
  </PropertyGroup>
  <ItemGroup><EmbeddedResource Include="update-public.pem" LogicalName="RiumKeys.UpdatePublicKey" /></ItemGroup>
 </Project>

@@ -4,7 +4,7 @@ Unicode true
 !ifndef APP_VERSION
 !define APP_VERSION "1.1.0"
 !endif
-Name "RIUM Keys"
+Name "CONTENTRIUM Keys"
 !ifndef APP_EXE
 !define APP_EXE "..\dist\RiumKeys.exe"
 !endif
@@ -19,8 +19,8 @@ SilentInstall silent
 SilentUnInstall silent
 SetCompressor /SOLID lzma
 VIProductVersion "${APP_VERSION}.0"
-VIAddVersionKey "ProductName" "RIUM Keys"
-VIAddVersionKey "FileDescription" "RIUM Keys"
+VIAddVersionKey "ProductName" "CONTENTRIUM Keys"
+VIAddVersionKey "FileDescription" "CONTENTRIUM Keys"
 VIAddVersionKey "CompanyName" "Contentrium"
 VIAddVersionKey "LegalCopyright" "Contentrium"
 VIAddVersionKey "FileVersion" "${APP_VERSION}"
@@ -90,8 +90,9 @@ stopped:
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RiumKeys" '"$INSTDIR\RiumKeys.exe"'
   ${EndIf}
   WriteUninstaller "$INSTDIR\Uninstall.exe"
-  CreateShortcut "$SMPROGRAMS\RIUM Keys.lnk" "$INSTDIR\RiumKeys.exe"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeys" "DisplayName" "RIUM Keys"
+  Delete "$SMPROGRAMS\RIUM Keys.lnk"
+  CreateShortcut "$SMPROGRAMS\CONTENTRIUM Keys.lnk" "$INSTDIR\RiumKeys.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeys" "DisplayName" "CONTENTRIUM Keys"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeys" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeys" "Publisher" "Contentrium"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeys" "InstallLocation" "$INSTDIR"
@@ -129,6 +130,7 @@ unwait:
 unclean:
   Delete "$INSTDIR\RiumKeys.previous.exe"
   Delete "$SMPROGRAMS\RIUM Keys.lnk"
+  Delete "$SMPROGRAMS\CONTENTRIUM Keys.lnk"
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RiumKeys"
   DeleteRegValue HKCU "Software\Contentrium\RiumKeys" "InstallDir"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeys"
