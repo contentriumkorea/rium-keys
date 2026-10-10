@@ -59,18 +59,26 @@ Test results on this PC:
   they are not physical keyboard or all-application compatibility tests.
 - Manual TIP activation using an ordinary application client ID returned
   `E_INVALIDARG`. This is not treated as successful Windows registration.
-- A temporary, process-local native EDIT trial physically composed `gksrmf`
-  into `한글`. That trial expired before the shortcut transition was finished;
-  it is **not** a passing end-to-end test.
-- The subsequent trial, with stricter shortcut/profile checks, did not run:
-  Windows elevation was cancelled. Temporary machine registration is absent;
-  the original RIUM Keys 1.1.1 tray process was restarted.
+- On 2026-10-10, the complete **single-process native EDIT physical test passed**:
+  `gksrmf` + Space produced `한글 `; the button then received original V down/up
+  with the fork and Korean mode verified at both events; returning to the EDIT
+  and repeating the word produced exact `한글 한글 `. Profile restoration was
+  read back successfully, fixture exit was 0, and temporary registration was removed.
+  This supersedes the earlier timeout/cancelled attempts.
+- This is evidence for the standard Win32 EDIT/button transition only. It does
+  not establish Premiere/After Effects compatibility or a latency bound.
+- A two-process physical test was prepared, but Windows administrator confirmation
+  was cancelled before registration or fixture launch. Cross-process behavior
+  is still unverified. Production 1.1.1 was restarted and both temporary COM/TIP
+  registration keys were confirmed absent after the attempt.
 
 ## Physical fixture
 
 ```powershell
 ./native-ime/build-fixture.ps1
 ./input-probe/test-registration.ps1 -ReusedEngine
+# For interleaved focus changes between two independently activated processes:
+./input-probe/test-registration.ps1 -TwoProcesses
 ```
 
 The second command needs a Windows administrator confirmation for temporary
@@ -86,6 +94,8 @@ return to the input and enter `gksrmf` then Space. A pass requires:
 5. Temporary registration removed by the parent controller.
 
 The controller bounds the test and cleans registration on success/failure.
+TwoProcesses copies only the generated fixture/DLL into an isolated output
+subdirectory and waits for both owned processes before removing registration.
 DLL files already loaded into another host can require later cleanup after that
 host exits; no application is terminated to unload them.
 

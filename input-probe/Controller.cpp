@@ -327,7 +327,7 @@ static void ExternalRegistrationTest(){
         Registration registration;registration.Install();SetEvent(ready);
         DWORD waited=WAIT_TIMEOUT;auto deadline=GetTickCount64()+
 #ifdef RIUM_REUSED_ENGINE
-        240000;
+        420000;
 #else
         105000;
 #endif

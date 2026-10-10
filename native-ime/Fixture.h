@@ -69,7 +69,7 @@ static void ReusedEngineSession(){
         VARIANT value;VariantInit(&value);value.vt=VT_I4;value.lVal=1;Check(open->SetValue(client,&value),"select Korean in fixture only");
         counter.profiles=profiles;counter.open=open;
         Line("READY: type gksrmf + Space; click Shortcut surface and press V; return and type gksrmf + Space.");
-        auto end=GetTickCount64()+180000;bool first=false;size_t lastLength=static_cast<size_t>(-1);
+        auto end=GetTickCount64()+360000;bool first=false;size_t lastLength=static_cast<size_t>(-1);
         while(GetTickCount64()<end&&IsWindow(window)){
             MSG message;
             while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
