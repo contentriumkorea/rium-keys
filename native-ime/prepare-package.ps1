@@ -12,7 +12,7 @@ $sources=@{
     'x64\RiumKeysInput.dll'='out\installable\x64\RiumKeysInput.dll'
     'x86\RiumKeysInput.dll'='out\installable\x86\RiumKeysInput.dll'
     'x64\RiumKeysControl.exe'='out\installable\x64\RiumKeysControl.exe'
-    'x64\RiumImeFixture.exe'='out\x64\RiumImeFixture.exe'
+    'x86\RiumKeysControl.exe'='out\installable\x86\RiumKeysControl.exe'
     'LICENSE'='third_party\jamotong\LICENSE'
     'COPYRIGHT.md'='third_party\jamotong\COPYRIGHT.md'
 }
@@ -54,5 +54,5 @@ try {
     }
     throw
 }
-Write-Output "Prepared $($config.Version) manual-prerelease package: $package"
+Write-Output "Prepared $($config.Version) release package: $package"
 Write-Output 'No stable updater metadata or public release was generated.'

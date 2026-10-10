@@ -104,4 +104,4 @@ if($Architecture -eq 'x64'){
     if($LASTEXITCODE){throw 'AE lifecycle test compilation failed.'}
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'providers/dva/owner-fixture-controls.manifest') -Destination $output
 }
-Write-Output "Built $dll (local preview; Installable=$Installable; not registered by build)."
+Write-Output "Built $dll (Installable=$Installable; not registered by build)."

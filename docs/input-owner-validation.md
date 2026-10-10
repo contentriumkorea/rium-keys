@@ -301,6 +301,6 @@ hashes, both COM paths, both profile icon paths, enabled/default/active profile
 and installed-app version were read back. Same-version packaged preflight passed.
 
 The detailed scope and exact release hashes are in
-[preview-10-release.md](preview-10-release.md). Earlier application-specific
+[build 10 release record](release-build10.md). Earlier application-specific
 results remain preview.8 evidence; this presentation/installer change does not
 expand the tested application scope or enable unattended native updates.

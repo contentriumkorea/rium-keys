@@ -12,7 +12,6 @@ $target=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.Version)
 $legacyDir=Join-Path $env:LOCALAPPDATA 'Programs\RIUM Keys'
 $legacyExe=Join-Path $legacyDir 'RiumKeys.exe'
 $legacyUninstaller=Join-Path $legacyDir 'Uninstall.exe'
-$fixtureSource=Join-Path $package 'x64\RiumImeFixture.exe'
 function Assert-NativeRegistryAbsent {
     foreach($view in @([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)){
         $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
@@ -31,8 +30,7 @@ $before=$beforeText | ConvertFrom-Json
 if($before.registered -or $before.categories -ne 0 -or (Test-Path -LiteralPath $target)){throw 'An existing native installation or version directory needs inspection.'}
 if($before.koreanDefault -notmatch '^0x0412:\{[0-9A-Fa-f-]{36}\}\{[0-9A-Fa-f-]{36}\}$'){throw 'Cannot capture the previous Korean input profile.'}
 $hasLegacy=Test-RiumLegacyMigration $legacyDir
-if(!(Test-Path -LiteralPath $fixtureSource)){throw 'Build the physical fixture before installation.'}
-if($Preflight){'PREFLIGHT PASS: package hashes/version, native absence, previous input profile, optional legacy migration and packaged fixture verified.';exit 0}
+if($Preflight){'PREFLIGHT PASS: package hashes/version, native absence, previous input profile and optional legacy migration verified.';exit 0}
 $transaction=[guid]::NewGuid().ToString()
 $recovery=Join-Path $env:LOCALAPPDATA ("Contentrium\RIUM Keys\Recovery\"+(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+$transaction)
 New-Item -ItemType Directory -Path $recovery | Out-Null
@@ -46,18 +44,9 @@ Save-State 'Preparing'
 $ready=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Ready")
 $done=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Done")
 $commit=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Commit")
-$machine=$null;$fixture=$null;$enabled=$false;$selected=$false;$committed=$false;$commitRequested=$false
+$machine=$null;$enabled=$false;$selected=$false;$committed=$false;$commitRequested=$false
 $wasRunning=$hasLegacy -and @(Get-Process RiumKeys -ErrorAction SilentlyContinue).Count -gt 0
 try {
-    $fixtureDir=Join-Path $recovery 'physical-test'
-    New-Item -ItemType Directory -Path $fixtureDir | Out-Null
-    Copy-Item -LiteralPath $fixtureSource -Destination (Join-Path $fixtureDir 'RiumInstalledSmoke.exe')
-    Copy-Item -LiteralPath (Join-Path $package 'x64\RiumKeysInput.dll') -Destination $fixtureDir
-    $launchInfo=[Diagnostics.ProcessStartInfo]::new((Join-Path $fixtureDir 'RiumInstalledSmoke.exe'),'--launch-check')
-    $launchInfo.UseShellExecute=$false;$launchInfo.CreateNoWindow=$true
-    $launchCheck=[Diagnostics.Process]::Start($launchInfo)
-    if(!$launchCheck.WaitForExit(5000)){Stop-Process -InputObject $launchCheck;throw 'Fixture launch check timed out.'}
-    if($launchCheck.ExitCode -ne 0){throw 'Fixture must launch under the ordinary user token.'}
     if($wasRunning){
         $stop=Start-Process -FilePath $legacyExe -ArgumentList '--exit' -WindowStyle Hidden -PassThru
         if(!$stop.WaitForExit(10000)){throw 'Legacy exit request timed out.'}
@@ -76,14 +65,9 @@ try {
     if($LASTEXITCODE){throw 'Could not enable the user input profile.'}
     New-Item -Path 'HKCU:\Software\Contentrium\RiumKeysInput' -Force | Out-Null
     Set-ItemProperty 'HKCU:\Software\Contentrium\RiumKeysInput' -Name InstallState -Value $statePath
-    Save-State 'AwaitingPhysicalTest'
-    # A different basename proves the registered installable DLL can activate
-    # outside the guarded RiumImeFixture process. COM resolves the installed DLL.
-    $fixture=Start-Process -FilePath (Join-Path $fixtureDir 'RiumInstalledSmoke.exe') -ArgumentList '--native-fixture' -WindowStyle Hidden -PassThru
-    "Physical verification window ready. Recovery: $recovery"
-    if(!$fixture.WaitForExit(390000)){throw 'Physical verification timed out.'}
-    Get-Content -LiteralPath (Join-Path $fixtureDir 'fixture-result.log')
-    if($fixture.ExitCode -ne 0){throw 'Installed input method did not pass physical verification.'}
+    Save-State 'VerifyingInstallation'
+    [void](Assert-RiumManifest $target $config)
+    Test-RiumInstalledLoad $target $recovery
     Save-State 'SelectingNativeInput'
     $selected=$true # default selection changes before activation/readback
     & $control --select
@@ -117,7 +101,6 @@ try {
     }
     if(!$committed -and !($commitRequested -and $machine.ExitCode -eq 0)){
         $rollbackErrors=@()
-        if($fixture -and !$fixture.HasExited){Stop-Process -InputObject $fixture;if(!$fixture.WaitForExit(5000)){throw 'Fixture shutdown not confirmed; inspect the pending installation.'}}
         # Enabling a profile can change selection before the explicit select step.
         if($enabled -or $selected){& $control --restore $before.defaultTip $before.activeTip;if($LASTEXITCODE){$rollbackErrors+='Previous default/active profile restoration failed.'}}
         if($enabled){& $control --disable;if($LASTEXITCODE){$rollbackErrors+='User profile disable failed.'}}
