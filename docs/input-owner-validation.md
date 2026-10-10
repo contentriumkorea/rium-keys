@@ -184,6 +184,13 @@ and each preserved transparent pixels and alpha-zero corners. A 32-pixel Windows
 readback was visually inspected. The legacy executable also built with zero
 warnings and errors. These checks do not by themselves establish installation.
 
+The 01:50 KST preview.9 upgrade attempt ended when Windows administrator
+confirmation was cancelled. It recorded `FailedRolledBack` before the machine
+upgrade began. Independent readback confirmed preview.8 still `Installed`,
+the installed-app name `CONTENTRIUM Keys`, and the native profile still
+registered/enabled/active/default with six categories. Preview.9 is built and
+published as development source, but its logo is not yet installed on this PC.
+
 ## Routing behavior
 
 The service retains Korean mode. Positive command ownership passes the original
