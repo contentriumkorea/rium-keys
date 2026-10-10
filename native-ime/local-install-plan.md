@@ -58,3 +58,12 @@ source review and PowerShell syntax checks.
 
 References: Microsoft ITfInputProcessorProfileMgr::ActivateProfile,
 InstallLayoutOrTip and SetDefaultLayoutOrTip documentation.
+
+2026-10-10 preview.3 upgrade: installed and verified after administrator approval.
+Both COM architectures now point to their preview.3 DLLs, seven package hashes
+match, and the native default/active profile and original uninstall fallback
+are preserved. A fresh installed-DLL fixture passed inline Hangul composition,
+Backspace, Space ordering, original V down/up and Korean input after returning
+to the EDIT. No initial language toggle was needed in this run. Preview.2 files
+remain for recovery. The existing chat process still loaded preview.2 and must
+restart to use the new DLL. No user application was terminated.

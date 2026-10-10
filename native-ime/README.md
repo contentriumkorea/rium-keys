@@ -257,3 +257,26 @@ The x64/x86 suites each pass 52 inline, 26 engine and 49 routing checks, includi
 selection failures, reentrant termination, deferred finalization, wrong-context
 edit rejection and Space-write/finalize failure. These checks do not establish
 compatibility with every application or remove the existing Adobe release gate.
+
+### Verified preview.3 upgrade on 2026-10-10
+
+The local upgrade committed successfully. Fresh readback confirmed
+`2.0.0-preview.3`, the `Installed` transaction state, both versioned COM paths,
+all seven installed package hashes, and the Windows installed-apps entry.
+The native profile remained enabled, active and the default, with six categories.
+The original uninstall fallback and preview.2 files were retained.
+
+A fresh ordinary-user physical fixture loaded the DLL from preview.3's Program
+Files directory. Physical keys showed `ㅎ → 하 → 한` inside the native EDIT,
+Backspace returned to `하`, and completion plus Space produced exact `한글 `.
+After clicking the button, the application received original V down/up while
+the RIUM profile and Korean mode remained selected. Returning to the EDIT
+produced exact `한글 한글 ` without a language toggle. Inline preedit, profile
+restoration and exit code 0 all passed. The physical log SHA-256 is
+`3F1770A261423FF94A878F71D633A0962752A45F0F92188973B72D60BA973E89`.
+
+The running chat application still held the preview.2 DLL after installation;
+it needs a restart to load the new version. Its composer was not directly
+automated. This result verifies the installed native EDIT/button path, not
+all applications or the pending Adobe scenarios. The detailed local report is
+`native-ime/out/inline-upgrade-verification.json` (ignored).
