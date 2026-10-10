@@ -325,7 +325,11 @@ void Jamotong_OnLayoutSwitched(JamotongTextService *obj) {
 // RFC-0010: 문서 인라인 조합이 남아 있으면 '확정'(텍스트 보존)하고 경로 캐시를 비운다 —
 // 포커스 이동 시 MS IME 관례(조합 텍스트 유지). Esc 취소는 호출 전에 JamoComp_Cancel.
 static void ResetComposition(JamotongTextService *obj) {
-    JamoComp_Finalize(obj);        // 문서 인라인 조합 확정 (없으면 no-op)
+    if (JamoComp_Finalize(obj) != S_OK) return;
+    Jamotong_ClearCompositionState(obj);
+}
+
+void Jamotong_ClearCompositionState(JamotongTextService *obj) {
     JamoComp_ResetPathCache(obj);  // 컨텍스트 경로 캐시 무효화 (stale 포인터 방지)
     Fsm_Init(&obj->fsm);
     Chord_Init(&obj->chord);
@@ -336,22 +340,20 @@ static void ResetComposition(JamotongTextService *obj) {
     CompTarget_Clear(obj);         // 조합이 끝났다 — 다음 조합은 대상을 새로 기억한다 (W1-09)
 }
 
-// 순차 FSM 결과 출력 — RFC-0010 분기: 비단명 컨텍스트(표준 composition 지원)는 문서 인라인
-// 조합, 그 외(단명·EDIT 계열·강등·킬스위치)는 기존 commit 전용 + 오버레이(OutputResult).
+// Supported TSF and CUAS contexts display composition inline. Unsupported or
+// behaviorally demoted contexts retain the visible commit-only fallback.
 //   isFlush=TRUE: res.commitChar는 '현재 조합의 확정'이다. 인라인 조합이 활성이면 그 텍스트가
 //   이미 문서 안에 있으므로 재삽입하지 않고 composition만 확정한다(재삽입=글자 중복).
 // 모아치기/코드/정적/플러그인 경로는 기존 OutputResult를 그대로 쓴다.
 static bool OutputResult(JamotongTextService *obj, ITfContext *pic, FsmResult res, BOOL isFlush);
 static bool OutputResultSeq(JamotongTextService *obj, ITfContext *pic, FsmResult res, BOOL isFlush) {
+    if (!isFlush && (obj->compFinalizePending || obj->compBoundaryWritten ||
+        (obj->pComposition && obj->pCompContext != pic))) return false;
     CompTarget_Remember(obj, pic);   // 조합 대상 기억 (조합마다 한 번, RFC-0008 W1-09)
-    // 경로 선택은 transitory 판정이 단독으로 한다. EDIT 계열 검출(EditCtl_*)은 경로 선택자가
-    // 아니라 COMMIT 경로 '안'의 주입 방식이다 — Win11 메모장 편집 컨트롤이 RichEditD2DPT
-    // (클래스명에 'edit', EM_* 응답)라서 EDIT 검출을 선행시키면 표준 조합의 1차 대상인
-    // 메모장이 통째로 COMMIT으로 굴러떨어진다(실기 2026-07-24). AkelPad류는 어차피
-    // 단명(TRANSITORY) 판정으로 COMMIT이 되므로 선행 가드는 필요 없다.
+    // Check the context's interfaces, not the application or control class name.
     if (pic && JamoComp_PathForContext(obj, pic) == JAMO_PATH_STANDARD) {
         if (JamoComp_IsActive(obj) && isFlush) {
-            JamoComp_Finalize(obj);   // 조합 텍스트는 이미 문서에 있다 — 확정만
+            if (JamoComp_Finalize(obj) != S_OK) return false;
             obj->prevChipValid = FALSE; obj->chipPendingAdv = 0;
             PreeditOverlay_Hide();
             return true;
@@ -1290,6 +1292,11 @@ static HRESULT STDMETHODCALLTYPE KES_OnTestKeyDown(ITfKeyEventSink *pThis, ITfCo
     // 이하 config/레이아웃 접근 전체를 설정 스레드의 Config_ApplyEdited(레이아웃 free)와 직렬화.
     // (기존엔 무락이라, 설정 적용 중 pHangulLayout/pChordLayout이 해제되는 순간 키가 오면 UAF.)
     EnterCriticalSection(&g_configLock);
+    if (wParam != VK_ESCAPE && !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods) &&
+        !JamoComp_PrepareInput(obj, pic)) {
+        if (pfEaten) *pfEaten = obj->pCompContext == pic;
+        goto tk_done;
+    }
 
     // 설정창 단축키 (설정 가능, 기본 Ctrl+Alt+K) 예측-소비 (OnKeyDown이 불려 설정창을 열도록).
     if (Config_IsShortcut(&obj->config, SC_FN_SETTINGS, skVk, skMods)) {
@@ -1548,6 +1555,11 @@ static HRESULT STDMETHODCALLTYPE KES_OnKeyDown(ITfKeyEventSink *pThis, ITfContex
     // 스레드의 Config_ApplyEdited(레이아웃 free)와 직렬화한다. 재진입 락이라 내부의
     // Config_RotateLayout 등과 중첩돼도 안전. 이후 모든 경로는 kd_done으로 해제.
     EnterCriticalSection(&g_configLock);
+    if (wParam != VK_ESCAPE && !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods) &&
+        !JamoComp_PrepareInput(obj, pic)) {
+        if (pfEaten) *pfEaten = obj->pCompContext == pic;
+        goto kd_done;
+    }
 
     // 설정창 단축키 (설정 가능, 기본 Ctrl+Alt+K — Win11 모던 설정엔 IME "옵션" 버튼이 없어 단축키로 연다).
     if (Config_IsShortcut(&obj->config, SC_FN_SETTINGS, skVk, skMods)) {
@@ -2035,18 +2047,24 @@ static HRESULT STDMETHODCALLTYPE KES_OnKeyDown(ITfKeyEventSink *pThis, ITfContex
                 //   소실되는 현상 대응 — 삽입 경로 하나로 직렬화하면 경합 자체가 없다.
                 //   (공백은 '문자'라 터미널 포함 삽입으로 전달 가능. 엔터/방향키는 제어키라 기존 재전달 유지)
                 if (wParam == VK_SPACE) {
-                    wchar_t c = Fsm_Flush(&obj->fsm);
+                    wchar_t c = Fsm_PeekPreedit(&obj->fsm);
                     JamoDiag("FLUSH+SPACE commit=U+%04X", (unsigned)c);
                     if (JamoComp_IsActive(obj)) {
-                        // RFC-0010: 조합 음절은 이미 문서 인라인 조합 안에 있다 — 확정 후 공백만 삽입.
-                        JamoComp_Finalize(obj);
-                        CommitText(obj, pic, L" ");
+                        // Write and finalize the last syllable plus space in one TSF transaction.
+                        if (JamoComp_CommitWithSpace(obj, c) != S_OK) {
+                            if (pfEaten) *pfEaten = TRUE;
+                            goto kd_done;
+                        }
                     } else {
                         wchar_t buf[3]; int n = 0;
                         if (c) buf[n++] = c;
                         buf[n++] = L' '; buf[n] = L'\0';
-                        CommitText(obj, pic, buf);   // EDIT=EM_REPLACESEL / 비-EDIT=TSF
+                        if (!CommitText(obj, pic, buf)) {
+                            if (pfEaten) *pfEaten = TRUE;
+                            goto kd_done;
+                        }
                     }
+                    Fsm_Flush(&obj->fsm);
                     obj->prevChipValid = FALSE; obj->chipPendingAdv = 0;
                     PreeditOverlay_Hide();   // 조합 종료 → 미리보기 제거
                     if (pfEaten) *pfEaten = TRUE;
@@ -2054,9 +2072,13 @@ static HRESULT STDMETHODCALLTYPE KES_OnKeyDown(ITfKeyEventSink *pThis, ITfContex
                 }
                 // 그 외 비자모 키: 조합만 확정하고, 원래 키는 실제 이벤트로 재전달 → 앱이 네이티브 처리.
                 // (편집세션 텍스트 삽입은 터미널(PuTTY 등)엔 안 통함. 방향키 이동·엔터·터미널 모두 지원.)
-                FsmResult res = {Fsm_Flush(&obj->fsm), 0, false};   // 초성만/중성만 부분 상태도 올바르게 확정
+                FsmResult res = {Fsm_PeekPreedit(&obj->fsm), 0, false};
                 JamoDiag("FLUSH commit=U+%04X then resend vk=%02X (delayed)", (unsigned)res.commitChar, (unsigned)wParam);
-                OutputResultSeq(obj, pic, res, TRUE);   // 어절 경계 → 현재 음절 확정
+                if (!OutputResultSeq(obj, pic, res, TRUE)) {
+                    if (pfEaten) *pfEaten = TRUE;
+                    goto kd_done;
+                }
+                Fsm_Flush(&obj->fsm);
                 ScheduleKeyResend(obj, wParam, lParam);   // 지연 재전달 — CUAS 전달 경합 방지 (AkelPad 엔터 소실)
                 if (pfEaten) *pfEaten = TRUE;   // 원본 소비(재전달본이 대신 처리)
             }

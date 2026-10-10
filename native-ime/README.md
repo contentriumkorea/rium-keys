@@ -62,7 +62,7 @@ Test results on this PC:
 - Original key sink: six failing routing cases (null, changed disabled value,
   empty, read-only, disconnected, stale cache). The added failure-injection
   suite also reproduced four compartment error/type failures before the fix.
-- Current x64 and x86: 26 reused-engine checks + 42 routing/policy checks pass in each
+- Current x64 and x86: 26 engine, 49 routing/policy and 52 inline-composition checks pass in each
   architecture. Routing tests exercise the real DLL with controlled contexts;
   they are not physical keyboard or all-application compatibility tests.
 - Manual TIP activation using an ordinary application client ID returned
@@ -143,7 +143,7 @@ migration, an ordinary-user test process with a different filename must pass
 the physical Korean / V / Korean test using the registered installed DLL.
 Only then is RIUM selected and the old utility removed with its own uninstaller.
 
-The preview is installed under `C:\Program Files\RIUM Keys\2.0.0-preview.2`.
+The first installed preview used `C:\Program Files\RIUM Keys\2.0.0-preview.2`.
 Windows loads it when selected; there is no legacy keyboard hook, UIA worker or
 login executable. Microsoft IME remains available. The Windows installed-apps
 entry provides removal and restoration of the captured previous input method.
@@ -153,7 +153,7 @@ does not terminate user applications. Recovery state is stored under
 
 This installer refuses an existing native registration/version directory and
 input configurations it cannot snapshot faithfully. It is a first-install
-preview, not an upgrade mechanism. An interrupted commit is reported as unknown
+preview. Use `upgrade-local.ps1` for an existing preview.2 installation. An interrupted commit is reported as unknown
 instead of being labeled rolled back.
 
 ### Verified local installation on 2026-10-10
@@ -192,3 +192,68 @@ is `8F36B9FA9E5C7DB7DBB9AC8A6E5A1C5AF7742DED7EE2201B01A6B0EF0C59E1A8`.
 API references: [profile activation](https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-activateprofile),
 [user profile enablement](https://learn.microsoft.com/en-us/windows/win32/tsf/installlayoutortip),
 [default input selection](https://learn.microsoft.com/en-us/windows/win32/tsf/setdefaultlayoutortip).
+
+### Inline composition correction (preview.3)
+
+The blue floating syllable was the commit-only fallback for every transitory
+CUAS context. Removing that condition alone caused CUAS to end composition on
+each key, producing separate consonants and vowels. A transitory Korean preedit
+now selects exactly its last character with `fInterimChar=TRUE` and
+`TF_AE_NONE`; native TSF stores retain their collapsed caret. This follows the
+[Windows Korean interim-selection contract](https://learn.microsoft.com/en-us/windows/win32/api/msctf/ns-msctf-tf_selectionstyle).
+Capable contexts show the current syllable in the document as it is typed.
+The unsupported-host fallback remains visible so that uncommitted text cannot
+silently disappear.
+
+Space updates the last syllable and space in the same synchronous TSF transaction.
+Previously, ending CUAS composition and immediately calling `EM_REPLACESEL`
+could deliver `한 글` instead of `한글 `. Finalization keeps the original
+composition alive across host callbacks. Deferred focus finalization is bound
+to that composition; subsequent input cannot edit another document with its
+cookie or overwrite a Space that was already written. Cross-context keys and
+Escape/Hangul recovery remain available if a host rejects finalization.
+
+```powershell
+./native-ime/build.ps1 -Architecture x64 -Installable
+./native-ime/build.ps1 -Architecture x86 -Installable
+./native-ime/out/installable/x64/InlineTests.exe
+./native-ime/out/installable/x86/InlineTests.exe
+./native-ime/build-control.ps1
+./native-ime/build-fixture.ps1
+./native-ime/test-fixture-launch.ps1
+./native-ime/prepare-package.ps1
+./native-ime/upgrade-local.ps1 -Preflight
+./native-ime/upgrade-local.ps1
+```
+
+`upgrade-local.ps1` upgrades the verified preview.2 installation only. It retains
+the previous version, stages preview.3 in its own Program Files directory, and
+updates both COM views without unregistering the shared keyboard profile.
+The ordinary-user verifier checks the DLL loaded by a fresh physical fixture,
+inline preedit, exact Korean text and Space, original V down/up on a button, and
+Korean input after returning. The machine worker commits only after that test.
+Uninstall retains the original Microsoft input fallback captured during the
+first installation. Failed upgrades verify both restored COM paths, installed
+metadata, and input profile state; incomplete recovery is reported explicitly.
+No application is terminated to unload an old DLL. Already running applications
+can require a restart to load the updated input method.
+
+For registration-free development testing:
+
+```powershell
+./native-ime/build.ps1 -Architecture x64 -Diagnostic
+./native-ime/build-inline-fixture.ps1
+./native-ime/out/inline-x64/RiumImeFixture.exe
+# Native EDIT, with physical keys and per-syllable document/IMM readback:
+./native-ime/out/inline-x64/RiumImeFixture.exe --native
+```
+
+Focus the disposable fixture window to start. Its application-local manifest
+loads its own DLL without changing machine registration. Diagnostic builds are
+restricted to fixtures, isolate their logs, and cannot be built as installable
+packages. The real `ITextStoreACP` fixture passed all seven checks for initial,
+vowel, final, Backspace, syllable boundary, visible last syllable and Space.
+The x64/x86 suites each pass 52 inline, 26 engine and 49 routing checks, including
+selection failures, reentrant termination, deferred finalization, wrong-context
+edit rejection and Space-write/finalize failure. These checks do not establish
+compatibility with every application or remove the existing Adobe release gate.

@@ -69,7 +69,7 @@ static void ReusedEngineSession(){
         VARIANT value;VariantInit(&value);value.vt=VT_I4;value.lVal=1;Check(open->SetValue(client,&value),"select Korean in fixture only");
         counter.profiles=profiles;counter.open=open;
         Line("READY: type gksrmf + Space; click Shortcut surface and press V; return and type gksrmf + Space.");
-        auto end=GetTickCount64()+360000;bool first=false;size_t lastLength=static_cast<size_t>(-1);
+        auto end=GetTickCount64()+360000;bool first=false,inlineSeen=false;size_t lastLength=static_cast<size_t>(-1);
         while(GetTickCount64()<end&&IsWindow(window)){
             MSG message;
             while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
@@ -79,12 +79,19 @@ static void ReusedEngineSession(){
                 TranslateMessage(&message);DispatchMessageW(&message);
             }
             wchar_t contents[256]{};GetWindowTextW(edit,contents,256);std::wstring actual=contents;
+            auto imc=ImmGetContext(edit);
+            if(imc){
+                auto preeditBytes=ImmGetCompositionStringW(imc,GCS_COMPSTR,nullptr,0);
+                if(preeditBytes>0&&!actual.empty())inlineSeen=true;
+                ImmReleaseContext(edit,imc);
+            }
             if(actual.size()!=lastLength){Print("Fixture text length: %zu\n",actual.size());lastLength=actual.size();}
             if(actual==L"\ud55c\uae00 "&&ReusedKoreanMode(profiles.Get(),open.Get())){first=true;counter.firstWord=true;}
             if(first&&counter.down>0&&counter.up>0&&actual==L"\ud55c\uae00 \ud55c\uae00 "){
                 TF_INPUTPROCESSORPROFILE now{};auto read=profiles->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD,&now);
                 VARIANT mode;VariantInit(&mode);auto modeRead=open->GetValue(&mode);
-                passed=read==S_OK&&SameReusedProfile(active,now)&&modeRead==S_OK&&mode.vt==VT_I4&&mode.lVal!=0;
+                passed=inlineSeen&&read==S_OK&&SameReusedProfile(active,now)&&modeRead==S_OK&&mode.vt==VT_I4&&mode.lVal!=0;
+                Print("Inline preedit visible in native document before commit: %d\n",inlineSeen);
                 VariantClear(&mode);Print("Fork profile and Korean selection retained: %d\n",passed);break;
             }
             Sleep(5);

@@ -1,7 +1,7 @@
 100 ICON "../src/rium-keys.ico"
 1 VERSIONINFO
- FILEVERSION 2,0,0,2
- PRODUCTVERSION 2,0,0,2
+ FILEVERSION 2,0,0,3
+ PRODUCTVERSION 2,0,0,3
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x2L
  FILEOS 0x40004L
@@ -13,9 +13,9 @@ BEGIN
   BEGIN
    VALUE "CompanyName", "Contentrium"
    VALUE "FileDescription", "RIUM Keys"
-   VALUE "FileVersion", "2.0.0.2"
+   VALUE "FileVersion", "2.0.0.3"
    VALUE "ProductName", "RIUM Keys"
-   VALUE "ProductVersion", "2.0.0-preview.2"
+   VALUE "ProductVersion", "2.0.0-preview.3"
    VALUE "OriginalFilename", "RiumKeysInput.dll"
    VALUE "LegalCopyright", "Contentrium; includes Jamotong by rubidus-api (MIT). See LICENSE and COPYRIGHT.md."
   END

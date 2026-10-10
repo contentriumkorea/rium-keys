@@ -1,5 +1,5 @@
 #pragma once
-// comp_inline.h — RFC-0010 문서 인라인 표준 composition (비단명 컨텍스트 전용)
+// comp_inline.h — Standard TSF composition, including the IMM/CUAS bridge.
 //   경로 판정: comp_path.h(JamoPath_Decide) + ITfContext::GetStatus(TS_SS_TRANSITORY).
 //   트랜잭션 레시피는 examples/standard-tsf-lab(메모장 실기 PASS)에서 이식:
 //   QUERYONLY range → StartComposition(실제 sink, S_OK+NULL=실패) → SetText(flag 0)
@@ -11,8 +11,7 @@
 // 서비스 생성 시 sink vtbl 초기화 (JamotongTextService_Create).
 void JamoComp_Init(JamotongTextService *svc);
 
-// 현재 컨텍스트의 경로 판정(단일 슬롯 캐시). 킬스위치(config.options.inlineComposition=0)와
-// EDIT 계열 검출은 호출자가 먼저 거른다(EDIT 계열은 실기 검증된 EM_REPLACESEL 경로 유지).
+// Context capability check; transitory contexts use a one-character interim selection.
 JamoPathKind JamoComp_PathForContext(JamotongTextService *svc, ITfContext *pic);
 
 // 순차 FSM 한 키 결과를 표준 composition으로 반영(한 키 = 한 동기 세션).
@@ -25,7 +24,13 @@ BOOL JamoComp_IsActive(const JamotongTextService *svc);
 
 // 확정: 조합 텍스트는 문서에 그대로 두고 composition만 종료(플러시·포커스 이동·한자키).
 // preedit 재삽입 금지 — 텍스트는 이미 문서 안에 있다.
-void JamoComp_Finalize(JamotongTextService *svc);
+HRESULT JamoComp_Finalize(JamotongTextService *svc);
+// Keep final syllable and space in one edit session, before the IMM bridge commits.
+HRESULT JamoComp_CommitWithSpace(JamotongTextService *svc, wchar_t syllable);
+// Finish a pending boundary before accepting input in this or another context.
+BOOL JamoComp_PrepareInput(JamotongTextService *svc, ITfContext *ctx);
+// Called only after the matching composition has actually ended.
+void Jamotong_ClearCompositionState(JamotongTextService *svc);
 
 // 취소: 조합 텍스트를 문서에서 제거하고 종료(Esc).
 void JamoComp_Cancel(JamotongTextService *svc);

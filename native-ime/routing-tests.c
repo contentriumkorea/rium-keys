@@ -139,6 +139,21 @@ int wmain(int argc, wchar_t **argv) {
     check(SUCCEEDED(sink->lpVtbl->OnKeyDown(sink,&ctx.iface,'V',0x002f0001,&handled))&&!handled,
           "key down rechecks changed context after preview");
     set_flag(mgr,client,&GUID_COMPARTMENT_EMPTYCONTEXT,0);
+    // A busy old composition must not lock another application out of its keys.
+    Context other = { .iface = { &context_vtable }, .compartments = mgr, .statusResult = S_OK };
+    service->pCompContext=&ctx.iface;service->compFinalizePending=TRUE;service->fsm.state=STATE_CHO;
+    check(!wants(sink,&other.iface),"pending old composition passes another context's first key");
+    handled=TRUE;
+    check(SUCCEEDED(sink->lpVtbl->OnKeyDown(sink,&other.iface,'V',0x002f0001,&handled))&&!handled,
+          "pending old composition also passes actual keydown in another context");
+    check(wants(sink,&ctx.iface),"pending composition protects its own interim character");
+    handled=FALSE;
+    check(SUCCEEDED(sink->lpVtbl->OnTestKeyDown(sink,&ctx.iface,VK_ESCAPE,1,&handled))&&handled,
+          "Escape recovery remains available while finalization is pending");
+    handled=FALSE;
+    check(SUCCEEDED(sink->lpVtbl->OnTestKeyDown(sink,&ctx.iface,VK_HANGUL,1,&handled))&&handled,
+          "Hangul toggle remains available while finalization is pending");
+    service->pCompContext=NULL;service->compFinalizePending=FALSE;service->fsm.state=STATE_EMPTY;
     HRESULT outsideFixture = tip->lpVtbl->Activate(tip, thread, client);
 #ifdef RIUM_INSTALLABLE
     check(outsideFixture != E_ACCESSDENIED, "installable DLL is not restricted to a fixture basename");

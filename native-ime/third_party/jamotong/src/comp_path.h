@@ -1,7 +1,7 @@
 #pragma once
 // comp_path.h — RFC-0010 인라인 composition 경로 결정 (순수 로직, WinAPI 무의존)
-//   비단명(non-transitory) 컨텍스트 → 표준 ITfComposition (STANDARD)
-//   단명(TS_SS_TRANSITORY)·판정 불가·필수 인터페이스 결여·행동 강등 → 기존 commit 전용 (COMMIT)
+//   Capable contexts, including transitory CUAS stores, use ITfComposition.
+//   Failed status, missing interfaces or repeated host rejection use COMMIT.
 // 네이티브 테스트: jamotong-private/test/comp_path_test.c (T011)
 
 // Windows SDK TS_SS_TRANSITORY와 같은 값이어야 한다 (독립 oracle: textstor.h = 0x4).

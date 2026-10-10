@@ -4,7 +4,7 @@ $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.Window
 if($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Start installation from the ordinary user session.'}
 $package=Join-Path $PSScriptRoot 'out\local-package'
 $control=Join-Path $package 'x64\RiumKeysControl.exe'
-$target=Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.2'
+$target=Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.3'
 $legacyDir=Join-Path $env:LOCALAPPDATA 'Programs\RIUM Keys'
 $legacyExe=Join-Path $legacyDir 'RiumKeys.exe'
 $legacyUninstaller=Join-Path $legacyDir 'Uninstall.exe'
@@ -106,7 +106,7 @@ try {
     if($run){throw 'Legacy startup registration remains.'}
     Save-State 'Installed'
     Get-Content -LiteralPath (Join-Path $target 'install-result.log')
-    "INSTALLED: RIUM Keys 2.0.0-preview.2; native profile selected; legacy utility removed. Recovery: $statePath"
+    "INSTALLED: RIUM Keys 2.0.0-preview.3; native profile selected; legacy utility removed. Recovery: $statePath"
 } catch {
     $failure=$_
     if($commitRequested -and !$committed -and $machine -and !$machine.HasExited){

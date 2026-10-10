@@ -38,8 +38,8 @@ int main(void) {
     check(Fsm_Backspace(&fsm, &preedit) && preedit == L'\u314e', "backspace vowel");
     check(Fsm_Backspace(&fsm, &preedit) && !preedit, "backspace initial");
     check(!Fsm_Backspace(&fsm, &preedit), "empty backspace belongs to application");
-    check(JamoPath_Decide(0, JAMO_TS_SS_TRANSITORY, 1, 1, 0) == JAMO_PATH_COMMIT,
-          "legacy CUAS context uses commit path");
+    check(JamoPath_Decide(0, JAMO_TS_SS_TRANSITORY, 1, 1, 0) == JAMO_PATH_STANDARD,
+          "CUAS context uses inline composition with interim selection");
     check(JamoPath_Decide(0, 0, 1, 1, 0) == JAMO_PATH_STANDARD,
           "native TSF context uses inline path");
     check(!Trans_PendingMatches((void*)1, NULL, (void*)2, (void*)3),

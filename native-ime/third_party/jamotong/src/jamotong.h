@@ -108,6 +108,8 @@ typedef struct JamotongTextService {
     int  pathKind;                  // JamoPathKind (pPathContext에 대한 판정)
     int  pathDemerits;              // 갱신 생존 없는 연속 외부 종료 카운트 (강등용)
     BOOL compUpdatedOnce;           // 현 composition이 갱신에서 생존했는가 (강등 리셋 근거)
+    BOOL compFinalizePending;       // A captured finalize session owns the pending boundary.
+    BOOL compBoundaryWritten;       // Space is in the document; only finalization may retry.
 
     // 무간섭(직접 입력) 모드 — 원격 데스크톱 등에서 해제 단축키 외 모든 키를 통과.
     // TIP 인스턴스는 프로세스별이므로 상태의 원본은 HKCU 레지스트리이고(프로세스 간 공유),

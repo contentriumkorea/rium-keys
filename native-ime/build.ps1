@@ -1,6 +1,7 @@
 param(
     [ValidateSet('x64','x86')][string]$Architecture = 'x64',
     [switch]$Installable,
+    [switch]$Diagnostic,
     [string]$Toolchain = (Join-Path $PSScriptRoot '..\upstream-research\toolchain\llvm-mingw-20261006-ucrt-x86_64'),
     [string]$SourceRoot = (Join-Path $PSScriptRoot 'third_party\jamotong')
 )
@@ -25,6 +26,10 @@ if ($LASTEXITCODE) { throw 'IME resource compilation failed.' }
 $baseArgs = @('-Wall','-Wextra','-std=c2x','-D_UNICODE','-DUNICODE','-O2',
     '-include', (Join-Path $PSScriptRoot 'win32-compat.h'))
 if($Installable){$baseArgs+='-DRIUM_INSTALLABLE'}else{$baseArgs+='-DRIUM_FIXTURE_ONLY'}
+if($Diagnostic){
+    if($Installable){throw 'Text diagnostics are restricted to isolated fixture builds.'}
+    $baseArgs+='-DJAMO_DIAG'
+}
 $argsDll = $baseArgs + @('-o',$dll) + $sources + @((Join-Path $SourceRoot 'src\jamotong.def'),$resource,
     '-shared','-static','-s','-lole32','-loleaut32','-luuid','-luiautomationcore',
     '-lcomctl32','-lcomdlg32','-lgdi32','-limm32','-ladvapi32')
@@ -42,4 +47,9 @@ $engineArgs = $baseArgs + @('-I',(Join-Path $SourceRoot 'src'),
     @('-o',(Join-Path $output 'EngineTests.exe'),'-static')
 & $compiler @engineArgs
 if ($LASTEXITCODE) { throw 'Engine test compilation failed.' }
+$inlineArgs = $baseArgs + @('-I',(Join-Path $SourceRoot 'src'),
+    (Join-Path $PSScriptRoot 'inline-tests.c')) + $engineSources +
+    @('-o',(Join-Path $output 'InlineTests.exe'),'-static','-lole32','-loleaut32','-luuid')
+& $compiler @inlineArgs
+if ($LASTEXITCODE) { throw 'Inline composition test compilation failed.' }
 Write-Output "Built $dll (local preview; Installable=$Installable; not registered by build)."
