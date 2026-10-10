@@ -64,6 +64,11 @@ neither is silently substituted for the requested automatic design. Production
 1.1.1 remains unchanged while this feasibility gate is open.
 
 References:
+- Cross-language research and framework-state experiments:
+  [research findings](cross-language-shortcut-research.md). Existing framework
+  contracts are a new integration route; no vendor inquiry is required to inspect
+  publicly available contracts. A positive global editing counter is not yet
+  proof of current-window ownership or a production routing fix.
 - https://github.com/rubidus-api/jamotong_ime
 - https://learn.microsoft.com/en-us/windows/apps/develop/input/input-method-editor-requirements
 - https://learn.microsoft.com/en-us/windows/win32/tsf/predefined-compartments

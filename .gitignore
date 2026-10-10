@@ -35,6 +35,7 @@
 !docs/
 !docs/system-input-design.md
 !docs/gureum-input-routing-analysis.md
+!docs/cross-language-shortcut-research.md
 !input-core/
 !input-core/*.h
 !input-core/*.cpp
@@ -60,6 +61,13 @@ upstream-research/
 !native-ime/experiments/focus-contract/*.h
 !native-ime/experiments/focus-contract/*.ps1
 !native-ime/experiments/focus-contract/README.md
+!native-ime/experiments/framework-input-state/
+!native-ime/experiments/framework-input-state/*.c
+!native-ime/experiments/framework-input-state/*.cpp
+!native-ime/experiments/framework-input-state/*.h
+!native-ime/experiments/framework-input-state/*.ps1
+!native-ime/experiments/framework-input-state/*.py
+!native-ime/experiments/framework-input-state/README.md
 !native-ime/third_party/
 !native-ime/third_party/jamotong/
 !native-ime/third_party/jamotong/LICENSE
