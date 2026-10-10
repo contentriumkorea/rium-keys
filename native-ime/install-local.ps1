@@ -4,7 +4,7 @@ $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.Window
 if($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Start installation from the ordinary user session.'}
 $package=Join-Path $PSScriptRoot 'out\local-package'
 $control=Join-Path $package 'x64\RiumKeysControl.exe'
-$target=Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.1'
+$target=Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.2'
 $legacyDir=Join-Path $env:LOCALAPPDATA 'Programs\RIUM Keys'
 $legacyExe=Join-Path $legacyDir 'RiumKeys.exe'
 $legacyUninstaller=Join-Path $legacyDir 'Uninstall.exe'
@@ -49,6 +49,15 @@ $commit=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::Manu
 $machine=$null;$fixture=$null;$enabled=$false;$selected=$false;$committed=$false;$commitRequested=$false
 $wasRunning=@(Get-Process RiumKeys -ErrorAction SilentlyContinue).Count -gt 0
 try {
+    $fixtureDir=Join-Path $recovery 'physical-test'
+    New-Item -ItemType Directory -Path $fixtureDir | Out-Null
+    Copy-Item -LiteralPath $fixtureSource -Destination (Join-Path $fixtureDir 'RiumInstalledSmoke.exe')
+    Copy-Item -LiteralPath (Join-Path $package 'x64\RiumKeysInput.dll') -Destination $fixtureDir
+    $launchInfo=[Diagnostics.ProcessStartInfo]::new((Join-Path $fixtureDir 'RiumInstalledSmoke.exe'),'--launch-check')
+    $launchInfo.UseShellExecute=$false;$launchInfo.CreateNoWindow=$true
+    $launchCheck=[Diagnostics.Process]::Start($launchInfo)
+    if(!$launchCheck.WaitForExit(5000)){Stop-Process -InputObject $launchCheck;throw 'Fixture launch check timed out.'}
+    if($launchCheck.ExitCode -ne 0){throw 'Fixture must launch under the ordinary user token.'}
     if($wasRunning){
         $stop=Start-Process -FilePath $legacyExe -ArgumentList '--exit' -WindowStyle Hidden -PassThru
         if(!$stop.WaitForExit(10000)){throw 'Legacy exit request timed out.'}
@@ -68,10 +77,6 @@ try {
     New-Item -Path 'HKCU:\Software\Contentrium\RiumKeysInput' -Force | Out-Null
     Set-ItemProperty 'HKCU:\Software\Contentrium\RiumKeysInput' -Name InstallState -Value $statePath
     Save-State 'AwaitingPhysicalTest'
-    $fixtureDir=Join-Path $recovery 'physical-test'
-    New-Item -ItemType Directory -Path $fixtureDir | Out-Null
-    Copy-Item -LiteralPath $fixtureSource -Destination (Join-Path $fixtureDir 'RiumInstalledSmoke.exe')
-    Copy-Item -LiteralPath (Join-Path $package 'x64\RiumKeysInput.dll') -Destination $fixtureDir
     # A different basename proves the registered installable DLL can activate
     # outside the guarded RiumImeFixture process. COM resolves the installed DLL.
     $fixture=Start-Process -FilePath (Join-Path $fixtureDir 'RiumInstalledSmoke.exe') -ArgumentList '--native-fixture' -WindowStyle Hidden -PassThru
@@ -101,7 +106,7 @@ try {
     if($run){throw 'Legacy startup registration remains.'}
     Save-State 'Installed'
     Get-Content -LiteralPath (Join-Path $target 'install-result.log')
-    "INSTALLED: RIUM Keys 2.0.0-preview.1; native profile selected; legacy utility removed. Recovery: $statePath"
+    "INSTALLED: RIUM Keys 2.0.0-preview.2; native profile selected; legacy utility removed. Recovery: $statePath"
 } catch {
     $failure=$_
     if($commitRequested -and !$committed -and $machine -and !$machine.HasExited){
@@ -111,13 +116,15 @@ try {
     if(!$committed -and !($commitRequested -and $machine.ExitCode -eq 0)){
         $rollbackErrors=@()
         if($fixture -and !$fixture.HasExited){Stop-Process -InputObject $fixture;if(!$fixture.WaitForExit(5000)){throw 'Fixture shutdown not confirmed; inspect the pending installation.'}}
-        if($selected){& $control --restore $before.defaultTip $before.activeTip;if($LASTEXITCODE){$rollbackErrors+='Previous default/active profile restoration failed.'}}
+        # Enabling a profile can change selection before the explicit select step.
+        if($enabled -or $selected){& $control --restore $before.defaultTip $before.activeTip;if($LASTEXITCODE){$rollbackErrors+='Previous default/active profile restoration failed.'}}
         if($enabled){& $control --disable;if($LASTEXITCODE){$rollbackErrors+='User profile disable failed.'}}
         [void]$done.Set()
         if($machine -and !$machine.WaitForExit(45000)){$rollbackErrors+='Machine rollback is still pending.'}
         $afterText=& $control --status
         if($LASTEXITCODE){$rollbackErrors+='Cannot verify rollback state.'}else{
             $after=$afterText | ConvertFrom-Json
+            $after | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $recovery 'rollback-readback.json') -Encoding UTF8
             if($after.registered -or $after.enabled -or $after.categories -ne 0 -or $after.defaultTip -ne $before.defaultTip -or $after.activeTip -ne $before.activeTip){$rollbackErrors+='Input profile rollback readback mismatch.'}
         }
         try {Assert-NativeRegistryAbsent}catch{$rollbackErrors+=$_.Exception.Message}

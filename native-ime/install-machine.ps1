@@ -1,6 +1,6 @@
 param([ValidateSet('Install','Uninstall')][string]$Operation='Install',[string]$Transaction)
 $ErrorActionPreference='Stop'
-$version='2.0.0-preview.1'
+$version='2.0.0-preview.2'
 $root=[IO.Path]::GetFullPath((Join-Path $env:ProgramFiles "RIUM Keys\$version"))
 $class='Software\Classes\CLSID\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}'
 $tip='Software\Microsoft\CTF\TIP\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}'
@@ -40,7 +40,7 @@ function Remove-Registration {
     try {$base.DeleteSubKeyTree($uninstall,$false)}finally{$base.Dispose()}
 }
 if($Operation -eq 'Uninstall'){
-    $expected=[IO.Path]::GetFullPath((Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.1'))
+    $expected=[IO.Path]::GetFullPath((Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.2'))
     if($root -ne $expected -or [IO.Path]::GetFullPath($PSScriptRoot) -ne $expected){throw 'Uninstall must run from its installed version directory.'}
     Start-Transcript -Path (Join-Path $root 'uninstall-result.log') -Force | Out-Null
     try {

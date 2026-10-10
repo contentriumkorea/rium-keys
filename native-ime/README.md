@@ -27,8 +27,10 @@ updater. All-application and Adobe compatibility remain unverified.
   in the production installer/updater by the build scripts.
 - User data uses `%APPDATA%\RIUM Keys` and
   `HKCU\Software\Contentrium\RiumKeysInput`, separate from upstream Jamotong.
-  The preview starts in Korean, disables the upstream UI helper and extra
-  command shortcuts, and exposes only input controls in the Windows input indicator.
+  The preview initializes its configuration to Korean, disables the upstream UI
+  helper and extra command shortcuts, and exposes only input controls in the
+  Windows input indicator. The actual initial Windows mode can still be English;
+  initial mode synchronization remains a release gate (see the installed test below).
 - `win32-compat.h` supplies three official WinUser accessibility constants absent
   from the pinned compiler headers. No original Korean composition algorithm
   changes were needed for these tests.
@@ -113,8 +115,9 @@ editable or non-editable. This fork does not claim to solve that ambiguity.
 
 Before a production release: verify actual Premiere/After Effects context
 transitions, Korean input in modern and legacy hosts, original shortcut delivery,
-composition focus-loss lifetime, settings/registry isolation, tray-only controls,
-versioned DLL installation, rollback, and signed automatic-update migration.
+initial mode synchronization, composition focus-loss lifetime, settings/registry
+isolation, tray-only controls, uninstall/rollback behavior, and signed
+automatic-update migration.
 The preview does not bundle Hanja dictionaries or enable upstream auxiliary
 commands. Automatic-update migration and complete application testing are
 required before replacing the public release.
@@ -126,6 +129,7 @@ required before replacing the public release.
 ./native-ime/build.ps1 -Architecture x86 -Installable
 ./native-ime/build-control.ps1
 ./native-ime/build-fixture.ps1
+./native-ime/test-fixture-launch.ps1
 ./native-ime/prepare-package.ps1
 ./native-ime/install-local.ps1 -Preflight
 ./native-ime/install-local.ps1
@@ -139,7 +143,7 @@ migration, an ordinary-user test process with a different filename must pass
 the physical Korean / V / Korean test using the registered installed DLL.
 Only then is RIUM selected and the old utility removed with its own uninstaller.
 
-The preview is installed under `C:\Program Files\RIUM Keys\2.0.0-preview.1`.
+The preview is installed under `C:\Program Files\RIUM Keys\2.0.0-preview.2`.
 Windows loads it when selected; there is no legacy keyboard hook, UIA worker or
 login executable. Microsoft IME remains available. The Windows installed-apps
 entry provides removal and restoration of the captured previous input method.
@@ -152,13 +156,38 @@ input configurations it cannot snapshot faithfully. It is a first-install
 preview, not an upgrade mechanism. An interrupted commit is reported as unknown
 instead of being labeled rolled back.
 
-Local attempt on 2026-10-10: Windows administrator approval was cancelled before
-the machine worker started, including one retry. The installer recorded
-`FailedRolledBack`; a fresh readback confirmed Microsoft Korean remained the
-default/active profile, no fork COM/TIP/uninstall keys existed in either registry
-view, no native version directory existed, and the installed 1.1.1 utility was
-running again. Native installation and the installed-DLL physical test remain
-pending; the build/test results above do not establish installation success.
+### Verified local installation on 2026-10-10
+
+`2.0.0-preview.2` was installed and selected as the user's default/active keyboard
+profile. Fresh verification confirmed enabled registration and six categories,
+x64/x86 COM paths, all seven packaged file hashes, the Windows installed-apps
+entry, and the `Installed` transaction state. The 1.1.1 utility's executable,
+processes, uninstall entry and startup value were absent after its own uninstaller
+finished. The public release remains 1.1.1.
+
+The ordinary-user `RiumInstalledSmoke.exe` process was confirmed to load the x64
+DLL from Program Files. Its physical test passed: exact `한글 `, original V
+keydown/up while the RIUM profile and Korean mode were retained, then exact
+`한글 한글 ` after returning to the EDIT without another language toggle. The
+fixture restored its previous process-local profile and exited with code 0.
+The first input initially produced Latin letters; **one Right Alt Korean toggle
+was needed before the passing sequence**. This test does not prove initial mode
+synchronization, cross-process transitions or Adobe compatibility.
+
+Before this success, two UAC attempts were cancelled before registration. A later
+preview.1 attempt registered successfully but Windows treated the renamed test
+executable as requiring elevation because its manifest was absent. Its profile
+was removed and a fresh readback confirmed the original input state. The fixture
+now embeds `asInvoker`/`uiAccess=false`, and a regression test verifies that a
+renamed copy launches with an unelevated token before COM or registration work.
+Both x64 and x86 launch tests pass. Installation checks that staged executable
+before stopping the old utility or opening UAC. Preview.1's failed-attempt files
+are retained as recovery evidence; they are not registered or loaded by the new
+COM paths. Preview.2 uses its own directory, without overwriting those DLLs.
+
+The local verification report is generated under
+`native-ime/out/installed-verification.json` (ignored). The physical test log SHA-256
+is `8F36B9FA9E5C7DB7DBB9AC8A6E5A1C5AF7742DED7EE2201B01A6B0EF0C59E1A8`.
 
 API references: [profile activation](https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-activateprofile),
 [user profile enablement](https://learn.microsoft.com/en-us/windows/win32/tsf/installlayoutortip),

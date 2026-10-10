@@ -340,6 +340,14 @@ static void ExternalRegistrationTest(){
 #include "../native-ime/Fixture.h"
 #endif
 int wmain(int argc,wchar_t** argv){
+#ifdef RIUM_REUSED_ENGINE
+    if(argc==2&&wcscmp(argv[1],L"--launch-check")==0){
+        HANDLE token=nullptr;TOKEN_ELEVATION elevation{};DWORD bytes=0;
+        if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))return 4;
+        BOOL read=GetTokenInformation(token,TokenElevation,&elevation,sizeof(elevation),&bytes);
+        CloseHandle(token);return read&&!elevation.TokenIsElevated?0:4;
+    }
+#endif
     if(argc==2&&(wcscmp(argv[1],L"--registration-test")==0||wcscmp(argv[1],L"--registered-fixture")==0||wcscmp(argv[1],L"--interactive-fixture")==0||wcscmp(argv[1],L"--native-fixture")==0||wcscmp(argv[1],L"--registration-external-test")==0)){
         auto log=DllPath();log.resize(log.find_last_of(L'\\')+1);log+=(wcscmp(argv[1],L"--registered-fixture")==0||wcscmp(argv[1],L"--interactive-fixture")==0||wcscmp(argv[1],L"--native-fixture")==0)?L"fixture-result.log":L"registration-result.log";
         diagnosticOutput=_wfsopen(log.c_str(),L"w",_SH_DENYWR);if(!diagnosticOutput)return 3;

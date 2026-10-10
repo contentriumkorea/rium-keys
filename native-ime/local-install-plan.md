@@ -29,21 +29,32 @@ preview through the production updater. The preview has no automatic updater.
 - [x] Build fixture and installable x64/x86 outputs; run engine/routing tests.
 - [x] Add native profile control and bounded transactional install/uninstall
   scripts. Verify read-only preflight, both registry views and profile identity.
-- [ ] Review before elevation. Install locally, verify default/active profile,
+- [x] Review before elevation. Install locally, verify default/active profile,
   both DLL hashes, old-process/startup/uninstall removal and new uninstall entry.
-- [ ] Exercise the installed DLL through an isolated native control fixture.
+- [x] Exercise the installed DLL through an isolated native control fixture.
   Do not claim Adobe or all-app compatibility from this result.
 
 Failure focus: wrong user after elevation; second-architecture failure; locked
 DLLs; partial legacy uninstall; user profile selection failure. All must fail
 visibly with recovery information rather than reporting completion.
 
-2026-10-10 outcome: code review found no remaining concrete installation blocker.
-Both guarded and installable x64/x86 builds passed 26 engine and 42 routing/policy
-checks per build. Two UAC attempts were cancelled before machine registration.
-Rollback readback confirmed no native registration or version directory, the
-original Microsoft default/active profile, and the legacy 1.1.1 utility running.
-The actual installation/installed-DLL physical verification items stay open.
+2026-10-10 outcome: `2.0.0-preview.2` installation and removal of the legacy
+utility completed. Fresh verification confirmed the default/active native
+profile, six categories, enabled state, both COM architectures, all package
+hashes, installed-apps entry and `Installed` transaction status. The installed
+x64 DLL passed the physical EDIT / V / EDIT test. One initial Right Alt toggle
+was necessary to enter Korean; the subsequent transition retained Korean without
+another toggle. Initial mode synchronization and all-app/Adobe compatibility
+remain unverified release gates.
+
+Before installation, the original renamed fixture reproduced Windows error 740.
+Its missing embedded manifest was corrected with `asInvoker`/`uiAccess=false`;
+real launch/unelevated-token regression tests pass for x64/x86. Staged launch is
+now checked before elevation. Rollback restores the original profiles after an
+enable attempt too and records the readback. The preview.1 failed-attempt files
+are retained; preview.2 uses a separate version directory. Fresh preview.2 x64/x86
+builds each passed 26 engine and 42 routing/policy checks, and the changes passed
+source review and PowerShell syntax checks.
 
 References: Microsoft ITfInputProcessorProfileMgr::ActivateProfile,
 InstallLayoutOrTip and SetDefaultLayoutOrTip documentation.
