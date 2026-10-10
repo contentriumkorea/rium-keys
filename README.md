@@ -1,5 +1,7 @@
 # RIUM Keys
 
+이 개발 브랜치에는 Windows 입력기로 전환하는 **2.0.0-preview.1**이 포함되어 있습니다. [로컬 입력기 설치와 검증 상태](native-ime/README.md)를 참고하세요. 새 입력기의 모든 앱 호환성과 자동 업데이트는 아직 검증·구현이 완료되지 않았습니다. 아래 설명과 공개 다운로드는 기존 **1.1.1 트레이 유틸리티** 기준입니다.
+
 한글 입력 상태를 유지하면서 PC 전반의 인식 가능한 비텍스트 영역에서 단축키를 전달하는 Windows 트레이 유틸리티입니다.
 
 [설치 파일 다운로드](https://github.com/contentriumkorea/rium-keys/releases/latest/download/RIUM-Keys-Setup.exe)

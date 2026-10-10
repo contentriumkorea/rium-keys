@@ -13,7 +13,7 @@ CRITICAL_SECTION g_configLock;   // live config 접근 직렬화 (입력 스레�
 static const WCHAR c_szInfoKeyPrefix[] = L"CLSID\\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}";
 static const WCHAR c_szInprocServer32[] = L"InprocServer32";
 static const WCHAR c_szModelName[] = L"Apartment";
-static const WCHAR c_szDescription[] = L"RIUM Keys Input (development)";
+static const WCHAR c_szDescription[] = L"RIUM Keys";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {

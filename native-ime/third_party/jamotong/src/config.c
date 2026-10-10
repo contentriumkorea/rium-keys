@@ -364,7 +364,7 @@ bool Config_UserPath(wchar_t *out, int cch) {
     DWORD n = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return false;
     wchar_t dir[MAX_PATH];
-    _snwprintf(dir, MAX_PATH, L"%ls\\Jamotong", appdata);
+    _snwprintf(dir, MAX_PATH, L"%ls\\RIUM Keys", appdata);
     dir[MAX_PATH - 1] = L'\0';   // _snwprintf 잘림 시 널 종료 보장
     CreateDirectoryW(dir, NULL);   // 이미 있으면 조용히 실패(무시)
     Config_GrantAppContainerRead(dir);    // UWP 호스트도 설정을 읽을 수 있게 (위 주석)
@@ -381,7 +381,7 @@ bool Config_UserLayoutDir(wchar_t *out, int cch) {
     DWORD n = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return false;
     wchar_t dir[MAX_PATH];
-    _snwprintf(dir, MAX_PATH, L"%ls\\Jamotong", appdata);
+    _snwprintf(dir, MAX_PATH, L"%ls\\RIUM Keys", appdata);
     dir[MAX_PATH - 1] = L'\0';
     CreateDirectoryW(dir, NULL);
     Config_GrantAppContainerRead(dir);
@@ -420,7 +420,7 @@ bool Config_UserDictDir(wchar_t *out, int cch) {
     DWORD n = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return false;
     wchar_t dir[MAX_PATH];
-    _snwprintf(dir, MAX_PATH, L"%ls\\Jamotong", appdata);
+    _snwprintf(dir, MAX_PATH, L"%ls\\RIUM Keys", appdata);
     dir[MAX_PATH - 1] = L'\0';
     CreateDirectoryW(dir, NULL);
     Config_GrantAppContainerRead(dir);
@@ -436,7 +436,7 @@ bool Config_MachineLayoutDir(wchar_t *out, int cch) {
     wchar_t base[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"PROGRAMDATA", base, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return false;
-    _snwprintf(out, cch, L"%ls\\Jamotong\\layouts", base);
+    _snwprintf(out, cch, L"%ls\\RIUM Keys\\layouts", base);
     out[cch - 1] = L'\0';
     return true;
 }
@@ -446,7 +446,7 @@ bool Config_MachineDictDir(wchar_t *out, int cch) {
     wchar_t base[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"PROGRAMDATA", base, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return false;
-    _snwprintf(out, cch, L"%ls\\Jamotong\\dicts", base);
+    _snwprintf(out, cch, L"%ls\\RIUM Keys\\dicts", base);
     out[cch - 1] = L'\0';
     return true;
 }

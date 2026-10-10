@@ -91,6 +91,14 @@ int wmain(int argc, wchar_t **argv) {
     if (FAILED(hr)) return 2;
     tip->lpVtbl->QueryInterface(tip, &IID_ITfKeyEventSink, (void**)&sink);
     JamotongTextService *service = (JamotongTextService*)tip;
+    check(service->config.layouts[service->config.currentLayoutIndex].type == LAYOUT_TYPE_KOREAN_FSM,
+          "a newly selected RIUM input method starts in Korean mode");
+    check(!service->config.options.useUiHelper, "RIUM does not launch the upstream helper");
+    check(service->config.shortcuts[SC_FN_SETTINGS].count == 0, "RIUM leaves the settings shortcut to applications");
+    check(service->config.shortcuts[SC_FN_CODE].count == 0, "RIUM leaves the code shortcut to applications");
+    check(service->config.shortcuts[SC_FN_PASSTHROUGH].count == 0, "RIUM leaves the bypass shortcut to applications");
+    check(service->config.shortcuts[SC_FN_ROTATE].count == 2,
+          "only Hangul and right Alt switch input; Shift Space belongs to applications");
     service->config.options.useUiHelper = false;
     int korean = -1;
     for (int i = 0; i < service->config.layoutCount; ++i)
@@ -132,7 +140,11 @@ int wmain(int argc, wchar_t **argv) {
           "key down rechecks changed context after preview");
     set_flag(mgr,client,&GUID_COMPARTMENT_EMPTYCONTEXT,0);
     HRESULT outsideFixture = tip->lpVtbl->Activate(tip, thread, client);
+#ifdef RIUM_INSTALLABLE
+    check(outsideFixture != E_ACCESSDENIED, "installable DLL is not restricted to a fixture basename");
+#else
     check(outsideFixture == E_ACCESSDENIED, "development DLL cannot activate in another application");
+#endif
     if(SUCCEEDED(outsideFixture))tip->lpVtbl->Deactivate(tip);
 
     if (argc == 3 && wcscmp(argv[2], L"--manual-activation") == 0) {

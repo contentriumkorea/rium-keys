@@ -1,8 +1,9 @@
 # RIUM Keys native input engine — development
 
-This is the Jamotong-based replacement candidate. It is **not installed as the
-system input method and is not included in the production updater**. Production
-1.1.1 remains the existing tray helper.
+This is the Jamotong-based replacement candidate. The production updater still
+distributes the 1.1.1 tray helper. An explicitly requested **local preview
+installation** is available below; it is not a public release and has no automatic
+updater. All-application and Adobe compatibility remain unverified.
 
 ## Reuse and local changes
 
@@ -20,9 +21,14 @@ system input method and is not included in the production updater**. Production
   and actual keydown. Null, disconnected, read-only, disabled, empty, failed,
   and malformed restriction states pass the original key. Absent optional
   compartments remain compatible with existing text controls.
-- The fork has separate service/profile identities, and `RIUM_FIXTURE_ONLY`
-  rejects activation outside `RiumImeFixture.exe`. Removing this restriction
-  requires the release gates below, not a build switch in the shipping installer.
+- The fork has separate service/profile identities. Default fixture builds use
+  `RIUM_FIXTURE_ONLY` and reject activation outside `RiumImeFixture.exe`.
+  `-Installable` produces a separate local-preview output; it is never included
+  in the production installer/updater by the build scripts.
+- User data uses `%APPDATA%\RIUM Keys` and
+  `HKCU\Software\Contentrium\RiumKeysInput`, separate from upstream Jamotong.
+  The preview starts in Korean, disables the upstream UI helper and extra
+  command shortcuts, and exposes only input controls in the Windows input indicator.
 - `win32-compat.h` supplies three official WinUser accessibility constants absent
   from the pinned compiler headers. No original Korean composition algorithm
   changes were needed for these tests.
@@ -54,7 +60,7 @@ Test results on this PC:
 - Original key sink: six failing routing cases (null, changed disabled value,
   empty, read-only, disconnected, stale cache). The added failure-injection
   suite also reproduced four compartment error/type failures before the fix.
-- Current x64 and x86: 26 reused-engine checks + 36 routing/activation-guard checks pass in each
+- Current x64 and x86: 26 reused-engine checks + 42 routing/policy checks pass in each
   architecture. Routing tests exercise the real DLL with controlled contexts;
   they are not physical keyboard or all-application compatibility tests.
 - Manual TIP activation using an ordinary application client ID returned
@@ -109,5 +115,43 @@ Before a production release: verify actual Premiere/After Effects context
 transitions, Korean input in modern and legacy hosts, original shortcut delivery,
 composition focus-loss lifetime, settings/registry isolation, tray-only controls,
 versioned DLL installation, rollback, and signed automatic-update migration.
-The upstream configuration windows, preserved shortcuts, registry paths, and
-helper process are not yet adapted for RIUM's product behavior.
+The preview does not bundle Hanja dictionaries or enable upstream auxiliary
+commands. Automatic-update migration and complete application testing are
+required before replacing the public release.
+
+## Explicit local preview installation
+
+```powershell
+./native-ime/build.ps1 -Architecture x64 -Installable
+./native-ime/build.ps1 -Architecture x86 -Installable
+./native-ime/build-control.ps1
+./native-ime/build-fixture.ps1
+./native-ime/prepare-package.ps1
+./native-ime/install-local.ps1 -Preflight
+./native-ime/install-local.ps1
+```
+
+The ordinary-user installer saves the current default and active input profiles,
+copies the legacy utility into a recovery directory, stops its processes, and
+requests one Windows administrator confirmation. The elevated worker installs
+versioned x64/x86 DLLs and registers the native profile. Before committing the
+migration, an ordinary-user test process with a different filename must pass
+the physical Korean / V / Korean test using the registered installed DLL.
+Only then is RIUM selected and the old utility removed with its own uninstaller.
+
+The preview is installed under `C:\Program Files\RIUM Keys\2.0.0-preview.1`.
+Windows loads it when selected; there is no legacy keyboard hook, UIA worker or
+login executable. Microsoft IME remains available. The Windows installed-apps
+entry provides removal and restoration of the captured previous input method.
+Loaded DLL files may remain until the hosting applications exit; the uninstaller
+does not terminate user applications. Recovery state is stored under
+`%LOCALAPPDATA%\Contentrium\RIUM Keys\Recovery`.
+
+This installer refuses an existing native registration/version directory and
+input configurations it cannot snapshot faithfully. It is a first-install
+preview, not an upgrade mechanism. An interrupted commit is reported as unknown
+instead of being labeled rolled back.
+
+API references: [profile activation](https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-activateprofile),
+[user profile enablement](https://learn.microsoft.com/en-us/windows/win32/tsf/installlayoutortip),
+[default input selection](https://learn.microsoft.com/en-us/windows/win32/tsf/setdefaultlayoutortip).

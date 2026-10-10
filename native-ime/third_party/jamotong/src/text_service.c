@@ -17,6 +17,7 @@
 #include "ui_ipc.h"    // RFC-0012 Phase 3 UI element 게이트
 #include "transition.h" // RFC-0008 W1-09 조합 경계 전환 정책
 #include "hanja_txn.h"  // RFC-0008 W1-02 한자 변환 트랜잭션 정책
+#include "../../../rium-policy.h"
 static void Jamotong_ChordTimerCancel(JamotongTextService *obj);   // 3판 조합 판정 타이머 (RFC-0016 §7.1)
 // ITfTextInputProcessorEx IID (SDK msctf.idl + windows-sys 이중 확인 — RFC-0013 A)
 static const GUID kIID_ITfTextInputProcessorEx = { 0x6e4e2102, 0xf9cd, 0x433d, { 0xb4, 0x96, 0x30, 0x3c, 0xe0, 0x3a, 0x65, 0x07 } };
@@ -25,7 +26,7 @@ extern HINSTANCE g_hInst;   // dllmain.c — DLL 모듈 핸들(사전 경로·�
 // 무간섭(직접 입력) 모드 상태의 원본 — TIP 인스턴스는 프로세스별이라 레지스트리로 공유한다.
 BOOL Jamotong_GetPassthroughReg(void) {
     DWORD v = 0, cb = sizeof(v);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Jamotong", L"Passthrough",
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Contentrium\\RiumKeysInput", L"Passthrough",
                      RRF_RT_REG_DWORD, NULL, &v, &cb) != ERROR_SUCCESS)
         return FALSE;
     return v != 0;
@@ -33,7 +34,7 @@ BOOL Jamotong_GetPassthroughReg(void) {
 
 static void WritePassthroughReg(BOOL on) {
     HKEY hk;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Jamotong", 0, NULL, 0, KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS) {
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Contentrium\\RiumKeysInput", 0, NULL, 0, KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS) {
         DWORD v = on ? 1u : 0u;
         RegSetValueExW(hk, L"Passthrough", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
         RegCloseKey(hk);
@@ -2459,7 +2460,7 @@ static HRESULT TIP_ActivateCommon(ITfTextInputProcessor *pThis, ITfThreadMgr *pt
     }
     Preserved_Register(obj);   // 문맥 무관 명령키 예약 (RFC-0013 C; 불가/실패 항목은 sink 폴백)
     AdviseThreadMgrEventSink(obj);   // 문서 포커스/편집 싱크 부착 (CUAS 조합유지 목적)
-    FuncConfig_Advise(obj);   // 설정 "옵션"(ITfFunctionProvider) in-session 노출
+    // RIUM controls live in the input-indicator menu, with no settings window.
 
     obj->daAtom = DA_RegisterAtom(ptim);   // composition display-attribute atom (per thread)
     obj->passthrough = Jamotong_GetPassthroughReg();   // 무간섭 모드 초기 상태 (프로세스 간 공유)
@@ -2583,6 +2584,7 @@ HRESULT JamotongTextService_Create(IUnknown *pUnkOuter, REFIID riid, void **ppvO
         wchar_t cfgPath[MAX_PATH];
         if (Config_UserPath(cfgPath, MAX_PATH)) Config_LoadFromFile(&obj->config, cfgPath);
     }
+    Rium_ApplyPolicy(&obj->config);
     Fsm_Init(&obj->fsm);
     Chord_Init(&obj->chord);
     ChordKb_Init(&obj->chordKb);

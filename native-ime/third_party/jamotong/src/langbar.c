@@ -93,7 +93,7 @@ static HRESULT STDMETHODCALLTYPE LBI_GetInfo(ITfLangBarItemButton *pThis,
     // GUID_LBI_INPUTMODE_J above; SHOWNINTRAY alone is not a visibility guarantee.
     pInfo->dwStyle = TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_SHOWNINTRAY;
     pInfo->ulSort = 0;
-    lstrcpyW(pInfo->szDescription, L"Jamotong Layout");
+    lstrcpyW(pInfo->szDescription, L"RIUM Keys");
     return S_OK;
 }
 
@@ -114,7 +114,7 @@ static HRESULT STDMETHODCALLTYPE LBI_GetTooltipString(ITfLangBarItemButton *pThi
                                                       BSTR *pbstrToolTip) {
     (void)pThis;
     if (!pbstrToolTip) return E_INVALIDARG;
-    *pbstrToolTip = SysAllocString(L"Jamotong IME");
+    *pbstrToolTip = SysAllocString(L"RIUM Keys");
     return *pbstrToolTip ? S_OK : E_OUTOFMEMORY;
 }
 
@@ -136,13 +136,11 @@ static HRESULT STDMETHODCALLTYPE LBI_OnClick(ITfLangBarItemButton *pThis, TfLBIC
         // InitMenu(ITfMenu)는 호출되지 않는다(BTN_MENU 전용) — Mozc와 동일 방식.
         HMENU menu = CreatePopupMenu();
         if (menu) {
-            AppendMenuW(menu, MF_STRING, 1, L"Settings...");
-            AppendMenuW(menu, MF_STRING, 2, L"Next layout");
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"RIUM Keys 2.0 Preview");
+            AppendMenuW(menu, MF_STRING, 2, L"한/영 전환");
             // 무간섭(직접 입력) 모드 — 원격 데스크톱 등에서 모든 키를 앱에 그대로 통과.
-            AppendMenuW(menu, MF_STRING | (obj->pService->passthrough ? MF_CHECKED : 0),
-                        4, L"Pass-through (direct input) mode");
-            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-            AppendMenuW(menu, MF_STRING, 3, L"About Jamotong IME...");
+            AppendMenuW(menu, MF_STRING | (!obj->pService->passthrough ? MF_CHECKED : 0),
+                        4, L"입력기 사용");
             POINT p = pt;
             HMONITOR mon = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);   // 가장자리 클램프
             if (mon) {
@@ -172,11 +170,10 @@ static HRESULT STDMETHODCALLTYPE LBI_InitMenu(ITfLangBarItemButton *pThis, void 
     ITfMenu *menu = (ITfMenu*)pMenu;
     if (menu) {
         JamotongLangBarItem *item = IMPL_LBI_BUTTON(pThis);
-        DWORD ptFlags = (item->pService && item->pService->passthrough) ? 0x1 /*TF_LBMENUF_CHECKED*/ : 0;
-        menu->lpVtbl->AddMenuItem(menu, 1, 0, NULL, NULL, L"Settings...", 11, NULL);
-        menu->lpVtbl->AddMenuItem(menu, 2, 0, NULL, NULL, L"Next layout", 11, NULL);
-        menu->lpVtbl->AddMenuItem(menu, 4, ptFlags, NULL, NULL, L"Pass-through (direct input) mode", 32, NULL);
-        menu->lpVtbl->AddMenuItem(menu, 3, 0, NULL, NULL, L"About Jamotong IME...", 21, NULL);
+        DWORD ptFlags = (item->pService && !item->pService->passthrough) ? 0x1 : 0;
+        const wchar_t *rotate = L"한/영 전환", *enable = L"입력기 사용";
+        menu->lpVtbl->AddMenuItem(menu, 2, 0, NULL, NULL, rotate, (ULONG)wcslen(rotate), NULL);
+        menu->lpVtbl->AddMenuItem(menu, 4, ptFlags, NULL, NULL, enable, (ULONG)wcslen(enable), NULL);
     }
     return S_OK;
 }
@@ -184,23 +181,11 @@ static HRESULT STDMETHODCALLTYPE LBI_InitMenu(ITfLangBarItemButton *pThis, void 
 // 메뉴 명령 실행 (우클릭 자체 팝업과 레거시 OnMenuSelect가 공유)
 static void ExecMenuCmd(JamotongLangBarItem *obj, UINT wID) {
     if (!obj->pService) return;
-    if (wID == 1) {
-        SettingsUI_Show(&obj->pService->config);   // 설정창 (별도 스레드)
-    } else if (wID == 2) {
+    if (wID == 2) {
         Jamotong_FlushForExternalSwitch(obj->pService);   // 조합 중 음절 확정 (실기 B-3: 클릭 전환은 확정을 안 했다)
         Config_RotateLayout(&obj->pService->config);   // 다음 자판
         LangBar_Update(obj);
         Compart_Publish(obj->pService);   // RFC-0012 Phase 1
-    } else if (wID == 3) {
-        extern HINSTANCE g_hInst;   // dllmain.c
-        wchar_t note[320], msg[512];
-        DiskVersion_StaleNote(g_hInst, L"this program", note, 320);
-        _snwprintf(msg, 512, L"Jamotong IME  " JAMOTONG_VERSION L"\n\n"
-            L"Pure-C Korean/Hangul IME (Text Services Framework).\n"
-            L"Left-click the tray icon to cycle layouts;\n"
-            L"right-click for this menu.%ls", note);
-        msg[511] = L'\0';
-        MessageBoxW(NULL, msg, L"About Jamotong IME", MB_OK | MB_TOPMOST | MB_SETFOREGROUND | MB_ICONINFORMATION);
     } else if (wID == 4) {
         // 무간섭(직접 입력) 모드 토글 — 원격 데스크톱 등. 상태는 레지스트리로 프로세스 간 공유.
         Jamotong_SetPassthrough(obj->pService, !obj->pService->passthrough);

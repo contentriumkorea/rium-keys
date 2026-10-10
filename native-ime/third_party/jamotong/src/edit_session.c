@@ -615,7 +615,7 @@ void UiGuard_CrossThread(const char *what, unsigned long owner, unsigned long me
     long n = ++s_hits;
     if ((n & (n - 1)) != 0) return;        // 1·2·4·8… 번째만 기록한다
     HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Jamotong", 0, NULL, 0,
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Contentrium\\RiumKeysInput", 0, NULL, 0,
                         KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) return;
     DWORD v = (DWORD)n;
     RegSetValueExW(k, L"UiCrossThread", 0, REG_DWORD, (const BYTE *)&v, sizeof v);

@@ -61,13 +61,12 @@ static ULONG STDMETHODCALLTYPE FC_Release(ITfFnConfigure *p) {
 }
 static HRESULT STDMETHODCALLTYPE FC_GetDisplayName(ITfFnConfigure *p, BSTR *pbstr) {
     (void)p; if (!pbstr) return E_INVALIDARG;
-    *pbstr = SysAllocString(L"Jamotong IME Settings"); return *pbstr ? S_OK : E_OUTOFMEMORY;
+    *pbstr = SysAllocString(L"RIUM Keys"); return *pbstr ? S_OK : E_OUTOFMEMORY;
 }
 static HRESULT STDMETHODCALLTYPE FC_Show(ITfFnConfigure *p, HWND hwndParent, LANGID langid, REFGUID rguidProfile) {
-    JamotongTextService *obj = IMPL_TO_OBJ(FnConfig, p);
+    (void)p;
     (void)hwndParent; (void)langid; (void)rguidProfile;
-    SettingsUI_Show(&obj->config);   // 설정창 (Apply 시 사용자 config 파일에 저장됨)
-    return S_OK;
+    return E_NOTIMPL; // RIUM has no separate configuration window.
 }
 static const ITfFnConfigureVtbl g_FnConfigVtbl = {
     FC_QueryInterface, FC_AddRef, FC_Release, FC_GetDisplayName, FC_Show

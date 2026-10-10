@@ -1,6 +1,6 @@
 #include "jamotong.h"
 
-static const WCHAR c_szProfileDesc[] = L"RIUM Keys Input (development)";
+static const WCHAR c_szProfileDesc[] = L"RIUM Keys";
 static const LANGID c_langIdKorean = MAKELANGID(LANG_KOREAN, SUBLANG_KOREAN);
 
 // 모던 Windows(Store/UWP 앱·시스템 트레이) 지원 카테고리. 이 MinGW의 msctf.h엔 없어 직접 정의한다.

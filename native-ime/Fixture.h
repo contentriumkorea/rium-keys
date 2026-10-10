@@ -37,7 +37,7 @@ static bool RestoreReusedProfile(ITfInputProcessorProfileMgr* profiles,const TF_
 static void ReusedEngineSession(){
     auto base=DllPath();base.resize(base.find_last_of(L'\\'));
     auto appdata=base+L"\\fixture-appdata";CreateDirectoryW(appdata.c_str(),nullptr);
-    auto configDir=appdata+L"\\Jamotong";CreateDirectoryW(configDir.c_str(),nullptr);
+    auto configDir=appdata+L"\\RIUM Keys";CreateDirectoryW(configDir.c_str(),nullptr);
     FILE* file=nullptr;_wfopen_s(&file,(configDir+L"\\config.ini").c_str(),L"w");Require(file!=nullptr,"create isolated fixture config");
     fputs("[Options]\nUseUiHelper=0\n",file);fclose(file);
     Require(SetEnvironmentVariableW(L"APPDATA",appdata.c_str())!=FALSE,"isolate fixture configuration");

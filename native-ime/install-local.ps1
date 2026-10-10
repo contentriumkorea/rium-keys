@@ -1,0 +1,129 @@
+param([switch]$Preflight)
+$ErrorActionPreference='Stop'
+$principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Start installation from the ordinary user session.'}
+$package=Join-Path $PSScriptRoot 'out\local-package'
+$control=Join-Path $package 'x64\RiumKeysControl.exe'
+$target=Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.1'
+$legacyDir=Join-Path $env:LOCALAPPDATA 'Programs\RIUM Keys'
+$legacyExe=Join-Path $legacyDir 'RiumKeys.exe'
+$legacyUninstaller=Join-Path $legacyDir 'Uninstall.exe'
+$fixtureSource=Join-Path $PSScriptRoot 'out\x64\RiumImeFixture.exe'
+function Assert-NativeRegistryAbsent {
+    foreach($view in @([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)){
+        $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
+        try {
+            foreach($path in @('Software\Classes\CLSID\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}','Software\Microsoft\CTF\TIP\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}','Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeysInput')){
+                $key=$base.OpenSubKey($path)
+                if($key){$key.Dispose();throw "Native registration remains: $view $path"}
+            }
+        }finally{$base.Dispose()}
+    }
+}
+Assert-NativeRegistryAbsent
+$manifest=Get-Content -LiteralPath (Join-Path $package 'manifest.json') -Raw | ConvertFrom-Json
+foreach($entry in $manifest){
+    if((Get-FileHash -LiteralPath (Join-Path $package $entry.Path) -Algorithm SHA256).Hash -ne $entry.Sha256){throw 'Package integrity check failed.'}
+}
+$beforeText=& $control --status
+if($LASTEXITCODE){throw 'Cannot read the current input profile.'}
+$before=$beforeText | ConvertFrom-Json
+if($before.registered -or $before.categories -ne 0 -or (Test-Path -LiteralPath $target)){throw 'An existing native installation or version directory needs inspection.'}
+if($before.koreanDefault -notmatch '^0x0412:\{[0-9A-Fa-f-]{36}\}\{[0-9A-Fa-f-]{36}\}$'){throw 'Cannot capture the previous Korean input profile.'}
+if(!(Test-Path -LiteralPath $legacyExe) -or !(Test-Path -LiteralPath $legacyUninstaller)){throw 'Expected legacy installation is absent.'}
+if(!(Test-Path -LiteralPath $fixtureSource)){throw 'Build the physical fixture before installation.'}
+if($Preflight){'PREFLIGHT PASS: package hashes, native absence, previous input profile, legacy uninstaller and fixture verified.';exit 0}
+$transaction=[guid]::NewGuid().ToString()
+$recovery=Join-Path $env:LOCALAPPDATA ("Contentrium\RIUM Keys\Recovery\"+(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+$transaction)
+New-Item -ItemType Directory -Path $recovery | Out-Null
+Copy-Item -LiteralPath $legacyExe,$legacyUninstaller -Destination $recovery
+$legacySettings=Get-ItemProperty 'HKCU:\Software\Contentrium\RiumKeys' -ErrorAction SilentlyContinue
+$legacySettings | Select-Object * -ExcludeProperty PSPath,PSParentPath,PSChildName,PSDrive,PSProvider | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $recovery 'legacy-settings.json') -Encoding UTF8
+$state=[ordered]@{UserSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;PreviousTip=$before.defaultTip;PreviousActiveTip=$before.activeTip;InstallRoot=$target;LegacyDirectory=$legacyDir;Status='Preparing';Created=(Get-Date).ToString('o')}
+$statePath=Join-Path $recovery 'install-state.json'
+function Save-State([string]$status){$state.Status=$status;$state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding UTF8}
+Save-State 'Preparing'
+$ready=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Ready")
+$done=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Done")
+$commit=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Commit")
+$machine=$null;$fixture=$null;$enabled=$false;$selected=$false;$committed=$false;$commitRequested=$false
+$wasRunning=@(Get-Process RiumKeys -ErrorAction SilentlyContinue).Count -gt 0
+try {
+    if($wasRunning){
+        $stop=Start-Process -FilePath $legacyExe -ArgumentList '--exit' -WindowStyle Hidden -PassThru
+        if(!$stop.WaitForExit(10000)){throw 'Legacy exit request timed out.'}
+        $deadline=[DateTime]::UtcNow.AddSeconds(10)
+        while(Get-Process RiumKeys -ErrorAction SilentlyContinue){if([DateTime]::UtcNow -gt $deadline){throw 'Legacy processes did not stop.'};Start-Sleep -Milliseconds 100}
+    }
+    Save-State 'AwaitingAdministrator'
+    $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $machine=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-File',('"'+(Join-Path $package 'install-machine.ps1')+'"'),'-Transaction',$transaction) -Verb RunAs -WindowStyle Hidden -PassThru
+    $deadline=[DateTime]::UtcNow.AddSeconds(30)
+    while(!$ready.WaitOne(250)){
+        if($machine.HasExited -or [DateTime]::UtcNow -gt $deadline){throw "Machine registration failed. See $target\install-result.log"}
+    }
+    $enabled=$true # an attempted call may partially succeed
+    & $control --enable
+    if($LASTEXITCODE){throw 'Could not enable the user input profile.'}
+    New-Item -Path 'HKCU:\Software\Contentrium\RiumKeysInput' -Force | Out-Null
+    Set-ItemProperty 'HKCU:\Software\Contentrium\RiumKeysInput' -Name InstallState -Value $statePath
+    Save-State 'AwaitingPhysicalTest'
+    $fixtureDir=Join-Path $recovery 'physical-test'
+    New-Item -ItemType Directory -Path $fixtureDir | Out-Null
+    Copy-Item -LiteralPath $fixtureSource -Destination (Join-Path $fixtureDir 'RiumInstalledSmoke.exe')
+    Copy-Item -LiteralPath (Join-Path $package 'x64\RiumKeysInput.dll') -Destination $fixtureDir
+    # A different basename proves the registered installable DLL can activate
+    # outside the guarded RiumImeFixture process. COM resolves the installed DLL.
+    $fixture=Start-Process -FilePath (Join-Path $fixtureDir 'RiumInstalledSmoke.exe') -ArgumentList '--native-fixture' -WindowStyle Hidden -PassThru
+    "Physical verification window ready. Recovery: $recovery"
+    if(!$fixture.WaitForExit(390000)){throw 'Physical verification timed out.'}
+    Get-Content -LiteralPath (Join-Path $fixtureDir 'fixture-result.log')
+    if($fixture.ExitCode -ne 0){throw 'Installed input method did not pass physical verification.'}
+    Save-State 'SelectingNativeInput'
+    $selected=$true # default selection changes before activation/readback
+    & $control --select
+    if($LASTEXITCODE){throw 'Could not select the native input method.'}
+    $nativeText=& $control --status
+    if($LASTEXITCODE){throw 'Cannot verify selected input method.'}
+    $native=$nativeText | ConvertFrom-Json
+    if(!$native.registered -or !$native.enabled -or !$native.active -or $native.categories -ne 6){throw 'Native registration or activation is incomplete.'}
+    $commitRequested=$true
+    [void]$commit.Set();[void]$done.Set()
+    if(!$machine.WaitForExit(45000) -or $machine.ExitCode -ne 0){throw 'Machine installation did not commit.'}
+    $committed=$true
+    Save-State 'NativeInstalledRemovingLegacy'
+    $remove=Start-Process -FilePath $legacyUninstaller -ArgumentList '/S' -WindowStyle Hidden -PassThru
+    if(!$remove.WaitForExit(30000)){throw 'Legacy uninstaller timed out; native IME remains installed.'}
+    $deadline=[DateTime]::UtcNow.AddSeconds(15)
+    while((Test-Path -LiteralPath $legacyExe) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 150}
+    if((Test-Path -LiteralPath $legacyExe) -or (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeys') -or (Get-Process RiumKeys -ErrorAction SilentlyContinue)){throw 'Legacy removal is incomplete; native IME remains installed.'}
+    $run=Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name RiumKeys -ErrorAction SilentlyContinue
+    if($run){throw 'Legacy startup registration remains.'}
+    Save-State 'Installed'
+    Get-Content -LiteralPath (Join-Path $target 'install-result.log')
+    "INSTALLED: RIUM Keys 2.0.0-preview.1; native profile selected; legacy utility removed. Recovery: $statePath"
+} catch {
+    $failure=$_
+    if($commitRequested -and !$committed -and $machine -and !$machine.HasExited){
+        Save-State 'CommitStatusUnknown'
+        throw "Installation commit is still running. User state was preserved; inspect $target\install-result.log before further changes. Original error: $failure"
+    }
+    if(!$committed -and !($commitRequested -and $machine.ExitCode -eq 0)){
+        $rollbackErrors=@()
+        if($fixture -and !$fixture.HasExited){Stop-Process -InputObject $fixture;if(!$fixture.WaitForExit(5000)){throw 'Fixture shutdown not confirmed; inspect the pending installation.'}}
+        if($selected){& $control --restore $before.defaultTip $before.activeTip;if($LASTEXITCODE){$rollbackErrors+='Previous default/active profile restoration failed.'}}
+        if($enabled){& $control --disable;if($LASTEXITCODE){$rollbackErrors+='User profile disable failed.'}}
+        [void]$done.Set()
+        if($machine -and !$machine.WaitForExit(45000)){$rollbackErrors+='Machine rollback is still pending.'}
+        $afterText=& $control --status
+        if($LASTEXITCODE){$rollbackErrors+='Cannot verify rollback state.'}else{
+            $after=$afterText | ConvertFrom-Json
+            if($after.registered -or $after.enabled -or $after.categories -ne 0 -or $after.defaultTip -ne $before.defaultTip -or $after.activeTip -ne $before.activeTip){$rollbackErrors+='Input profile rollback readback mismatch.'}
+        }
+        try {Assert-NativeRegistryAbsent}catch{$rollbackErrors+=$_.Exception.Message}
+        if($wasRunning -and (Test-Path -LiteralPath $legacyExe)){Start-Process -FilePath $legacyExe -WindowStyle Hidden}
+        if($rollbackErrors.Count){Save-State 'RecoveryRequired';throw ("$failure Rollback incomplete: "+($rollbackErrors -join '; '))}
+        Save-State 'FailedRolledBack'
+    }else{Save-State 'NativeInstalledLegacyRemovalIncomplete'}
+    throw $failure
+} finally {$ready.Dispose();$done.Dispose();$commit.Dispose()}

@@ -46,6 +46,7 @@ upstream-research/
 !native-ime/*.c
 !native-ime/*.cpp
 !native-ime/*.h
+!native-ime/*.rc
 !native-ime/third_party/
 !native-ime/third_party/jamotong/
 !native-ime/third_party/jamotong/LICENSE
