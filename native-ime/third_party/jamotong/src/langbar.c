@@ -7,8 +7,13 @@
 #include "layout_icon.h"   // 자판마다 다른 아이콘 (2026-10-04)
 #include <stddef.h>
 
+extern HINSTANCE g_hInst;
+
 #ifndef TF_LBI_ICON
 #define TF_LBI_ICON 0x00000001   // 이 MinGW msctf.h엔 없음 (표준값). 아이콘 갱신 통지 플래그.
+#endif
+#ifndef TF_LBI_TOOLTIP
+#define TF_LBI_TOOLTIP 0x00000004
 #endif
 
 // TSF ITfMenu (langbar right-click menu). This MinGW's msctf.h does not expose it under
@@ -93,7 +98,7 @@ static HRESULT STDMETHODCALLTYPE LBI_GetInfo(ITfLangBarItemButton *pThis,
     // GUID_LBI_INPUTMODE_J above; SHOWNINTRAY alone is not a visibility guarantee.
     pInfo->dwStyle = TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_SHOWNINTRAY;
     pInfo->ulSort = 0;
-    lstrcpyW(pInfo->szDescription, L"RIUM Keys");
+    lstrcpyW(pInfo->szDescription, L"CONTENTRIUM Keys");
     return S_OK;
 }
 
@@ -112,9 +117,21 @@ static HRESULT STDMETHODCALLTYPE LBI_Show(ITfLangBarItemButton *pThis, BOOL fSho
 
 static HRESULT STDMETHODCALLTYPE LBI_GetTooltipString(ITfLangBarItemButton *pThis,
                                                       BSTR *pbstrToolTip) {
-    (void)pThis;
+    JamotongLangBarItem *obj = IMPL_LBI_BUTTON(pThis);
     if (!pbstrToolTip) return E_INVALIDARG;
-    *pbstrToolTip = SysAllocString(L"RIUM Keys");
+    const wchar_t *tooltip = L"CONTENTRIUM Keys";
+    if (obj->pService) {
+        if (obj->pService->passthrough) {
+            tooltip = L"CONTENTRIUM Keys · 입력기 꺼짐";
+        } else {
+            EnterCriticalSection(&g_configLock);
+            LayoutConfig *layout = Config_GetCurrentLayout(&obj->pService->config);
+            tooltip = (layout && layout->type == LAYOUT_TYPE_PASSTHROUGH)
+                ? L"CONTENTRIUM Keys · English" : L"CONTENTRIUM Keys · 한글";
+            LeaveCriticalSection(&g_configLock);
+        }
+    }
+    *pbstrToolTip = SysAllocString(tooltip);
     return *pbstrToolTip ? S_OK : E_OUTOFMEMORY;
 }
 
@@ -136,7 +153,7 @@ static HRESULT STDMETHODCALLTYPE LBI_OnClick(ITfLangBarItemButton *pThis, TfLBIC
         // InitMenu(ITfMenu)는 호출되지 않는다(BTN_MENU 전용) — Mozc와 동일 방식.
         HMENU menu = CreatePopupMenu();
         if (menu) {
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"RIUM Keys 2.0 Preview");
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"CONTENTRIUM Keys 2.0 Preview");
             AppendMenuW(menu, MF_STRING, 2, L"한/영 전환");
             // 무간섭(직접 입력) 모드 — 원격 데스크톱 등에서 모든 키를 앱에 그대로 통과.
             AppendMenuW(menu, MF_STRING | (!obj->pService->passthrough ? MF_CHECKED : 0),
@@ -200,13 +217,18 @@ static HRESULT STDMETHODCALLTYPE LBI_OnMenuSelect(ITfLangBarItemButton *pThis, U
     return S_OK;
 }
 
-// 자판 아이콘은 layout_icon.c (2026-10-04 사용자 요청: 자판마다 다른 모양·색, 오른쪽 아래 언어, 밝은 회색 바탕)
+// Retain the upstream layout icon only as a resource-load fallback.
 static HICON CreateAbbrevIcon(const wchar_t *abbrev) { return LayoutIcon_Create(abbrev, 0); }
 
 static HRESULT STDMETHODCALLTYPE LBI_GetIcon(ITfLangBarItemButton *pThis, HICON *phIcon) {
     JamotongLangBarItem *obj = IMPL_LBI_BUTTON(pThis);
     if (!phIcon) return E_INVALIDARG;
     if (!obj->pService) { *phIcon = NULL; return S_OK; }   // Deactivate 후 — UAF 방어
+    // The shell owns this private HICON. Never use LR_SHARED here.
+    // Resource 100 contains the transparent CONTENTRIUM Keys PNG at each tray size.
+    *phIcon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(100), IMAGE_ICON,
+                              GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    if (*phIcon) return S_OK;
     if (obj->pService->passthrough) {   // 무간섭 모드: 자판 대신 "--" 표시
         *phIcon = CreateAbbrevIcon(L"--");
         return S_OK;
@@ -308,6 +330,6 @@ JamotongLangBarItem* LangBar_Create(JamotongTextService *pService) {
 
 void LangBar_Update(JamotongLangBarItem *pItem) {
     if (pItem && pItem->pSink) {
-        pItem->pSink->lpVtbl->OnUpdate(pItem->pSink, TF_LBI_TEXT | TF_LBI_ICON);   // 자판 바뀌면 아이콘도 갱신
+        pItem->pSink->lpVtbl->OnUpdate(pItem->pSink, TF_LBI_TEXT | TF_LBI_ICON | TF_LBI_TOOLTIP);
     }
 }

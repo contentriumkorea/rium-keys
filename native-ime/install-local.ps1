@@ -108,7 +108,7 @@ try {
     }
     Save-State 'Installed'
     Get-Content -LiteralPath (Join-Path $target 'install-result.log')
-    "INSTALLED: RIUM Keys $($config.Version); native profile selected; legacy migration performed when present. Recovery: $statePath"
+    "INSTALLED: CONTENTRIUM Keys $($config.Version); native profile selected; legacy migration performed when present. Recovery: $statePath"
 } catch {
     $failure=$_
     if($commitRequested -and !$committed -and $machine -and !$machine.HasExited){

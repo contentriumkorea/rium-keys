@@ -61,13 +61,15 @@ static ULONG STDMETHODCALLTYPE ES_Release(ITfEditSession *pThis) {
 
 // 삽입 후 커서(선택)를 range 끝으로 이동. 이걸 안 하면 다음 삽입이 커서 위치(앞)에 계속 들어가
 // 글자가 역순(abcd→dcba)으로 쌓인다. Clone으로 원본 range는 보존.
-static BOOL EditSessionOwnsFocus(const EditSessionData *data) {
-    return !data || !data->bindFocus || (data->focusOwner && data->focusOwner == GetFocus());
+static BOOL EditSessionOwnsFocus(JamotongTextService *svc, const EditSessionData *data) {
+    if (!data) return TRUE;
+    if (data->bindFocus && (!data->focusOwner || data->focusOwner != GetFocus())) return FALSE;
+    return !data->bindInputOwner || RiumOwner_AllowsWrite(&svc->inputOwner,&data->inputOwner,data->deferred);
 }
 
-static void MoveCaretToEnd(ITfContext *ctx, TfEditCookie ec, ITfRange *range,
+static void MoveCaretToEnd(JamotongTextService *svc, ITfContext *ctx, TfEditCookie ec, ITfRange *range,
                            const EditSessionData *data) {
-    if (!EditSessionOwnsFocus(data)) return;
+    if (!EditSessionOwnsFocus(svc,data)) return;
     ITfRange *pEnd = NULL;
     if (SUCCEEDED(range->lpVtbl->Clone(range, &pEnd)) && pEnd) {
         HRESULT hr = pEnd->lpVtbl->Collapse(pEnd, ec, TF_ANCHOR_END);
@@ -75,7 +77,7 @@ static void MoveCaretToEnd(ITfContext *ctx, TfEditCookie ec, ITfRange *range,
         sel.range = pEnd;
         sel.style.ase = TF_AE_NONE;
         sel.style.fInterimChar = FALSE;
-        if (SUCCEEDED(hr) && EditSessionOwnsFocus(data))
+        if (SUCCEEDED(hr) && EditSessionOwnsFocus(svc,data))
             ctx->lpVtbl->SetSelection(ctx, ec, 1, &sel);
         pEnd->lpVtbl->Release(pEnd);
     }
@@ -115,28 +117,28 @@ static HRESULT ES_DoEditSession_Inner(ITfEditSession *pThis, TfEditCookie ec) {
     ITfContext *ctx = es->pContext;
     int cLen = (int)wcslen(es->data.committed);
     HRESULT hrOut = S_OK;   // 삽입 실패를 hrSession으로 전파 (RFC-0004 P2-2: S_OK로 삼키지 않음)
-    if (!EditSessionOwnsFocus(&es->data)) return E_PENDING;
+    if (!EditSessionOwnsFocus(es->pService,&es->data)) return E_PENDING;
 
     if (cLen > 0) {
         ITfInsertAtSelection *pIns = NULL;
         hrOut = ctx->lpVtbl->QueryInterface(ctx, &IID_ITfInsertAtSelection, (void**)&pIns);
         if (SUCCEEDED(hrOut)) {
             ITfRange *r = NULL;
-            if (!EditSessionOwnsFocus(&es->data)) {
+            if (!EditSessionOwnsFocus(es->pService,&es->data)) {
                 pIns->lpVtbl->Release(pIns);
                 return E_PENDING;
             }
             HRESULT hrIns = pIns->lpVtbl->InsertTextAtSelection(pIns, ec, 0, es->data.committed, cLen, &r);
             JamoDiag("INSERT U+%04X len=%d hr=0x%08lX r=%p", (unsigned)es->data.committed[0], cLen, (unsigned long)hrIns, (void*)r);
             if (SUCCEEDED(hrIns) && r) {
-                MoveCaretToEnd(ctx, ec, r, &es->data); // A completed insertion is not retried if caret movement is skipped.
+                MoveCaretToEnd(es->pService, ctx, ec, r, &es->data); // A completed insertion is not retried if caret movement is skipped.
                 r->lpVtbl->Release(r);
             }
             if (FAILED(hrIns)) hrOut = hrIns;
             pIns->lpVtbl->Release(pIns);
         }
     }
-    if (EditSessionOwnsFocus(&es->data)) CaptureCaretRect(es->pService, ctx, ec);
+    if (EditSessionOwnsFocus(es->pService,&es->data)) CaptureCaretRect(es->pService, ctx, ec);
     return hrOut;
 }
 static HRESULT STDMETHODCALLTYPE ES_DoEditSession(ITfEditSession *pThis, TfEditCookie ec) {
@@ -166,6 +168,11 @@ HRESULT RequestEditSessionDataEx(JamotongTextService *pService, ITfContext *pCon
     es->pService = pService;
     es->pContext = pContext;
     es->data = *data;
+    if (!es->data.bindInputOwner) {
+        RiumOwner_Capture(&pService->inputOwner,&es->data.inputOwner);
+        es->data.bindInputOwner=TRUE;
+    }
+    es->data.deferred = es->data.deferred || !(esFlags & TF_ES_SYNC);
     
     pService->lpVtblTIP->AddRef((ITfTextInputProcessor*)pService);
     pContext->lpVtbl->AddRef(pContext);
@@ -312,7 +319,7 @@ static HRESULT Rep_DoEditSession_Inner(ITfEditSession *pThis, TfEditCookie ec) {
         pRange->lpVtbl->ShiftStart(pRange, ec, -es->replaceLen, &cch, NULL);
         int rlen = (int)wcslen(es->replacement);
         pRange->lpVtbl->SetText(pRange, ec, 0, es->replacement, rlen);
-        MoveCaretToEnd(es->pContext, ec, pRange, NULL); // Existing unbound replacement path.
+        MoveCaretToEnd(es->pService, es->pContext, ec, pRange, NULL); // Existing unbound replacement path.
         pRange->lpVtbl->Release(pRange);
     }
     pInsert->lpVtbl->Release(pInsert);
@@ -582,6 +589,20 @@ bool EditCtl_ReplaceSelection(HWND h, const wchar_t *str) {
     JamoDiag("REPLACESEL len=%d verdict=%d sel=%ld,%ld->%ld,%ld", (int)wcslen(str), (int)v,
              before.start, before.end, after.start, after.end);
     return !EditVerdict_Failed(v);
+}
+
+bool EditCtl_ReplaceSelectionOwned(HWND h, const wchar_t *str, JamotongTextService *svc,
+                                   const RiumOwnerBinding *owner, BOOL deferred) {
+    if (!h || h!=GetFocus() || !RiumOwner_AllowsWrite(&svc->inputOwner,owner,deferred)) return false;
+    EditSelSnap before=ReadSelSnap(h);
+    // Even EM_GETSEL can run application code. Recheck immediately before the
+    // single mutation; never replay it after a successful send changes focus.
+    if (h!=GetFocus() || !RiumOwner_AllowsWrite(&svc->inputOwner,owner,deferred)) return false;
+    SendMessageW(h,EM_REPLACESEL,TRUE,(LPARAM)str);
+    if (h!=GetFocus() || !RiumOwner_AllowsWrite(&svc->inputOwner,owner,deferred)) return true;
+    EditSelSnap after=ReadSelSnap(h);
+    if (h!=GetFocus() || !RiumOwner_AllowsWrite(&svc->inputOwner,owner,deferred)) return true;
+    return !EditVerdict_Failed(EditVerdict_Decide(before,after,(long)wcslen(str)));
 }
 
 bool EditCtl_ReadSelection(HWND h, wchar_t *outBuf, int maxLen) {

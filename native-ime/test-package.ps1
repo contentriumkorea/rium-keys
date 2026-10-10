@@ -9,7 +9,10 @@ foreach ($candidateArchitecture in @('x64', 'x86')) {
     $candidateDirectory = Join-Path $CandidateRoot $candidateArchitecture
     $candidateDll = Join-Path $candidateDirectory 'RiumKeysInput.dll'
     $candidateHash = (Get-FileHash -LiteralPath $candidateDll -Algorithm SHA256).Hash
-    foreach ($candidateSuite in @('EngineTests', 'InlineTests', 'EditSessionTests', 'RoutingTests')) {
+    $candidateSuites=@('EngineTests', 'InlineTests', 'EditSessionTests', 'RoutingTests',
+        'InputOwnerTests', 'PendingTests', 'ResendTests', 'RuntimeTests')
+    if($candidateArchitecture -eq 'x64'){$candidateSuites+=@('CclOwnerTests','DvaOwnerTests','DvaMonitorTests','DvaSnapshotTests','DvaCaptureTests','AeOwnerTests','AeLifecycleTests')}
+    foreach ($candidateSuite in $candidateSuites) {
         $candidateExecutable = Join-Path $candidateDirectory ($candidateSuite + '.exe')
         if (-not (Test-Path -LiteralPath $candidateExecutable -PathType Leaf)) {
             throw "Missing $candidateArchitecture/$candidateSuite. Rebuild both installable architectures before packaging."

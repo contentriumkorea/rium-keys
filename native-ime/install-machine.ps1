@@ -6,6 +6,7 @@ $version=$config.Version
 $root=[IO.Path]::GetFullPath((Join-Path $env:ProgramFiles "RIUM Keys\$version"))
 $class='Software\Classes\CLSID\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}'
 $tip='Software\Microsoft\CTF\TIP\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}'
+$profileDescription="$tip\LanguageProfile\0x00000412\{EA007E57-6806-4596-BB29-88EBFBC620B5}"
 $uninstall='Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeysInput'
 $views=@([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)
 $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -64,7 +65,7 @@ $commit=[Threading.EventWaitHandle]::OpenExisting("Local\RIUM.Keys.Install.$Tran
 if($Operation -eq 'Upgrade'){
     # Reuse the existing profile and user defaults; only the versioned binaries change.
     $previousRoot=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.UpgradeFrom)
-    $changedViews=@();$oldAppValues=@{};$appChanged=$false;$transcript=$false;$upgradeCommitted=$false
+    $changedViews=@();$oldDescriptions=@{};$oldAppValues=@{};$appChanged=$false;$transcript=$false;$upgradeCommitted=$false
     try {
         if(Test-Path -LiteralPath $root){throw 'New version directory already exists; refusing to overwrite.'}
         foreach($view in $views){
@@ -82,7 +83,7 @@ if($Operation -eq 'Upgrade'){
             if(!$key){throw 'Missing previous installed-apps entry.'}
             try {
                 if($key.GetValue('InstallLocation') -ne $previousRoot -or $key.GetValue('DisplayVersion') -ne $config.UpgradeFrom){throw 'Unexpected installed version.'}
-                foreach($name in @('DisplayVersion','InstallLocation','DisplayIcon','UninstallString')){$oldAppValues[$name]=$key.GetValue($name)}
+                foreach($name in @('DisplayName','DisplayVersion','InstallLocation','DisplayIcon','UninstallString')){$oldAppValues[$name]=$key.GetValue($name)}
             }finally{$key.Dispose()}
         }finally{$base.Dispose()}
         $manifest=@(Assert-RiumManifest $PSScriptRoot $config)
@@ -112,10 +113,37 @@ if($Operation -eq 'Upgrade'){
         }
         [void]$ready.Set()
         if(!$done.WaitOne(600000) -or !$commit.WaitOne(0)){throw 'Upgrade was not committed by the ordinary-user verifier.'}
+        # CTF keys can alias across views: snapshot ALL names before changing
+        # either view, so rollback never records the new name as the old name.
+        foreach($view in $views){
+            $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
+            try {
+                $key=$base.OpenSubKey($profileDescription)
+                if(!$key){throw "Missing owned language profile: $view"}
+                try {
+                    $old=$key.GetValue('Description')
+                    if($old -notin @('RIUM Keys','CONTENTRIUM Keys') -or $key.GetValueKind('Description') -ne [Microsoft.Win32.RegistryValueKind]::String){throw 'Unexpected input profile description.'}
+                    $oldDescriptions[$view]=$old
+                }finally{$key.Dispose()}
+            }finally{$base.Dispose()}
+        }
+        foreach($view in $views){
+            $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
+            try {
+                $key=$base.OpenSubKey($profileDescription,$true)
+                if(!$key){throw "Missing owned language profile: $view"}
+                try {
+                    if($key.GetValue('Description') -notin @($oldDescriptions[$view],'CONTENTRIUM Keys')){throw 'Input profile name changed during upgrade.'}
+                    $key.SetValue('Description','CONTENTRIUM Keys')
+                    if($key.GetValue('Description') -ne 'CONTENTRIUM Keys'){throw 'Input profile name readback mismatch.'}
+                }finally{$key.Dispose()}
+            }finally{$base.Dispose()}
+        }
         $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',[Microsoft.Win32.RegistryView]::Registry64)
         try {
             $key=$base.OpenSubKey($uninstall,$true);$appChanged=$true
             try {
+                $key.SetValue('DisplayName','CONTENTRIUM Keys')
                 $key.SetValue('DisplayVersion',$version);$key.SetValue('InstallLocation',$root)
                 $key.SetValue('DisplayIcon',(Join-Path $root 'x64\RiumKeysInput.dll'))
                 $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -138,6 +166,16 @@ if($Operation -eq 'Upgrade'){
                     if($key.GetValue('') -ne $oldDll){throw 'Rollback COM readback mismatch.'}
                 }finally{if($key){$key.Dispose()}}}finally{$base.Dispose()}
             }catch{$rollbackErrors+="$view`: $($_.Exception.Message)"}
+        }
+        foreach($view in $oldDescriptions.Keys){
+            try {
+                $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
+                try {$key=$base.OpenSubKey($profileDescription,$true);try {
+                    if(!$key -or $key.GetValue('Description') -notin @($oldDescriptions[$view],'CONTENTRIUM Keys')){throw 'Profile description rollback owner mismatch.'}
+                    $key.SetValue('Description',$oldDescriptions[$view])
+                    if($key.GetValue('Description') -ne $oldDescriptions[$view]){throw 'Profile description rollback readback mismatch.'}
+                }finally{if($key){$key.Dispose()}}}finally{$base.Dispose()}
+            }catch{$rollbackErrors+=$_.Exception.Message}
         }
         if($appChanged){
             try {
@@ -199,7 +237,7 @@ try {
     try {
         $key=$base.CreateSubKey($uninstall)
         try {
-            $key.SetValue('DisplayName','RIUM Keys');$key.SetValue('DisplayVersion',$version)
+            $key.SetValue('DisplayName','CONTENTRIUM Keys');$key.SetValue('DisplayVersion',$version)
             $key.SetValue('Publisher','Contentrium');$key.SetValue('InstallLocation',$root)
             $key.SetValue('DisplayIcon',(Join-Path $root 'x64\RiumKeysInput.dll'))
             $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'

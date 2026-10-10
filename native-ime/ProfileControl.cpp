@@ -82,11 +82,18 @@ int wmain(int argc,wchar_t** argv){
             if(profiles->GetProfile(TF_PROFILETYPE_INPUTPROCESSOR,0x412,Service,Profile,nullptr,&existing)==S_OK)
                 throw std::runtime_error("Profile already exists; refusing replacement");
             std::wstring dll=argv[2];
-            Check(profiles->RegisterProfile(Service,0x412,Profile,L"RIUM Keys",9,dll.c_str(),static_cast<ULONG>(dll.size()),
+            static const wchar_t name[]=L"CONTENTRIUM Keys";
+            Check(profiles->RegisterProfile(Service,0x412,Profile,name,static_cast<ULONG>(wcslen(name)),dll.c_str(),static_cast<ULONG>(dll.size()),
                 static_cast<ULONG>(-100),nullptr,0,TRUE,0),"register profile");
             for(auto& category:Categories)Check(categories->RegisterCategory(Service,category,Service),"register category");
             if(CategoryCount(categories.Get())!=6)throw std::runtime_error("Registered categories incomplete");
-            Refresh();puts("Registered RIUM Keys profile and six categories.");
+            Refresh();puts("Registered CONTENTRIUM Keys profile and six categories.");
+        }else if(mode==L"--refresh"){
+            Refresh();BSTR description=nullptr;
+            Check(legacy->GetLanguageProfileDescription(Service,0x412,Profile,&description),"read input method name");
+            bool matches=description&&wcscmp(description,L"CONTENTRIUM Keys")==0;
+            printf("Profile description: %ls\n",description?description:L"");SysFreeString(description);
+            if(!matches)throw std::runtime_error("Input method name readback mismatch");
         }else if(mode==L"--unregister"){
             HRESULT first=S_OK;
             for(auto& category:Categories){auto hr=categories->UnregisterCategory(Service,category,Service);if(FAILED(hr)&&SUCCEEDED(first))first=hr;}
@@ -130,6 +137,6 @@ int wmain(int argc,wchar_t** argv){
                 registered?L"true":L"false",enabled?L"true":L"false",CategoryCount(categories.Get()),
                 activeHr==S_OK&&active.clsid==Service&&active.guidProfile==Profile?L"true":L"false",Tip(0x412,defClass,defProfile).c_str(),defaultTip.c_str(),Tip(active.langid,active.clsid,active.guidProfile).c_str());
         }else throw std::runtime_error("Unknown mode or invalid arguments");
-    }catch(const std::exception& ex){fprintf(stderr,"RIUM Keys: %s\n",ex.what());result=1;}
+    }catch(const std::exception& ex){fprintf(stderr,"CONTENTRIUM Keys: %s\n",ex.what());result=1;}
     CoUninitialize();return result;
 }

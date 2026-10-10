@@ -1,10 +1,32 @@
-# RIUM Keys native input engine — development
+# CONTENTRIUM Keys native input engine — development
 
 This is the Jamotong-based replacement candidate. The production updater still
 distributes the 1.1.1 tray helper. An explicitly requested **local preview
 installation** is available below; it is not a public release and has no automatic
-updater. Premiere workspace shortcuts currently fail. After Effects and
-all-application compatibility remain unverified.
+updater. The locally installed preview.8 contains the new logical input-owner
+providers and passed its installed native EDIT/button physical test on
+2026-10-11. The preview.8 candidate additionally fixes the reproduced first
+syllable split after a command-to-text transition and passes 1,202 native
+assertions. The installed preview.8 subsequently passed physical text/command/text
+transitions in the tested Premiere search, caption and timeline routes and Studio
+One search/workspace, including switching applications. After Effects and broader
+compatibility remain under validation; see the [actual test record](../docs/input-owner-validation.md).
+
+The preview.8 display name is **CONTENTRIUM Keys**. The input service/profile
+GUIDs, settings locations, internal executable names and versioned installation
+root are preserved so existing installations upgrade without a duplicate input
+method. The upgrade updates and reads back the existing Windows profile and
+installed-app names; it restores the previous names if the machine commit fails.
+The local upgrade committed on 2026-10-11 at 01:19 KST after physical
+Korean/shortcut/Korean input passed. Both registry views, DLL hashes, profile
+description and installed-app version were independently read back.
+
+Preview.9 adds the user's transparent **CK** notification-area logo. The PNG
+source and conversion details are in [assets](../assets/README.md). The icon is
+embedded at nine Windows sizes and loaded by both the native input button and
+legacy executable. Input mode and enabled state remain available in the tooltip
+and existing right-click menu. Preview.9 upgrades preview.8; input routing and
+composition behavior are unchanged by the icon addition.
 
 On 2026-10-10 an external one-shot experiment restored C in the tested Premiere
 timeline and Studio One workspace while preserving the tested search/caption
@@ -16,8 +38,9 @@ packaged as a completed fix. See [experiment scope and evidence](experiments/inl
 `prepare-package.ps1` now runs `test-package.ps1` against both actual installable
 DLL candidates before writing package files. No known-bug expectation switch is
 accepted by that gate. Passing automated contracts is necessary but does not
-replace physical application and installer verification. The existing workspace
-routing failure currently blocks packaging.
+replace physical application and installer verification. The candidate now
+passes its automated package gate and installed physical fixture. Actual
+application transitions remain release gates.
 
 The latest candidate fixes Chromium-style interim selection and composition
 lifetime/reentrancy errors. On 2026-10-10 the exact x64 candidate passed a real
@@ -25,9 +48,13 @@ Windows TSF own-document run with Chromium-style static flags: nine consumed
 keys, exact Hangul/backspace/space results, collapsed TSF/ACP selections without
 interim highlighting, live compositions and verified profile/mode restoration.
 This does not test Chromium itself or solve host workspace classification.
-The two architecture contract runs each pass 26 engine, 178 inline and 15
-edit-session checks; routing still fails one of 86 cases. Details and the
-official Premiere SDK/event-observer investigation are in
+The candidate also binds composition, pending commits and delayed resend work
+to their original input owner. Exact-build DVA, CCL and AE providers perform bounded
+metadata reads after background module verification. Their verified scope and
+remaining unknown states are documented in [providers/README.md](providers/README.md).
+Automated owner, inline, edit-session, pending, resend, routing and runtime
+regressions pass on x64 and x86; these are not real application typing results.
+Earlier findings and the official Premiere SDK/event-observer investigation are in
 [the evidence report](../docs/gureum-input-routing-analysis.md).
 
 ## Reuse and local changes

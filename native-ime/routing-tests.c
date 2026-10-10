@@ -90,6 +90,9 @@ static HRESULT STDMETHODCALLTYPE no_selection(ITfContext *p,TfEditCookie ec,ULON
                                                TF_SELECTION *selection,ULONG *fetched) {
     (void)p;(void)ec;(void)index;(void)count;(void)selection;*fetched=0;return E_FAIL;
 }
+static void fixture_owner(void *context, RiumOwnerStamp *out) {
+    *out=*(RiumOwnerStamp*)context;
+}
 static HRESULT STDMETHODCALLTYPE reject_session(ITfContext *p,TfClientId id,ITfEditSession *es,DWORD flags,HRESULT *result) {
     (void)p;(void)id;(void)es;(void)flags;++pendingRequests;
     if(reenterPending){
@@ -162,13 +165,60 @@ int wmain(int argc, wchar_t **argv) {
     thread->lpVtbl->QueryInterface(thread, &IID_ITfCompartmentMgr, (void**)&mgr);
     Context ctx = { .iface = { &context_vtable }, .compartments = mgr, .statusResult = S_OK };
     check(wants(sink, &ctx.iface), "editable context retains Korean letter");
-    // CUAS also creates writable contexts for application workspaces. With no
-    // focused text host, swallowing V would create the default IMM popup.
+    RiumOwnerStamp logicalOwner={.provider=91,.profile=1,.kind=RIUM_OWNER_TEXT,
+        .processId=GetCurrentProcessId(),.threadId=GetCurrentThreadId(),.focus=owner,
+        .windowObject=100,.logicalObject=200,.lifetimeToken=301,.textObject=400};
+    service->inputOwner.reader=fixture_owner;
+    service->inputOwner.readerContext=&logicalOwner;
+    check(wants(sink,&ctx.iface),"verified text target retains the Korean key");
+    logicalOwner.kind=RIUM_OWNER_COMMAND;logicalOwner.logicalObject=201;logicalOwner.lifetimeToken=302;
+    pendingRequests=0;
+    check(!wants(sink,&ctx.iface),"same HWND and context passes first V at a verified command target");
+    BOOL routed=TRUE;
+    check(SUCCEEDED(sink->lpVtbl->OnKeyDown(sink,&ctx.iface,'V',0x002f0001,&routed))&&!routed,
+          "actual keydown rechecks logical command target after text preview");
+    check(pendingRequests==0,"command key never starts a text edit session");
+    logicalOwner.kind=RIUM_OWNER_TEXT;logicalOwner.logicalObject=200;logicalOwner.lifetimeToken=301;
+    check(wants(sink,&ctx.iface),"text target can be observed again after a command");
+    service->compTargetCtx=&ctx.iface;service->compTargetFocusHwnd=owner;
+    service->compTargetOwner=(RiumOwnerBinding){.stamp=logicalOwner,.epoch=service->inputOwner.epoch};
+    RiumOwnerBinding originalTextOwner=service->compTargetOwner;
+    service->fsm=(FsmContext){.state=STATE_CHO_JUNG_JONG,.cho=18,.jung=0,.jong=4};
+    logicalOwner.kind=RIUM_OWNER_COMMAND;logicalOwner.logicalObject=201;logicalOwner.lifetimeToken=302;
+    pendingRequests=0;
+    check(!wants(sink,&ctx.iface)&&service->fsm.state==STATE_EMPTY&&service->cpPendingCommit==L'\ud55c'&&pendingRequests==0,
+          "logical text to command boundary preserves the old syllable without any write");
+    service->fsm.state=STATE_EMPTY;
+    pendingInsert.lpVtbl=&pending_insert_vtable;pendingMode=1;pendingWrites=pendingRequests=0;
+    service->cpPendingCommit=L'\ud55c';service->cpPendingCtx=&ctx.iface;service->cpPendingFocusHwnd=owner;
+    service->pendingOwner=originalTextOwner;
+    logicalOwner.kind=RIUM_OWNER_TEXT;logicalOwner.logicalObject=200;logicalOwner.lifetimeToken=301;
+    wants(sink,&ctx.iface);
+    check(pendingWrites==0&&pendingRequests==0&&service->cpPendingCommit==L'\ud55c',
+          "returning to a shared text host does not replay an unproven deferred syllable");
+    logicalOwner.kind=RIUM_OWNER_UNKNOWN;pendingRequests=pendingWrites=0;
+    service->cpPendingCommit=L'\ud55c';service->cpPendingCtx=&ctx.iface;service->cpPendingFocusHwnd=owner;
+    wants(sink,&ctx.iface);
+    check(pendingWrites==0&&pendingRequests==0&&service->cpPendingCommit==L'\ud55c',
+          "failed recognized owner read cannot authorize old pending text");
+    pendingMode=0;
+    service->cpPendingCommit=0;service->cpPendingCtx=NULL;service->cpPendingFocusHwnd=NULL;
+    service->compTargetOwner=(RiumOwnerBinding){0};service->pendingOwner=(RiumOwnerBinding){0};
+    service->fsm.state=STATE_EMPTY;service->compTargetCtx=NULL;service->compTargetFocusHwnd=NULL;
+    service->inputOwner=(RiumOwnerState){0};
+    service->inputOwnerBoundary=FALSE;
+    // TRANSITORY is also used by real text stores. It cannot by itself prove
+    // that a workspace wants commands; require the independent owner source.
     ctx.status.dwStaticFlags = 0x0004; // TF_SS_TRANSITORY
     if (argc == 3 && wcscmp(argv[2], L"--expect-known-workspace-bug") == 0)
         check(wants(sink, &ctx.iface), "characterization: diagnostic preview still reproduces the workspace bug");
-    else
-        check(!wants(sink, &ctx.iface), "transitory workspace without text focus passes first V");
+    else {
+        check(wants(sink,&ctx.iface),"transitory text is not misclassified solely by a TSF flag");
+        logicalOwner.kind=RIUM_OWNER_COMMAND;
+        service->inputOwner.reader=fixture_owner;service->inputOwner.readerContext=&logicalOwner;
+        check(!wants(sink,&ctx.iface),"verified transitory command surface passes first V");
+        service->inputOwner=(RiumOwnerState){0};service->inputOwnerBoundary=FALSE;
+    }
     ctx.status.dwStaticFlags = 0;
     check(!wants(sink, NULL), "no text context passes first shortcut");
     set_flag(mgr, client, &GUID_COMPARTMENT_KEYBOARD_DISABLED, 1);

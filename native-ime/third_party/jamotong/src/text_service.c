@@ -22,6 +22,7 @@ static void Jamotong_ChordTimerCancel(JamotongTextService *obj);   // 3판 조�
 // ITfTextInputProcessorEx IID (SDK msctf.idl + windows-sys 이중 확인 — RFC-0013 A)
 static const GUID kIID_ITfTextInputProcessorEx = { 0x6e4e2102, 0xf9cd, 0x433d, { 0xb4, 0x96, 0x30, 0x3c, 0xe0, 0x3a, 0x65, 0x07 } };
 extern HINSTANCE g_hInst;   // dllmain.c — DLL 모듈 핸들(사전 경로·윈도 클래스 등록용)
+#include "../../../input-owner-runtime.h"
 
 // 무간섭(직접 입력) 모드 상태의 원본 — TIP 인스턴스는 프로세스별이라 레지스트리로 공유한다.
 BOOL Jamotong_GetPassthroughReg(void) {
@@ -88,12 +89,15 @@ static BOOL GetCaretScreenRect(JamotongTextService *obj, RECT *out) {
 // TSF 로 다시 넣지 않는다: CUAS 를 거쳐도 같은 컨트롤이 받으므로 읽기 전용·길이 제한을 넘지 못할
 // 것이고(미실측), 판정이 틀렸다면 이중 삽입이 된다.
 static bool CommitText(JamotongTextService *obj, ITfContext *pic, const wchar_t *str) {
+    RiumOwnerBinding binding={0};
+    RiumOwner_Capture(&obj->inputOwner,&binding);
     HWND edit = EditCtl_FocusEditWindow();
     if (edit) {
         obj->lastCaretValid = FALSE;   // TSF rect 없음 → 오버레이는 GUIThreadInfo 캐럿 폴백
-        return EditCtl_ReplaceSelection(edit, str);
+        return EditCtl_ReplaceSelectionOwned(edit,str,obj,&binding,FALSE);
     }
     EditSessionData esd = {0};
+    esd.bindInputOwner=TRUE;esd.inputOwner=binding;
     wcsncpy(esd.committed, str, 127); esd.committed[127] = L'\0';
     HRESULT hr = RequestEditSessionData(obj, pic, &esd);   // 비-EDIT(터미널·네이티브): TSF + 캐럿 캡처
     if (FAILED(hr)) JamoDiag("COMMIT fail hr=0x%08lX", (unsigned long)hr);
@@ -179,16 +183,32 @@ static void CompTarget_Clear(JamotongTextService *obj) {
     obj->compTargetCtx = NULL;
     obj->compTargetHwnd = NULL;
     obj->compTargetFocusHwnd = NULL;
+    obj->compTargetOwner = (RiumOwnerBinding){0};
     if (context) context->lpVtbl->Release(context);
 }
 
 static void CompTarget_Remember(JamotongTextService *obj, ITfContext *pic) {
     if (!pic || obj->compTargetCtx) return;   // 조합마다 한 번 (ResetComposition 이 비운다)
     HWND owner = GetFocus(); // Before AddRef or EDIT capability messages can reenter the host.
+    RiumOwnerBinding binding={0};
+    RiumOwner_Capture(&obj->inputOwner,&binding);
     pic->lpVtbl->AddRef(pic);
+    // Keep this reference local until every host callback has completed. A
+    // nested key/focus callback may already have published a newer target.
+    if (obj->compTargetCtx || GetFocus()!=owner ||
+        !RiumOwner_AllowsWrite(&obj->inputOwner,&binding,FALSE)) {
+        pic->lpVtbl->Release(pic);
+        return;
+    }
+    HWND edit = EditCtl_FocusEditWindow();
+    if (obj->compTargetCtx || GetFocus()!=owner ||
+        !RiumOwner_AllowsWrite(&obj->inputOwner,&binding,FALSE)) {
+        pic->lpVtbl->Release(pic);
+        return;
+    }
     obj->compTargetCtx = pic;
     obj->compTargetFocusHwnd = owner;
-    HWND edit = EditCtl_FocusEditWindow();
+    obj->compTargetOwner = binding;
     obj->compTargetHwnd = edit == owner ? edit : NULL;
 }
 
@@ -199,40 +219,48 @@ void Jamotong_PendingClear(JamotongTextService *obj) {
     obj->cpPendingHwnd = NULL;
     obj->cpPendingFocusHwnd = NULL;
     obj->cpPendingCommit = 0;
+    obj->pendingOwner = (RiumOwnerBinding){0};
     if (context) context->lpVtbl->Release(context);
 }
 
-static void Pending_Set(JamotongTextService *obj, wchar_t ch, HWND hwnd, HWND focus, ITfContext *ctx) {
-    if (obj->cpPendingCommit) return; // Key sinks apply backpressure; never overwrite unresolved text.
+// Consumes a context reference already owned by compTargetCtx. No COM call may
+// occur between detaching that tuple and publishing this complete pending slot.
+static void Pending_Set(JamotongTextService *obj,wchar_t ch,HWND hwnd,HWND focus,
+                        ITfContext *ctx,const RiumOwnerBinding *binding) {
     ++obj->cpPendingGeneration;
-    obj->cpPendingCommit = ch;
-    obj->cpPendingHwnd = hwnd;
-    obj->cpPendingFocusHwnd = focus;
-    if (ctx) { ctx->lpVtbl->AddRef(ctx); obj->cpPendingCtx = ctx; }
+    obj->cpPendingCommit=ch;
+    obj->cpPendingHwnd=hwnd;
+    obj->cpPendingFocusHwnd=focus;
+    obj->pendingOwner=*binding;
+    obj->cpPendingCtx=ctx;
 }
 
-// 포커스를 떠날 때: 확정 전용 경로에 남은 음절을 **기억한 대상**에 정확히 한 번 넣는다(Q1 확정).
-// 인라인 조합은 여기서 손대지 않는다 — 뒤따르는 ResetComposition 의 Finalize 가 확정한다.
-// 넣지 못하면 대상에 묶어 보류한다(Q2) — 그 대상으로 돌아와 키를 칠 때 한 번 재시도.
-static void Transition_FlushComposition(JamotongTextService *obj, const char *why) {
-    HWND eh = obj->compTargetHwnd;
-    int editOk = eh && IsWindow(eh) && GetWindowThreadProcessId(eh, NULL) == GetCurrentThreadId();
-    TransFlushAction a = Trans_FlushAction(JamoComp_IsActive(obj) ? 1 : 0,
-                                           obj->fsm.state != STATE_EMPTY, editOk,
-                                           obj->compTargetCtx != NULL);
-    if (a == TRANS_NONE || a == TRANS_FINALIZE_INLINE) return;
-    wchar_t ch = Fsm_Flush(&obj->fsm);
-    if (!ch) return;
-    wchar_t cs[2] = { ch, L'\0' };
-    BOOL done = FALSE;
-    if (a == TRANS_EDIT_REPLACE) {
-        done = EditCtl_ReplaceSelection(eh, cs) ? TRUE : FALSE;   // B1 판정 (EDIT 판정이 최종)
-    }
-    // A CUAS context can already point at a different control here. Do not queue
-    // InsertTextAtSelection against that shared context. Retry synchronously only
-    // when the original owner is focused; the pending slot owns the text meanwhile.
-    JamoDiag("TRANS %s flush U+%04X action=%d done=%d", why, (unsigned)ch, (int)a, (int)done);
-    if (!done) Pending_Set(obj, ch, editOk ? eh : NULL, obj->compTargetFocusHwnd, obj->compTargetCtx);
+static void Transition_FlushComposition(JamotongTextService *obj,const char *why) {
+    // A single occupied slot is backpressure, never permission to discard the FSM.
+    if (obj->cpPendingCommit || obj->cpPendingInFlight) return;
+    HWND eh=obj->compTargetHwnd;
+    int editOk=eh && IsWindow(eh) && GetWindowThreadProcessId(eh,NULL)==GetCurrentThreadId();
+    TransFlushAction a=Trans_FlushAction(JamoComp_IsActive(obj)?1:0,
+        obj->fsm.state!=STATE_EMPTY,editOk,obj->compTargetCtx!=NULL);
+    if(a==TRANS_NONE || a==TRANS_FINALIZE_INLINE)return;
+    wchar_t ch=Fsm_Flush(&obj->fsm);
+    if(!ch)return;
+    HWND focus=obj->compTargetFocusHwnd;
+    ITfContext *context=obj->compTargetCtx;
+    RiumOwnerBinding binding=obj->compTargetOwner;
+    obj->compTargetCtx=NULL;obj->compTargetHwnd=NULL;obj->compTargetFocusHwnd=NULL;
+    obj->compTargetOwner=(RiumOwnerBinding){0};
+    Pending_Set(obj,ch,editOk?eh:NULL,focus,context,&binding);
+    ULONG generation=obj->cpPendingGeneration;
+    wchar_t cs[2]={ch,L'\0'};
+    BOOL done=FALSE;
+    obj->cpPendingInFlight=TRUE;
+    if(a==TRANS_EDIT_REPLACE)
+        done=EditCtl_ReplaceSelectionOwned(eh,cs,obj,&binding,TRUE);
+    obj->cpPendingInFlight=FALSE;
+    // Host callbacks may cancel this slot and publish another. Never clear it.
+    if(done && generation==obj->cpPendingGeneration)Jamotong_PendingClear(obj);
+    JamoDiag("TRANS %s flush U+%04X action=%d done=%d",why,(unsigned)ch,(int)a,(int)done);
 }
 
 static bool RetryPendingAtOwnedFocus(JamotongTextService *obj, ITfContext *pic) {
@@ -240,6 +268,7 @@ static bool RetryPendingAtOwnedFocus(JamotongTextService *obj, ITfContext *pic) 
     if (!obj->cpPendingCommit) return true;
     if (!pic || !obj->cpPendingFocusHwnd || obj->cpPendingFocusHwnd != GetFocus() ||
         (obj->cpPendingCtx && obj->cpPendingCtx != pic)) return false;
+    if (!RiumOwner_AllowsWrite(&obj->inputOwner,&obj->pendingOwner,TRUE)) return false;
     wchar_t cs[2] = { obj->cpPendingCommit, L'\0' };
     HWND owner = obj->cpPendingFocusHwnd;
     HWND edit = obj->cpPendingHwnd;
@@ -247,16 +276,49 @@ static bool RetryPendingAtOwnedFocus(JamotongTextService *obj, ITfContext *pic) 
     obj->cpPendingInFlight = TRUE;
     bool inserted;
     if (edit && edit == owner) {
-        inserted = EditCtl_ReplaceSelection(edit, cs);
+        inserted = EditCtl_ReplaceSelectionOwned(edit,cs,obj,&obj->pendingOwner,TRUE);
     } else {
         EditSessionData data={0};data.committed[0]=cs[0];
         data.bindFocus=TRUE;data.focusOwner=owner;
+        data.bindInputOwner=TRUE;data.inputOwner=obj->pendingOwner;data.deferred=TRUE;
         inserted = RequestEditSessionData(obj, pic, &data) == S_OK;
     }
     bool sameSlot = generation == obj->cpPendingGeneration;
     if (inserted && sameSlot) Jamotong_PendingClear(obj);
     obj->cpPendingInFlight = FALSE;
     return inserted && sameSlot && !obj->cpPendingCommit;
+}
+
+/* Leaving a logical editor must not flush its unfinished text through a CUAS
+ * context that already points at a command surface. Move the existing context
+ * reference with the syllable; no application callback or write is needed. */
+static void OwnerQuarantine(JamotongTextService *obj) {
+    obj->inputOwnerBoundary=TRUE;
+    if (obj->pComposition || obj->cpPendingCommit || obj->fsm.state==STATE_EMPTY) return;
+    wchar_t pending=Fsm_Flush(&obj->fsm);
+    if (!pending) return;
+    ++obj->cpPendingGeneration;
+    obj->cpPendingCommit=pending;
+    obj->cpPendingHwnd=obj->compTargetHwnd;
+    obj->cpPendingFocusHwnd=obj->compTargetFocusHwnd;
+    obj->cpPendingCtx=obj->compTargetCtx;
+    obj->pendingOwner=obj->compTargetOwner;
+    obj->compTargetHwnd=NULL;obj->compTargetFocusHwnd=NULL;obj->compTargetCtx=NULL;
+    obj->compTargetOwner=(RiumOwnerBinding){0};
+}
+
+bool Jamotong_HasPendingTimers(void);
+static bool OwnerPassesCommand(JamotongTextService *obj, WPARAM key, UINT mods) {
+    RiumOwnerKind kind=RiumOwnerRuntime_AtBoundary(&obj->inputOwner,
+        !obj->pComposition && obj->fsm.state==STATE_EMPTY && !obj->cpPendingCommit &&
+        !obj->cpPendingInFlight && !obj->compFinalizePending && !Jamotong_InOurEdit() &&
+        !obj->compTargetCtx && !Jamotong_HasPendingTimers() &&
+        !obj->seqKb.pending[0] && !obj->seqKb.reading[0]);
+    if (kind!=RIUM_OWNER_COMMAND) return false;
+    OwnerQuarantine(obj);
+    if (key<'A' || key>'Z' || mods) return false;
+    UINT character=MapVirtualKeyExW((UINT)key,MAPVK_VK_TO_CHAR,GetKeyboardLayout(0));
+    return character==(UINT)key || character==(UINT)key+('a'-'A');
 }
 
 // 순차 입력(중국어·일본어)의 읽기도 포커스 이동·밖에서의 전환에서 잃지 않는다 — 읽기는 미리보기(오버레이)일 뿐
@@ -303,8 +365,18 @@ static void UiCodeHide(JamotongTextService *obj);
 //   확정(무엇을 문서에 남길지)은 경계마다 다르므로 부르는 쪽이 먼저 하고, 이 함수는 그 뒤에
 //   남은 상태와 화면을 비운다.
 static void Jamotong_FoldInput(JamotongTextService *obj) {
+    if (obj->cpPendingInFlight || (obj->cpPendingCommit && obj->fsm.state!=STATE_EMPTY)) return;
+    FsmContext beforeFsm=obj->fsm;
+    ITfContext *beforeTarget=obj->compTargetCtx;
+    ITfComposition *beforeComp=obj->pComposition;
+    RiumOwnerBinding beforeOwner=obj->compTargetOwner;
+    uint64_t beforeEpoch=obj->inputOwner.epoch;
     Jamotong_ChordTimerCancel(obj);      // 늦은 콜백 금지 (RFC-0016 §7.1)
     ChordKb_ReleaseAll(&obj->chordKb);   // 합성 Ctrl/Alt 가 대상 앱에 눌린 채 남지 않게 (W1-09)
+    if (obj->cpPendingInFlight || obj->compTargetCtx!=beforeTarget ||
+        obj->pComposition!=beforeComp || obj->inputOwner.epoch!=beforeEpoch ||
+        memcmp(&obj->compTargetOwner,&beforeOwner,sizeof beforeOwner) ||
+        memcmp(&obj->fsm,&beforeFsm,sizeof beforeFsm)) return;
     SeqKb_Init(&obj->seqKb);             // 순차 변환의 보류·읽기
     ResetComposition(obj);               // 인라인 Finalize + FSM·모아치기·칩·조합 대상
     CodeInput_Hide();
@@ -315,6 +387,8 @@ static void Jamotong_FoldInput(JamotongTextService *obj) {
 }
 
 static void Jamotong_Transition(JamotongTextService *obj, TransWhy why, ITfContext *pic) {
+    if (obj->cpPendingInFlight || (obj->cpPendingCommit && obj->fsm.state!=STATE_EMPTY)) return;
+    BOOL wasInline=JamoComp_IsActive(obj);
     if (why == TRANS_WHY_KEY && pic) {
         LayoutConfig *cur = Config_GetCurrentLayout(&obj->config);
         if (cur && cur->type == LAYOUT_TYPE_SEQUENCE) {
@@ -329,6 +403,10 @@ static void Jamotong_Transition(JamotongTextService *obj, TransWhy why, ITfConte
         Transition_FlushSeq(obj, why == TRANS_WHY_FOCUS ? "focus" : "ext-switch");
         Transition_FlushComposition(obj, why == TRANS_WHY_FOCUS ? "focus" : "ext-switch");
     }
+    // A callback may have begun another input transaction while the old one
+    // was being delivered. Its text/target belong to the nested transaction.
+    if (obj->cpPendingInFlight || (!wasInline && obj->fsm.state!=STATE_EMPTY) ||
+        (!wasInline && why!=TRANS_WHY_KEY && obj->compTargetCtx)) return;
     Jamotong_FoldInput(obj);             // 접는 일은 한 곳에만 (B3)
 }
 
@@ -369,7 +447,15 @@ void Jamotong_OnLayoutSwitched(JamotongTextService *obj) {
 // RFC-0010: 문서 인라인 조합이 남아 있으면 '확정'(텍스트 보존)하고 경로 캐시를 비운다 —
 // 포커스 이동 시 MS IME 관례(조합 텍스트 유지). Esc 취소는 호출 전에 JamoComp_Cancel.
 static void ResetComposition(JamotongTextService *obj) {
-    if (JamoComp_Finalize(obj) != S_OK) return;
+    if (obj->cpPendingInFlight || (obj->cpPendingCommit && obj->fsm.state!=STATE_EMPTY)) return;
+    ITfContext *target=obj->compTargetCtx;
+    RiumOwnerBinding binding=obj->compTargetOwner;
+    FsmContext fsm=obj->fsm;
+    uint64_t epoch=obj->inputOwner.epoch;
+    if (JamoComp_Finalize(obj)!=S_OK) return;
+    if (obj->pComposition || obj->compTargetCtx!=target || obj->inputOwner.epoch!=epoch ||
+        memcmp(&obj->compTargetOwner,&binding,sizeof binding) ||
+        (obj->fsm.state!=STATE_EMPTY && memcmp(&obj->fsm,&fsm,sizeof fsm))) return;
     Jamotong_ClearCompositionState(obj);
 }
 
@@ -394,10 +480,12 @@ static bool OutputResultSeq(JamotongTextService *obj, ITfContext *pic, FsmResult
     if (!isFlush && (obj->compFinalizePending || obj->compBoundaryWritten ||
         (obj->pComposition && !JamoComp_OwnsFocus(obj, pic)))) return false;
     CompTarget_Remember(obj, pic);   // 조합 대상 기억 (조합마다 한 번, RFC-0008 W1-09)
-    if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus()) return false;
+    if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus() ||
+        !RiumOwner_AllowsWrite(&obj->inputOwner,&obj->compTargetOwner,FALSE)) return false;
     // Check the context's interfaces, not the application or control class name.
     JamoPathKind path = pic ? JamoComp_PathForContext(obj, pic) : JAMO_PATH_COMMIT;
-    if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus()) return false;
+    if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus() ||
+        !RiumOwner_AllowsWrite(&obj->inputOwner,&obj->compTargetOwner,FALSE)) return false;
     if (pic && path == JAMO_PATH_STANDARD) {
         if (JamoComp_IsActive(obj) && isFlush) {
             if (JamoComp_Finalize(obj) != S_OK) return false;
@@ -406,11 +494,13 @@ static bool OutputResultSeq(JamotongTextService *obj, ITfContext *pic, FsmResult
             return true;
         }
         if (!isFlush) {
-            if (SUCCEEDED(JamoComp_Apply(obj, pic, res))) {
+            HRESULT applyHr=JamoComp_Apply(obj, pic, res);
+            if (SUCCEEDED(applyHr)) {
                 obj->prevChipValid = FALSE; obj->chipPendingAdv = 0;
                 PreeditOverlay_Hide();   // 문서가 밑줄 preedit를 직접 표시한다
                 return true;
             }
+            if (applyHr==E_PENDING) return false;
             if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus()) return false;
             // 실패: Apply가 rollback+강등까지 마쳤다 — 이 키 결과는 아래 기존 경로로 커밋.
         }
@@ -993,66 +1083,62 @@ static HWND FocusHwnd(void) {
     return (GetGUIThreadInfo(0, &gti) && gti.hwndFocus) ? gti.hwndFocus : NULL;
 }
 
-// target = 예약 때의 포커스 창(RFC-0008 W1-01). 경로 규칙은 transition.h.
-static void ResendKeyNow(WPARAM vk, LPARAM lParam, HWND target) {
-    HWND focus = FocusHwnd();
-    int alive = target && IsWindow(target);
-    int isEdit = alive && IsEditFamily(target);
-    TransResendRoute r = Trans_ResendRoute(target != NULL, alive, isEdit, focus == target);
-    if (r == TRANS_RESEND_POST) {
-        LPARAM base = lParam & 0x01FF0000;   // 스캔코드·확장키 비트 유지
-        LPARAM rep = (lParam & 0xFFFF) ? (lParam & 0xFFFF) : 1;   // 원래 반복 횟수 (W1-01)
-        if (PostMessageW(target, WM_KEYDOWN, vk, base | rep)) {
-            if (!PostMessageW(target, WM_KEYUP, vk, base | 0xC0000001))
-                JamoDiag("RESEND vk=%02X keyup post failed err=%lu", (unsigned)vk, (unsigned long)GetLastError());
-            JamoDiag("RESEND vk=%02X via PostMessage", (unsigned)vk);
+// Capture before any composition commit can reenter the host.
+typedef struct { HWND hwnd; RiumOwnerBinding binding; } ResendTarget;
+static void CaptureResendTarget(JamotongTextService *obj, ResendTarget *target) {
+    target->hwnd=FocusHwnd();
+    RiumOwner_Capture(&obj->inputOwner,&target->binding);
+}
+static bool ResendOwnsTarget(JamotongTextService *obj,const ResendTarget *target) {
+    DWORD pid=0;
+    if (!obj || !target->hwnd || FocusHwnd()!=target->hwnd || !IsWindow(target->hwnd) ||
+        GetWindowThreadProcessId(target->hwnd,&pid)!=GetCurrentThreadId() || pid!=GetCurrentProcessId()) return false;
+    return RiumOwner_AllowsWrite(&obj->inputOwner,&target->binding,TRUE);
+}
+static void ResendKeyNow(JamotongTextService *obj,WPARAM vk,LPARAM lParam,const ResendTarget *target) {
+    if (!ResendOwnsTarget(obj,target)) return;
+    // EM_GETSEL calls host code; its result cannot carry ownership across reentry.
+    bool isEdit=IsEditFamily(target->hwnd);
+    if (!ResendOwnsTarget(obj,target)) return;
+    if (isEdit) {
+        LPARAM base=lParam & 0x01FF0000;
+        LPARAM rep=(lParam & 0xFFFF)?(lParam & 0xFFFF):1;
+        if (PostMessageW(target->hwnd,WM_KEYDOWN,vk,base|rep)) {
+            if (!PostMessageW(target->hwnd,WM_KEYUP,vk,base|0xC0000001))
+                JamoDiag("RESEND keyup post failed err=%lu",(unsigned long)GetLastError());
             return;
         }
-        // 게시 실패(큐 한도 등): 그 창이 여전히 포커스면 SendInput 으로 대신, 아니면 버린다.
-        JamoDiag("RESEND vk=%02X post failed err=%lu", (unsigned)vk, (unsigned long)GetLastError());
-        r = (focus == target) ? TRANS_RESEND_SENDINPUT : TRANS_RESEND_DROP;
     }
-    if (r == TRANS_RESEND_DROP) {
-        JamoDiag("RESEND vk=%02X dropped (target gone or focus moved)", (unsigned)vk);
-        return;
-    }
-    JamoDiag("RESEND vk=%02X via SendInput", (unsigned)vk);
-    SendKeyThrough(vk, lParam);
+    if (ResendOwnsTarget(obj,target)) SendKeyThrough(vk,lParam);
 }
-// 경계키 재전송 보류. 타이머 콜백은 Windows 가 **전역 함수로** 부르므로 인스턴스 필드로 옮길 수
-// 없다(RFC-0008 W0-03 에서 UI 창과 같은 부류). 대신 **소유 인스턴스를 기록**해, 그 인스턴스가
-// 내려갈 때 자기 것만 정리하고 남의 것은 건드리지 않는다.
-static WPARAM  g_pendResendVk = 0;
-static LPARAM  g_pendResendLp = 0;
-static HWND    g_pendResendHwnd = NULL;   // 예약 때의 포커스 창 (W1-01)
-static UINT_PTR g_pendResendTimer = 0;
-static JamotongTextService *g_pendResendOwner = NULL;
-
-static void CALLBACK ResendTimerProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time) {
-    (void)hwnd; (void)msg; (void)time;
-    KillTimer(NULL, id);
-    if (id == g_pendResendTimer) {
-        g_pendResendTimer = 0;
-        ResendKeyNow(g_pendResendVk, g_pendResendLp, g_pendResendHwnd);
-    }
+static WPARAM g_pendResendVk;
+static LPARAM g_pendResendLp;
+static ResendTarget g_pendResendTarget;
+static UINT_PTR g_pendResendTimer;
+static JamotongTextService *g_pendResendOwner;
+static void DeliverPendingKeyResend(void) {
+    JamotongTextService *obj=g_pendResendOwner;
+    ResendTarget target=g_pendResendTarget;
+    WPARAM vk=g_pendResendVk;LPARAM lp=g_pendResendLp;
+    UINT_PTR timer=g_pendResendTimer;
+    // Detach before any host callback can schedule another reservation.
+    g_pendResendOwner=NULL;g_pendResendTimer=0;
+    g_pendResendTarget=(ResendTarget){0};
+    if(timer)KillTimer(NULL,timer);
+    if(!obj)return;
+    ITfTextInputProcessor *tip=(ITfTextInputProcessor*)&obj->lpVtblTIP;
+    tip->lpVtbl->AddRef(tip);
+    ResendKeyNow(obj,vk,lp,&target);
+    tip->lpVtbl->Release(tip);
 }
-// RFC-0008 W0-02: 보류 중인 재전송을 지금 끝낸다. Deactivate 가 이걸 안 부르면 타이머 콜백이
-// (해제된) DLL 코드로 들어올 수 있고, 보류하던 키는 조용히 사라진다. 순서를 지키려고 **버리지
-// 않고 즉시 방출**한다. `KillTimer` 는 이미 큐에 든 WM_TIMER 를 지우지 않으므로 id 도 0 으로
-// 비워, 뒤늦게 들어온 콜백이 아무 일도 하지 않게 한다.
+static void CALLBACK ResendTimerProc(HWND hwnd,UINT msg,UINT_PTR id,DWORD time) {
+    (void)hwnd;(void)msg;(void)time;
+    if (id && id==g_pendResendTimer) DeliverPendingKeyResend();
+}
 static void FlushPendingKeyResend(JamotongTextService *obj) {
-    if (!g_pendResendTimer) return;
-    if (g_pendResendOwner && g_pendResendOwner != obj) return;   // 남의 보류는 건드리지 않는다
-    UINT_PTR t = g_pendResendTimer;
-    g_pendResendTimer = 0;
-    g_pendResendOwner = NULL;
-    KillTimer(NULL, t);
-    ResendKeyNow(g_pendResendVk, g_pendResendLp, g_pendResendHwnd);
+    if (g_pendResendOwner==obj) DeliverPendingKeyResend();
 }
 
-// ── 3판 조합: 키 이벤트 없이 흐르는 시간으로 hold 확정 (RFC-0016 §7.1) ──────────────────────
-//   ChordKb_NextTickMs 가 0 이 아닐 때만 스레드 타이머를 건다. 재전송 타이머와 같은 규칙:
-//   전역 콜백이므로 소유 인스턴스를 기록하고, 그 인스턴스가 내려갈 때 자기 것만 끈다 (W0-02·W0-03).
 static UINT_PTR g_chordTimer = 0;
 static JamotongTextService *g_chordTimerOwner = NULL;
 
@@ -1216,19 +1302,16 @@ static void HangulTextSink(void *ctx, const wchar_t *text) {
 // 타이머가 살아 있는 동안에는 DLL 을 내리면 안 된다 (dllmain.c 의 DllCanUnloadNow 가 묻는다).
 bool Jamotong_HasPendingTimers(void) { return g_pendResendTimer != 0 || g_chordTimer != 0; }
 
-static void ScheduleKeyResend(JamotongTextService *obj, WPARAM vk, LPARAM lParam) {
-    if (g_pendResendTimer) {   // 이전 보류분은 즉시 방출(순서 유지) 후 새 키를 보류
-        KillTimer(NULL, g_pendResendTimer);
-        g_pendResendTimer = 0;
-        ResendKeyNow(g_pendResendVk, g_pendResendLp, g_pendResendHwnd);
-    }
-    g_pendResendVk = vk; g_pendResendLp = lParam; g_pendResendOwner = obj;
-    g_pendResendHwnd = FocusHwnd();   // 지금 키를 받던 창 — 30ms 뒤 포커스가 바뀌어도 여기로만 (W1-01)
-    g_pendResendTimer = SetTimer(NULL, 0, RESEND_DELAY_MS, ResendTimerProc);
-    if (!g_pendResendTimer) ResendKeyNow(vk, lParam, g_pendResendHwnd);   // 타이머 실패 시 즉시 재전달
+static void ScheduleKeyResend(JamotongTextService *obj,WPARAM vk,LPARAM lParam,const ResendTarget *target) {
+    DeliverPendingKeyResend();
+    // A displaced delivery may have called host code or installed a new timer.
+    if (g_pendResendOwner || !ResendOwnsTarget(obj,target)) return;
+    g_pendResendVk=vk;g_pendResendLp=lParam;
+    g_pendResendOwner=obj;g_pendResendTarget=*target;
+    g_pendResendTimer=SetTimer(NULL,0,RESEND_DELAY_MS,ResendTimerProc);
+    if(!g_pendResendTimer)DeliverPendingKeyResend();
 }
 
-// ASCII → 전각(full-width). 전각 모드일 때 라틴/숫자/기호를 전각 폭 문자로 변환.
 static wchar_t ToFullWidth(wchar_t c) {
     if (c == L' ') return 0x3000;                         // 전각 공백
     if (c >= 0x21 && c <= 0x7E) return (wchar_t)(c - 0x21 + 0xFF01);   // ! ~ → ！ ～
@@ -1294,6 +1377,10 @@ static HRESULT STDMETHODCALLTYPE KES_OnTestKeyDown(ITfKeyEventSink *pThis, ITfCo
     // (Config_CurrentMods 는 GetKeyState 5회; 기능마다 다시 부르면 키 하나에 수십 회 syscall).
     const UINT skVk = Config_ResolveVK(wParam, lParam);
     const UINT skMods = Config_CurrentMods();
+
+    /* A verified command surface receives the original event before any old
+     * composition is flushed or retried against a shared CUAS context. */
+    if (OwnerPassesCommand(obj,wParam,skMods)) return S_OK;
 
     // 앱이 이 문맥의 입력기를 껐다(KEYBOARD_DISABLED) → 아무 키도 건드리지 않는다 (RFC-0012 Phase 1).
     Compart_ReadContextDisabled(obj, pic);   // RIUM: no stale focus cache on the first key
@@ -1541,6 +1628,7 @@ static HRESULT STDMETHODCALLTYPE KES_OnKeyDown(ITfKeyEventSink *pThis, ITfContex
     if ((ULONG_PTR)GetMessageExtraInfo() == JAMO_SYNTH_MARK) { JamoDiag("KD  vk=%02X SYNTH-pass", (unsigned)wParam); return S_OK; }
     const UINT skVk = Config_ResolveVK(wParam, lParam);    // OnTestKeyDown 과 같은 이유로 1회만
     const UINT skMods = Config_CurrentMods();
+    if (OwnerPassesCommand(obj,wParam,skMods)) return S_OK;
     JamoDiag("KD  vk=%02X state=%d", (unsigned)wParam, (int)obj->fsm.state);
 
     // 무간섭(직접 입력) 모드: 해제 단축키만 처리, 그 외 전부 통과 (OnTestKeyDown과 동일 판단).
@@ -1992,8 +2080,9 @@ static HRESULT STDMETHODCALLTYPE KES_OnKeyDown(ITfKeyEventSink *pThis, ITfContex
                         if (pfEaten) *pfEaten = TRUE;
                         goto kd_done;
                     }
+                    ResendTarget resendTarget;CaptureResendTarget(obj,&resendTarget);
                     SeqApply(obj, pic, &fr);
-                    ScheduleKeyResend(obj, wParam, lParam);
+                    ScheduleKeyResend(obj, wParam, lParam,&resendTarget);
                     if (pfEaten) *pfEaten = TRUE;
                     goto kd_done;
                 }
@@ -2131,12 +2220,13 @@ static HRESULT STDMETHODCALLTYPE KES_OnKeyDown(ITfKeyEventSink *pThis, ITfContex
                 // (편집세션 텍스트 삽입은 터미널(PuTTY 등)엔 안 통함. 방향키 이동·엔터·터미널 모두 지원.)
                 FsmResult res = {Fsm_PeekPreedit(&obj->fsm), 0, false};
                 JamoDiag("FLUSH commit=U+%04X then resend vk=%02X (delayed)", (unsigned)res.commitChar, (unsigned)wParam);
+                ResendTarget resendTarget;CaptureResendTarget(obj,&resendTarget);
                 if (!OutputResultSeq(obj, pic, res, TRUE)) {
                     if (pfEaten) *pfEaten = TRUE;
                     goto kd_done;
                 }
                 Fsm_Flush(&obj->fsm);
-                ScheduleKeyResend(obj, wParam, lParam);   // 지연 재전달 — CUAS 전달 경합 방지 (AkelPad 엔터 소실)
+                ScheduleKeyResend(obj, wParam, lParam,&resendTarget);   // 지연 재전달 — CUAS 전달 경합 방지 (AkelPad 엔터 소실)
                 if (pfEaten) *pfEaten = TRUE;   // 원본 소비(재전달본이 대신 처리)
             }
         }
@@ -2524,6 +2614,7 @@ static HRESULT TIP_ActivateCommon(ITfTextInputProcessor *pThis, ITfThreadMgr *pt
 #endif
     JamotongTextService *obj = IMPL_TO_OBJ(TIP, pThis);
     obj->activateFlags = dwFlags;
+    RiumOwnerRuntime_Attach(&obj->inputOwner);
     JamoDiag("ACTIVATE flags=0x%08lX tid=%lu", (unsigned long)dwFlags, (unsigned long)GetCurrentThreadId());
     obj->threadMgr = ptim;
     obj->threadMgr->lpVtbl->AddRef(obj->threadMgr);

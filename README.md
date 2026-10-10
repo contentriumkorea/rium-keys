@@ -1,6 +1,8 @@
-# RIUM Keys
+# CONTENTRIUM Keys
 
-이 개발 브랜치에는 Windows 입력기로 전환하는 **2.0.0-preview.4**와 후속 실험 코드가 포함되어 있습니다. [로컬 입력기 설치와 검증 상태](native-ime/README.md)를 참고하세요. Premiere·Studio One의 일부 한글 단축키 시험은 실험 코드에서 성공했지만, 범용 입력 보존 검증에서 실패하여 새 설치본의 공개 배포는 보류했습니다. 설치된 preview.4 자체가 그 실험 기능을 포함하는 것은 아닙니다. 새 입력기의 모든 앱 호환성과 자동 업데이트는 아직 검증·구현이 완료되지 않았습니다. 아래 설명과 공개 다운로드는 기존 **1.1.1 트레이 유틸리티** 기준입니다.
+이 개발 브랜치에는 Windows 입력기로 전환하는 **2.0.0-preview.9** 후보가 포함되어 있습니다. 프로그램 이름은 **CONTENTRIUM Keys**이며, 우측 하단 아이콘은 [투명 배경 CK 로고](assets/contentrium-keys.png)를 사용합니다. 기존 설정과 입력기 등록을 이어받도록 내부 식별자와 설치 경로는 유지합니다. Premiere 오디오 타임라인의 단축키 판별을 추가하고, 편집 영역에서 입력칸으로 돌아왔을 때 첫 음절이 갈라지는 원인을 수정했습니다. 실제 설치와 앱별 확인 결과는 [입력기 안내](native-ime/README.md)와 [검증 기록](docs/input-owner-validation.md)에 구분해 기록합니다. 모든 앱 호환성과 새 입력기의 자동 업데이트는 아직 완료되지 않았습니다.
+
+아래 설명과 공개 다운로드는 이름 변경 전 **RIUM Keys 1.1.1 트레이 유틸리티** 기준입니다. 새 입력기 후보는 이 공개 자동 업데이트에 포함되지 않습니다.
 
 한글 입력 상태를 유지하면서 PC 전반의 인식 가능한 비텍스트 영역에서 단축키를 전달하는 Windows 트레이 유틸리티입니다.
 
@@ -42,4 +44,4 @@ Windows x64, .NET 10 SDK, NSIS 3.13이 필요합니다. NSIS를 `tools/nsis-3.13
 
 배포 메타데이터는 `./sign-release.ps1`로 생성합니다. 서명용 개인 키는 저장소에 포함하지 않습니다. `src/update-public.pem`은 업데이트 검증용 공개 키입니다.
 
-Contentrium · RIUM Keys
+Contentrium · CONTENTRIUM Keys

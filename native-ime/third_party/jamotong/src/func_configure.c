@@ -61,7 +61,7 @@ static ULONG STDMETHODCALLTYPE FC_Release(ITfFnConfigure *p) {
 }
 static HRESULT STDMETHODCALLTYPE FC_GetDisplayName(ITfFnConfigure *p, BSTR *pbstr) {
     (void)p; if (!pbstr) return E_INVALIDARG;
-    *pbstr = SysAllocString(L"RIUM Keys"); return *pbstr ? S_OK : E_OUTOFMEMORY;
+    *pbstr = SysAllocString(L"CONTENTRIUM Keys"); return *pbstr ? S_OK : E_OUTOFMEMORY;
 }
 static HRESULT STDMETHODCALLTYPE FC_Show(ITfFnConfigure *p, HWND hwndParent, LANGID langid, REFGUID rguidProfile) {
     (void)p;

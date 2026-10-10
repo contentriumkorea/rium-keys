@@ -1,7 +1,7 @@
 $ErrorActionPreference='Stop'
 $statePath=(Get-ItemProperty 'HKCU:\Software\Contentrium\RiumKeysInput' -Name InstallState).InstallState
 $state=Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-if($state.UserSid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value){throw 'Run uninstall as the user who installed RIUM Keys.'}
+if($state.UserSid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value){throw 'Run uninstall as the user who installed CONTENTRIUM Keys.'}
 if([IO.Path]::GetFullPath($state.InstallRoot) -ne [IO.Path]::GetFullPath($PSScriptRoot)){
     throw 'This uninstaller does not own the current installation. Use the current installed-apps entry.'
 }
@@ -15,4 +15,4 @@ $process=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-File',('"
 $process.WaitForExit()
 if($process.ExitCode){throw 'Machine removal failed. See uninstall-result.log in the installed directory.'}
 Remove-ItemProperty 'HKCU:\Software\Contentrium\RiumKeysInput' -Name InstallState -ErrorAction SilentlyContinue
-'RIUM Keys removed. Previous input method restored; settings and recovery files retained.'
+'CONTENTRIUM Keys removed. Previous input method restored; settings and recovery files retained.'

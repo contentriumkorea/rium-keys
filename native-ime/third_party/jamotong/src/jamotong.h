@@ -12,6 +12,7 @@
 #include "chord.h"
 #include "chord_layout.h"
 #include "seq_layout.h"
+#include "../../../input-owner.h"
 
 // RIUM Keys fork identity. Never register over upstream Jamotong.
 DEFINE_GUID(CLSID_JamotongIME, 
@@ -137,6 +138,9 @@ typedef struct JamotongTextService {
     long  cpLastOpen, cpLastConv;  // 마지막으로 발행/수용한 값 (-1 = 아직 없음). 같으면 안 쓴다.
     BOOL  cpSelfWrite;             // 우리가 쓰는 중 — OnChange 메아리 무시
     BOOL  ctxKeyboardDisabled;     // 포커스 문맥의 KEYBOARD_DISABLED (앱이 입력기를 껐다) 캐시
+    RiumOwnerState inputOwner;
+    RiumOwnerBinding compTargetOwner, pendingOwner, inlineOwner;
+    BOOL inputOwnerBoundary;
 
     // ── RFC-0013 C preserved key (preserved.c) ──
     JamoPreservedEntry preserved[JAMO_PRESERVED_MAX];

@@ -44,7 +44,7 @@ static void ReusedEngineSession(){
     Require(UserTip(true),"enable temporary reused-engine profile");Check(RefreshTipCache(),"refresh temporary profile cache");
     WNDCLASSW cls{};cls.lpfnWndProc=DefWindowProcW;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"RiumReusedEngineFixture";
     RegisterClassW(&cls);
-    HWND window=CreateWindowExW(0,cls.lpszClassName,L"RIUM Keys - reused input engine test",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,620,190,nullptr,nullptr,cls.hInstance,nullptr);
+    HWND window=CreateWindowExW(0,cls.lpszClassName,L"CONTENTRIUM Keys - input engine test",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,620,190,nullptr,nullptr,cls.hInstance,nullptr);
     Require(window!=nullptr,"create isolated native fixture");
     HWND edit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,20,20,550,32,window,nullptr,cls.hInstance,nullptr);
     HWND button=CreateWindowExW(0,L"BUTTON",L"Shortcut surface (V)",WS_CHILD|WS_VISIBLE|WS_TABSTOP,20,70,240,30,window,nullptr,cls.hInstance,nullptr);

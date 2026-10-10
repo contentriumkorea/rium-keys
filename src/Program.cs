@@ -52,7 +52,7 @@ internal sealed class TrayApp : ApplicationContext
         bridge=new(probe);
         if(paused||!Preferences.Read("Enabled"))bridge.TogglePause();
         var menu=new ContextMenuStrip();
-        menu.Items.Add(new ToolStripMenuItem("RIUM Keys  "+AutoUpdater.Version){Enabled=false});
+        menu.Items.Add(new ToolStripMenuItem("CONTENTRIUM Keys  "+AutoUpdater.Version){Enabled=false});
         menu.Items.Add(status);menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(enabled);menu.Items.Add(startup);menu.Items.Add(automatic);
         menu.Items.Add(check);menu.Items.Add(updateStatus);menu.Items.Add(new ToolStripSeparator());
@@ -62,7 +62,7 @@ internal sealed class TrayApp : ApplicationContext
         automatic.Click+=(_,_)=>{bool value=!Preferences.Read("AutoUpdate");if(Preferences.Write("AutoUpdate",value)){if(!value)updater.Cancel();else nextUpdate=Environment.TickCount64;}RefreshMenu();};
         check.Click+=async(_,_)=>await updater.CheckAsync();
         menu.Opening+=(_,_)=>RefreshMenu();
-        tray=new NotifyIcon{Text="RIUM Keys",Icon=System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!)??System.Drawing.SystemIcons.Application,ContextMenuStrip=menu,Visible=true};
+        tray=new NotifyIcon{Text="CONTENTRIUM Keys",Icon=System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!)??System.Drawing.SystemIcons.Application,ContextMenuStrip=menu,Visible=true};
         timer.Tick+=async(_,_)=>{
             if(exitSignal.WaitOne(0)){ExitThread();return;}
             RefreshMenu();
@@ -75,7 +75,7 @@ internal sealed class TrayApp : ApplicationContext
         enabled.Checked=!bridge.Paused;startup.Checked=Preferences.Startup;automatic.Checked=Preferences.Read("AutoUpdate");
         status.Text=bridge.Paused?"기능 꺼짐":"기능 켜짐 · "+probe.Current.Reason;
         updateStatus.Text=updater.Status;check.Enabled=!updater.Busy;
-        tray.Text=bridge.Paused?"RIUM Keys · OFF":"RIUM Keys · ON";
+        tray.Text=bridge.Paused?"CONTENTRIUM Keys · OFF":"CONTENTRIUM Keys · ON";
     }
     protected override void ExitThreadCore(){Cleanup();base.ExitThreadCore();}
     protected override void Dispose(bool disposing){if(disposing)Cleanup();base.Dispose(disposing);}

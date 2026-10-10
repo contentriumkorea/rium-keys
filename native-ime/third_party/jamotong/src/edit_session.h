@@ -6,6 +6,9 @@ typedef struct {
     wchar_t composing[128];
     HWND focusOwner; // Optional immutable target for synchronous pending delivery.
     BOOL bindFocus;
+    RiumOwnerBinding inputOwner;
+    BOOL bindInputOwner;
+    BOOL deferred;
 } EditSessionData;
 
 HRESULT RequestEditSession(JamotongTextService *pService, ITfContext *pContext, FsmResult fsmRes);
@@ -35,6 +38,8 @@ bool EditCtl_SelectWordBeforeCaret(HWND h, const wchar_t *word);
 // h의 현재 선택을 str로 교체(빈 선택이면 캐럿에 삽입). AkelEdit는 TSF 삽입을 반영 안 해
 // 커밋·교체 모두 이 경로가 신뢰성 있다.
 bool EditCtl_ReplaceSelection(HWND h, const wchar_t *str);
+bool EditCtl_ReplaceSelectionOwned(HWND h, const wchar_t *str, JamotongTextService *svc,
+                                   const RiumOwnerBinding *owner, BOOL deferred);
 // 선택을 그 끝의 캐럿으로 접는다 (우리가 잡은 선택을 교체하지 못했을 때 되돌리는 용도).
 void EditCtl_CollapseSelectionToEnd(HWND h);
 // 컨트롤 h 의 현재 선택 텍스트(최대 maxLen 자). 읽지 못하면 false.

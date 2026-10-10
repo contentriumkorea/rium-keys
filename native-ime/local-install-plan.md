@@ -1,4 +1,4 @@
-# RIUM Keys local IME installation
+# CONTENTRIUM Keys local IME installation
 
 The user explicitly requested replacing the installed 1.1.1 tray bridge with
 the native input method on this PC. This authorizes a local preview installation;

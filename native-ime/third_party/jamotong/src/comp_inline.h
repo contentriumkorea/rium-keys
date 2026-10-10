@@ -23,7 +23,7 @@ HRESULT JamoComp_Apply(JamotongTextService *svc, ITfContext *pic, FsmResult res)
 // 활성 문서 composition 존재 여부.
 BOOL JamoComp_IsActive(const JamotongTextService *svc);
 // Ownership only: a shared CUAS context is not proof of the same input target.
-BOOL JamoComp_OwnsFocus(const JamotongTextService *svc, ITfContext *ctx);
+BOOL JamoComp_OwnsFocus(JamotongTextService *svc, ITfContext *ctx);
 
 // 확정: 조합 텍스트는 문서에 그대로 두고 composition만 종료(플러시·포커스 이동·한자키).
 // preedit 재삽입 금지 — 텍스트는 이미 문서 안에 있다.
@@ -31,6 +31,8 @@ HRESULT JamoComp_Finalize(JamotongTextService *svc);
 // Keep final syllable and space in one edit session, before the IMM bridge commits.
 HRESULT JamoComp_CommitWithSpace(JamotongTextService *svc, wchar_t syllable);
 // Finish a pending boundary before accepting input in this or another context.
+// Exact original DVA TEXT with a lifetime token may synchronously retire only
+// its old composition handle after an epoch change; no text/caret edits or rebasing.
 BOOL JamoComp_PrepareInput(JamotongTextService *svc, ITfContext *ctx);
 // Called only after the matching composition has actually ended.
 void Jamotong_ClearCompositionState(JamotongTextService *svc);

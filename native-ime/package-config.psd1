@@ -1,6 +1,6 @@
 @{
-    Version = '2.0.0-preview.5'
-    UpgradeFrom = '2.0.0-preview.4'
+    Version = '2.0.0-preview.9'
+    UpgradeFrom = '2.0.0-preview.8'
     Channel = 'manual-prerelease'
     PayloadPaths = @(
         'x64\RiumKeysInput.dll', 'x86\RiumKeysInput.dll', 'x64\RiumKeysControl.exe',

@@ -7,7 +7,7 @@
 #define JAMO_E_COMPOSITION_REJECTED MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x201)
 
 typedef enum { COMP_OP_UPDATE = 0, COMP_OP_FINALIZE = 1, COMP_OP_CANCEL = 2,
-               COMP_OP_SPACE = 3 } CompOp;
+               COMP_OP_SPACE = 3, COMP_OP_RETIRE = 4 } CompOp;
 
 typedef struct InlineEditSession {
     ITfEditSessionVtbl *lpVtbl;
@@ -18,12 +18,40 @@ typedef struct InlineEditSession {
     wchar_t commit;    // COMP_OP_UPDATE: 확정 음절 (0=없음)
     wchar_t preedit;   // COMP_OP_UPDATE: 조합 중 음절 (0=없음)
     HWND focusHwnd;   // Captured before any reentrant host call.
+    RiumOwnerBinding inputOwner;
+    BOOL deferred;
     ITfComposition *expectedComposition; // Bind queued finalization to its original document.
 } InlineEditSession;
+
+// Retirement grants only EndComposition on the retained original handle.
+// It never rebases inlineOwner or grants a text/selection mutation after an epoch change.
+static BOOL RetirementTupleMatches(InlineEditSession *es) {
+    return es->expectedComposition && es->svc->pComposition==es->expectedComposition &&
+        es->svc->pCompContext==es->ctx && es->focusHwnd && GetFocus()==es->focusHwnd &&
+        es->svc->pCompFocusHwnd==es->focusHwnd &&
+        es->inputOwner.stamp.provider==1 && es->inputOwner.stamp.profile==1 &&
+        es->inputOwner.stamp.kind==RIUM_OWNER_TEXT && es->inputOwner.stamp.lifetimeToken &&
+        !memcmp(&es->inputOwner.stamp,&es->svc->inlineOwner.stamp,sizeof(RiumOwnerStamp)) &&
+        RiumOwner_AllowsWrite(&es->svc->inputOwner,&es->inputOwner,FALSE);
+}
+static BOOL RetirementOwnsContext(InlineEditSession *es) {
+    if(!RetirementTupleMatches(es)||!es->svc->threadMgr)return FALSE;
+    ITfThreadMgr *manager=es->svc->threadMgr;
+    ITfDocumentMgr *doc=NULL;ITfContext *current=NULL;BOOL same=FALSE;
+    HRESULT hr=manager->lpVtbl->GetFocus(manager,&doc);
+    if(hr==S_OK && doc && es->svc->threadMgr==manager && RetirementTupleMatches(es)) {
+        hr=doc->lpVtbl->GetTop(doc,&current);
+        same=hr==S_OK && current==es->ctx && RetirementTupleMatches(es);
+    }
+    if(current)current->lpVtbl->Release(current);
+    if(doc)doc->lpVtbl->Release(doc);
+    return same && es->svc->threadMgr==manager && RetirementTupleMatches(es);
+}
 
 // A retained, different document can finish after focus leaves its window.
 // Prove distinct COM identity; a shared CUAS context must still match its HWND.
 static BOOL SessionOwnsTarget(InlineEditSession *es) {
+    if (!RiumOwner_AllowsWrite(&es->svc->inputOwner,&es->inputOwner,es->deferred)) return FALSE;
     if (es->focusHwnd && es->focusHwnd == GetFocus()) return TRUE;
     if (es->op != COMP_OP_FINALIZE || !es->svc->threadMgr) return FALSE;
     ITfDocumentMgr *doc=NULL;ITfContext *current=NULL;
@@ -54,6 +82,8 @@ static void ForgetComposition(JamotongTextService *svc) {
     svc->compFinalizePending = FALSE;
     svc->compBoundaryWritten = FALSE;
     svc->pCompFocusHwnd = NULL;
+    ZeroMemory(&svc->inlineOwner,sizeof(svc->inlineOwner));
+    svc->inputOwnerBoundary = FALSE;
     if (composition) composition->lpVtbl->Release(composition);
     if (context) context->lpVtbl->Release(context);
 }
@@ -163,18 +193,26 @@ static HRESULT EnsureComposition(InlineEditSession *es, TfEditCookie ec, ITfRang
     if (svc->pComposition && svc->pCompContext != es->ctx) return E_UNEXPECTED;
 
     if (svc->pComposition) {
-        HRESULT hr = svc->pComposition->lpVtbl->GetRange(svc->pComposition, rangeOut);
-        if (SUCCEEDED(hr)) {
+        ITfComposition *existing=svc->pComposition;
+        existing->lpVtbl->AddRef(existing);
+        HRESULT hr=E_PENDING;
+        if (svc->pComposition==existing && SessionOwnsTarget(es))
+            hr=existing->lpVtbl->GetRange(existing,rangeOut);
+        existing->lpVtbl->Release(existing);
+        if (SUCCEEDED(hr) && (svc->pComposition!=existing || !SessionOwnsTarget(es))) hr=E_PENDING;
+        if (FAILED(hr) && *rangeOut) { (*rangeOut)->lpVtbl->Release(*rangeOut);*rangeOut=NULL; }
+        if (SUCCEEDED(hr) && *rangeOut) {
             svc->compUpdatedOnce = TRUE;   // 갱신에서 생존한 조합 — 이 컨텍스트는 건강
             svc->pathDemerits = 0;
         }
-        return hr;
+        return SUCCEEDED(hr) && !*rangeOut ? E_UNEXPECTED : hr;
     }
 
     ITfInsertAtSelection *pIns = NULL;
     ITfRange *insRange = NULL;
     ITfContextComposition *pCC = NULL;
     ITfComposition *created = NULL;
+    ITfContext *retainedContext = NULL;
     HRESULT hr = es->ctx->lpVtbl->QueryInterface(es->ctx, &IID_ITfInsertAtSelection, (void**)&pIns);
     if (FAILED(hr)) goto done;
     if (!SessionOwnsTarget(es)) { hr=E_PENDING; goto done; }
@@ -194,19 +232,29 @@ static HRESULT EnsureComposition(InlineEditSession *es, TfEditCookie ec, ITfRang
     if (FAILED(hr)) goto done;
     if (!SessionOwnsTarget(es)) { hr=E_PENDING; if(*rangeOut){(*rangeOut)->lpVtbl->Release(*rangeOut);*rangeOut=NULL;} goto done; }
 
-    svc->pComposition = created;   // publish (참조 이관)
-    created = NULL;
-    svc->pCompContext = es->ctx;
+    // Acquire every host reference before publication. AddRef and Release can
+    // enter another document and create a replacement composition.
     es->ctx->lpVtbl->AddRef(es->ctx);
-    svc->pCompFocusHwnd = es->focusHwnd;
-    svc->compUpdatedOnce = FALSE;
+    retainedContext=es->ctx;
 
 done:
-    if (FAILED(hr) && created) created->lpVtbl->EndComposition(created, ec);   // rollback
-    if (created) created->lpVtbl->Release(created);
     if (pCC) pCC->lpVtbl->Release(pCC);
     if (insRange) insRange->lpVtbl->Release(insRange);
     if (pIns) pIns->lpVtbl->Release(pIns);
+    if (SUCCEEDED(hr) && (!retainedContext || svc->pComposition || !SessionOwnsTarget(es))) hr=E_PENDING;
+    if (SUCCEEDED(hr)) {
+        // No host calls between these writes or after publishing this tuple.
+        svc->pComposition=created;created=NULL;
+        svc->pCompContext=retainedContext;retainedContext=NULL;
+        svc->pCompFocusHwnd=es->focusHwnd;
+        svc->inlineOwner=es->inputOwner;
+        svc->compUpdatedOnce=FALSE;
+    } else {
+        if (*rangeOut) { (*rangeOut)->lpVtbl->Release(*rangeOut);*rangeOut=NULL; }
+        if (created && !svc->pComposition && SessionOwnsTarget(es)) created->lpVtbl->EndComposition(created,ec);
+        if (created) created->lpVtbl->Release(created);
+        if (retainedContext) retainedContext->lpVtbl->Release(retainedContext);
+    }
     return hr;
 }
 
@@ -226,8 +274,9 @@ static HRESULT CommitPrefix(InlineEditSession *es, TfEditCookie ec, LONG commitL
     if (FAILED(hr) || moved != commitLen) { if (SUCCEEDED(hr)) hr = E_FAIL; goto done; }
     hr = newStart->lpVtbl->Collapse(newStart, ec, TF_ANCHOR_START);
     if (FAILED(hr)) goto done;
-    if (svc->pComposition == composition)
+    if (svc->pComposition == composition && SessionOwnsTarget(es))
         hr = composition->lpVtbl->ShiftStart(composition, ec, newStart);
+    else if (svc->pComposition == composition) hr=E_PENDING;
 done:
     if (newStart) newStart->lpVtbl->Release(newStart);
     if (whole) whole->lpVtbl->Release(whole);
@@ -235,9 +284,37 @@ done:
     return hr;
 }
 
+static void ApplyOwnedAttribute(InlineEditSession *es,TfEditCookie ec,ITfRange *range) {
+    if (!es->svc->daAtom || !SessionOwnsTarget(es)) return;
+    ITfProperty *property=NULL;
+    if (SUCCEEDED(es->ctx->lpVtbl->GetProperty(es->ctx,&GUID_PROP_ATTRIBUTE,&property)) && property) {
+        VARIANT value;VariantInit(&value);value.vt=VT_I4;value.lVal=(LONG)es->svc->daAtom;
+        if (SessionOwnsTarget(es)) property->lpVtbl->SetValue(property,ec,range,&value);
+        property->lpVtbl->Release(property);
+    }
+}
+
 // ── 편집 세션 본체 (한 키 = 한 동기 트랜잭션) ───────────────────────────────────────
 static HRESULT DoInlineWork(InlineEditSession *es, TfEditCookie ec) {
     JamotongTextService *svc = es->svc;
+
+    if(es->op==COMP_OP_RETIRE) {
+        if(!RetirementOwnsContext(es))return E_PENDING;
+        ITfComposition *old=es->expectedComposition; // Session holds its reference.
+        FsmContext beforeFsm=svc->fsm;
+        HRESULT hr=old->lpVtbl->EndComposition(old,ec);
+        if(hr!=S_OK)return hr;
+        if(svc->pComposition==old) {
+            // S_OK confirms this handle is ended even if the callback moved
+            // focus. Forget only this ended object; do not reset nested input.
+            if(!memcmp(&svc->fsm,&beforeFsm,sizeof beforeFsm))Fsm_Init(&svc->fsm);
+            ForgetComposition(svc);
+            if(!svc->pComposition && svc->fsm.state==STATE_EMPTY &&
+                RiumOwner_AllowsWrite(&svc->inputOwner,&es->inputOwner,FALSE))
+                Jamotong_ClearCompositionState(svc);
+        }
+        return !svc->pComposition && RiumOwner_AllowsWrite(&svc->inputOwner,&es->inputOwner,FALSE) ? S_OK : E_PENDING;
+    }
 
     if (es->expectedComposition && es->expectedComposition != svc->pComposition) return S_FALSE;
     if (!SessionOwnsTarget(es) || (svc->pComposition && svc->pCompContext != es->ctx))
@@ -269,7 +346,7 @@ static HRESULT DoInlineWork(InlineEditSession *es, TfEditCookie ec) {
                  (unsigned long)endHr);
         if (SUCCEEDED(endHr) && svc->pComposition == composition) ForgetComposition(svc);
         composition->lpVtbl->Release(composition);
-        CaptureCaret(svc, es->ctx, ec);
+        if (SessionOwnsTarget(es)) CaptureCaret(svc, es->ctx, ec);
         return FAILED(hr) ? hr : endHr;
     }
 
@@ -295,12 +372,19 @@ static HRESULT DoInlineWork(InlineEditSession *es, TfEditCookie ec) {
     hr = SessionOwnsTarget(es) ? range->lpVtbl->SetText(range, ec, 0, whole, n) : E_PENDING;
     if (FAILED(hr)) {
         // 방금 만든 조합이면 rollback — 실패를 감추면 증상이 엉뚱한 곳에서 나타난다.
-        if (createdNow && svc->pComposition) {
+        if (createdNow && svc->pComposition && SessionOwnsTarget(es)) {
             svc->pComposition->lpVtbl->EndComposition(svc->pComposition, ec);
             ForgetComposition(svc);
         }
         range->lpVtbl->Release(range);
         return hr;
+    }
+    // SetText already committed. An owner change during the host callback must
+    // neither relocate the new target's caret nor turn this into a retry.
+    if (!SessionOwnsTarget(es)) {
+        svc->inputOwnerBoundary=TRUE;
+        range->lpVtbl->Release(range);
+        return S_OK;
     }
     if (es->op == COMP_OP_SPACE) {
         range->lpVtbl->Release(range);
@@ -310,21 +394,23 @@ static HRESULT DoInlineWork(InlineEditSession *es, TfEditCookie ec) {
         return DoInlineWork(es, ec);
     }
     // 표시 속성(밑줄) 실패는 조합을 무효로 만들지 않는다 — 밑줄이 없을 뿐이다.
-    DA_ApplyToRange(es->ctx, ec, range, svc->daAtom);
+    ApplyOwnedAttribute(es,ec,range);
     BOOL interim = es->preedit && HasTransitoryExtensionParent(es->ctx);
     hr = SelectRangeEnd(es, ec, range, interim);
     range->lpVtbl->Release(range);
+    if (hr == E_PENDING) { svc->inputOwnerBoundary=TRUE; return S_OK; }
     if (FAILED(hr)) return hr;
 
     if (es->commit) {
         hr = CommitPrefix(es, ec, 1);
-        if (SUCCEEDED(hr) && !es->preedit && svc->pComposition) {
+        if (SUCCEEDED(hr) && !es->preedit && svc->pComposition && SessionOwnsTarget(es)) {
             HRESULT endHr = svc->pComposition->lpVtbl->EndComposition(svc->pComposition, ec);
             (void)endHr;   // 확정은 이미 성립 — End 실패로 되돌리지 않는다
             ForgetComposition(svc);
         }
     }
-    CaptureCaret(svc, es->ctx, ec);
+    if (SessionOwnsTarget(es)) CaptureCaret(svc, es->ctx, ec);
+    if (hr == E_PENDING) { svc->inputOwnerBoundary=TRUE; return S_OK; }
     return hr;
 }
 
@@ -382,6 +468,8 @@ static HRESULT RequestInline(JamotongTextService *svc, ITfContext *ctx, CompOp o
     es->svc = svc; es->ctx = ctx;
     es->op = op; es->commit = commit; es->preedit = preedit;
     es->focusHwnd = op == COMP_OP_UPDATE ? GetFocus() : svc->pCompFocusHwnd;
+    if (svc->pComposition && op!=COMP_OP_RETIRE) es->inputOwner=svc->inlineOwner;
+    else RiumOwner_Capture(&svc->inputOwner,&es->inputOwner);
     if (op != COMP_OP_UPDATE && svc->pComposition) {
         es->expectedComposition = svc->pComposition;
         es->expectedComposition->lpVtbl->AddRef(es->expectedComposition);
@@ -396,6 +484,11 @@ static HRESULT RequestInline(JamotongTextService *svc, ITfContext *ctx, CompOp o
     // MS SampleIME 의 _TerminateComposition 처럼 비동기(ASYNCDONTCARE)로 다시 건다 — 세션 객체는 힙+참조계수라 안전.
     if (op == COMP_OP_FINALIZE &&
         (hr == TF_E_SYNCHRONOUS || (SUCCEEDED(hr) && hrSession == TF_E_SYNCHRONOUS))) {
+        es->deferred=TRUE;
+        if (!RiumOwner_AllowsWrite(&svc->inputOwner,&es->inputOwner,TRUE)) {
+            es->lpVtbl->Release((ITfEditSession*)es);
+            return E_PENDING;
+        }
         hrSession = S_OK;
         hr = ctx->lpVtbl->RequestEditSession(ctx, svc->clientId, (ITfEditSession*)es,
                                              TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hrSession);
@@ -506,9 +599,10 @@ BOOL JamoComp_IsActive(const JamotongTextService *svc) {
     return svc->pComposition != NULL;
 }
 
-BOOL JamoComp_OwnsFocus(const JamotongTextService *svc, ITfContext *ctx) {
+BOOL JamoComp_OwnsFocus(JamotongTextService *svc, ITfContext *ctx) {
     return ctx && svc->pCompContext == ctx && svc->pCompFocusHwnd &&
-           svc->pCompFocusHwnd == GetFocus();
+           svc->pCompFocusHwnd == GetFocus() &&
+           RiumOwner_AllowsWrite(&svc->inputOwner,&svc->inlineOwner,FALSE);
 }
 
 HRESULT JamoComp_Finalize(JamotongTextService *svc) {
@@ -548,12 +642,29 @@ HRESULT JamoComp_CommitWithSpace(JamotongTextService *svc, wchar_t syllable) {
 
 BOOL JamoComp_PrepareInput(JamotongTextService *svc, ITfContext *ctx) {
     if (svc->compFinalizePending) return FALSE;
+    // A command can mark a boundary after the host already ended the old
+    // composition on blur. Consume that empty boundary before starting text;
+    // otherwise the next key finalizes the first NEW consonant and splits it.
+    // Existing compositions/pending finalization still keep their owner guards.
+    if (!svc->pComposition) svc->inputOwnerBoundary=FALSE;
+    if (svc->pComposition && svc->inlineOwner.stamp.provider &&
+        !RiumOwner_AllowsWrite(&svc->inputOwner,&svc->inlineOwner,FALSE)) {
+        svc->inputOwnerBoundary=TRUE;
+        RiumOwnerBinding fresh;RiumOwner_Capture(&svc->inputOwner,&fresh);
+        if(ctx==svc->pCompContext && fresh.stamp.provider==1 && fresh.stamp.profile==1 &&
+            fresh.stamp.kind==RIUM_OWNER_TEXT && fresh.stamp.lifetimeToken &&
+            fresh.epoch!=svc->inlineOwner.epoch &&
+            !memcmp(&fresh.stamp,&svc->inlineOwner.stamp,sizeof(RiumOwnerStamp)))
+            return RequestInline(svc,ctx,COMP_OP_RETIRE,0,0)==S_OK && !svc->pComposition &&
+                   RiumOwner_AllowsWrite(&svc->inputOwner,&fresh,FALSE);
+        return FALSE;
+    }
     if (svc->pComposition && svc->pCompContext == ctx &&
         svc->pCompFocusHwnd && svc->pCompFocusHwnd != GetFocus()) {
         svc->compBoundaryWritten = TRUE;
         return FALSE; // Retry only on the original target; new target keys belong to the app.
     }
-    if (svc->compBoundaryWritten || (svc->pComposition && svc->pCompContext != ctx))
+    if (svc->inputOwnerBoundary || svc->compBoundaryWritten || (svc->pComposition && svc->pCompContext != ctx))
         return JamoComp_Finalize(svc) == S_OK;
     return TRUE;
 }

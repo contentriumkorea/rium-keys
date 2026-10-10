@@ -82,10 +82,12 @@ try {
     if(!$machine.WaitForExit(45000)){throw 'Machine commit status is not yet known.'}
     if($machine.ExitCode -ne 0){throw 'Machine upgrade did not commit.'}
     $committed=$true
+    & $control --refresh
+    if($LASTEXITCODE){throw 'Installed input name could not be read back.'}
     Save-State 'Installed'
     Set-ItemProperty $stateKey -Name InstallState -Value $statePath
     Get-Content -LiteralPath (Join-Path $target 'install-result.log')
-    "INSTALLED: RIUM Keys $($config.Version). Recovery: $statePath"
+    "INSTALLED: CONTENTRIUM Keys $($config.Version). Recovery: $statePath"
 }catch {
     $failure=$_
     if($fixture -and !$fixture.HasExited){

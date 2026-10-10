@@ -9,6 +9,7 @@ static HWND FixtureSetFocus(HWND hwnd) { HWND old=fixtureFocus;fixtureFocus=hwnd
 #define RIUM_FOCUS_CALL(first, ...) first
 #define GetFocus(...) RIUM_FOCUS_CALL(__VA_OPT__(GetFocus,) FixtureGetFocus)(__VA_ARGS__)
 #define SetFocus FixtureSetFocus
+#include "input-owner.c"
 #include "third_party/jamotong/src/comp_inline.c"
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,18 @@ static int oldContextReleases, newContextReleases;
 static int compositionAddReentry, contextAddReentry;
 static void reenterRetention(int mode);
 static ITfEditSession *queued;
+static RiumOwnerStamp observedOwner;
+static BOOL ownerChangeOnRange, ownerChangeAfterWrite;
+static int retirementSelections, retirementEndMode, retirementTopChange;
+static void ownerReader(void *unused,RiumOwnerStamp *out) { (void)unused;*out=observedOwner; }
+static void changeOwner(void) { ++observedOwner.logicalObject;++observedOwner.lifetimeToken; }
+static void bindOwner(void) {
+    observedOwner=(RiumOwnerStamp){.provider=1,.profile=1,.kind=RIUM_OWNER_TEXT,.deferredSafe=TRUE,
+        .processId=GetCurrentProcessId(),.threadId=GetCurrentThreadId(),.focus=GetFocus(),
+        .windowObject=0x100,.logicalObject=0x200,.lifetimeToken=1,.textObject=0x300};
+    svc.inputOwner.reader=ownerReader;
+    RiumOwner_Capture(&svc.inputOwner,&svc.inlineOwner);
+}
 static ULONG STDMETHODCALLTYPE tip_ref(ITfTextInputProcessor *p) { (void)p; return 1; }
 static JamoTIPExVtbl tip_vtable={.AddRef=tip_ref,.Release=tip_ref};
 static ULONG STDMETHODCALLTYPE ctx_ref(ITfContext *p) {
@@ -91,7 +104,8 @@ static HRESULT STDMETHODCALLTYPE range_text(ITfRange *p,TfEditCookie ec,DWORD fl
     LONG oldEnd=r->end, tail=(LONG)wcslen(r->text)-oldEnd;
     memmove(r->text+r->start+len,r->text+oldEnd,(size_t)(tail+1)*sizeof(wchar_t));
     memcpy(r->text+r->start,text,(size_t)len*sizeof(wchar_t)); r->end=r->start+len;
-    if(svc.pComposition)((Composition*)svc.pComposition)->end=r->end; return S_OK;
+    if(svc.pComposition)((Composition*)svc.pComposition)->end=r->end;
+    if(ownerChangeAfterWrite)changeOwner();return S_OK;
 }
 static ITfRangeVtbl range_vtable={.Release=range_release,.Clone=range_clone,
     .Collapse=range_collapse,.ShiftStart=range_shift,.SetText=range_text};
@@ -119,14 +133,17 @@ static ULONG STDMETHODCALLTYPE comp_release(ITfComposition *p) {
 }
 static HRESULT STDMETHODCALLTYPE comp_range(ITfComposition *p,ITfRange **out) {
     Composition *c=(Composition*)p; check(c->refs>0,"composition remains alive during host call");
-    *out=makeRange(c->start,c->end);((Range*)*out)->text=c->text;return S_OK;
+    *out=makeRange(c->start,c->end);((Range*)*out)->text=c->text;
+    if(ownerChangeOnRange)changeOwner();return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE comp_shift(ITfComposition *p,TfEditCookie ec,ITfRange *range) {
     (void)ec;Composition *c=(Composition*)p;check(c->refs>0,"prefix never uses released composition");
     c->start=((Range*)range)->start;return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE comp_end(ITfComposition *p,TfEditCookie ec) {
-    (void)ec;Composition *c=(Composition*)p;check(c->refs>0,"end never uses released composition");++c->ended;return S_OK;
+    (void)ec;Composition *c=(Composition*)p;check(c->refs>0,"end never uses released composition");
+    if(retirementEndMode==1)return E_FAIL;
+    ++c->ended;if(retirementEndMode==2)reenterRetention(2);if(retirementEndMode==3)changeOwner();return S_OK;
 }
 static ITfCompositionVtbl comp_vtable={.AddRef=comp_addref,.Release=comp_release,
     .GetRange=comp_range,.ShiftStart=comp_shift,.EndComposition=comp_end};
@@ -220,7 +237,7 @@ static HRESULT STDMETHODCALLTYPE doc_qi(ITfDocumentMgr *p,REFIID iid,void **out)
 }
 static ULONG STDMETHODCALLTYPE doc_addref(ITfDocumentMgr *p) { (void)p;return ++parentProbe.documentRefs; }
 static ULONG STDMETHODCALLTYPE doc_release(ITfDocumentMgr *p) { (void)p;return --parentProbe.documentRefs; }
-static HRESULT STDMETHODCALLTYPE doc_top(ITfDocumentMgr *p,ITfContext **out) { (void)p;*out=focusedContext;return S_OK; }
+static HRESULT STDMETHODCALLTYPE doc_top(ITfDocumentMgr *p,ITfContext **out) { (void)p;*out=focusedContext;if(retirementTopChange)changeOwner();return S_OK; }
 static ITfDocumentMgrVtbl doc_vtable={.QueryInterface=doc_qi,.AddRef=doc_addref,.Release=doc_release,.GetTop=doc_top};
 static ITfDocumentMgr doc={&doc_vtable};
 static HRESULT STDMETHODCALLTYPE thread_focus(ITfThreadMgr *p,ITfDocumentMgr **out) { (void)p;*out=&doc;doc_addref(*out);return S_OK; }
@@ -235,6 +252,7 @@ static HRESULT STDMETHODCALLTYPE ctx_document(ITfContext *p,ITfDocumentMgr **out
     return parentProbe.documentHr;
 }
 static HRESULT STDMETHODCALLTYPE ctx_selection(ITfContext *p,TfEditCookie ec,ULONG count,const TF_SELECTION *sel) {
+    ++retirementSelections;
     (void)p;(void)ec;(void)count;if(failSelection)return E_FAIL;
     Range *r=(Range*)sel->range;selStart=r->start;selEnd=r->end;style=sel->style;
     if(terminateSelection)terminate();return S_OK;
@@ -255,6 +273,7 @@ static HRESULT STDMETHODCALLTYPE ctx_request(ITfContext *p,TfClientId client,ITf
 static ITfContextVtbl ctx_vtable={.QueryInterface=ctx_qi,.AddRef=ctx_ref,.Release=ctx_release,.GetStatus=ctx_status,
     .SetSelection=ctx_selection,.GetSelection=ctx_get_selection,.RequestEditSession=ctx_request,.GetDocumentMgr=ctx_document};
 static void setup(const wchar_t *text) {
+    ownerChangeOnRange=ownerChangeAfterWrite=FALSE;retirementSelections=retirementEndMode=retirementTopChange=0;
     ZeroMemory(&svc,sizeof(svc));JamoComp_Init(&svc);svc.lpVtblTIP=&tip_vtable;svc.threadMgr=&thread;focusedContext=&ctx;
     ctx.lpVtbl=&ctx_vtable;otherCtx.lpVtbl=&ctx_vtable;
     comp=(Composition){.iface={&comp_vtable},.refs=1,.end=(LONG)wcslen(text),.text=document};otherDocument[0]=0;
@@ -372,8 +391,9 @@ int main(void) {
     }
     setup(L"\ud55c");parentProbe.changeFocus=TRUE;
     selStart=selEnd=7;
-    check(work(COMP_OP_UPDATE,0,L'\ud558')==E_PENDING&&selStart==7&&selEnd==7&&parent_refs_balanced(),
-          "parent probe reentry cannot select in a newly focused control");
+    check(work(COMP_OP_UPDATE,0,L'\ud558')==S_OK&&writes==1&&wcscmp(document,L"\ud558")==0&&
+          selStart==7&&selEnd==7&&parent_refs_balanced(),
+          "post-write parent probe reentry skips new selection without retrying committed text");
     SetFocus(owner);
     setup(L"\ud55c");shortShift=1;check(FAILED(work(COMP_OP_UPDATE,0,L'\ud55c')),"partial interim-range movement fails visibly");
     setup(L"\ud55c");failSelection=1;check(FAILED(JamoComp_Finalize(&svc)),"selection failure is not success");
@@ -443,6 +463,108 @@ int main(void) {
           wcscmp(document,L"\u314e")==0,
           "returning to the original owner resumes inline updates after temporary focus reentry");
     JamoComp_Release(&svc);
+    setup(L"\ud55c");bindOwner();ownerChangeOnRange=TRUE;
+    check(JamoComp_Apply(&svc,&ctx,update)==E_PENDING&&writes==0&&wcscmp(document,L"\ud55c")==0,
+          "logical owner change in GetRange blocks SetText within same HWND and context");
+    ownerChangeOnRange=FALSE;JamoComp_Release(&svc);
+    setup(L"\ud55c");bindOwner();requestMode=1;
+    check(JamoComp_Finalize(&svc)==TF_S_ASYNC&&queued!=NULL,
+          "logical-owner finalization regression really queues original composition");
+    changeOwner();LONG ownerSelStart=selStart,ownerSelEnd=selEnd;
+    check(runQueued()==E_PENDING&&comp.ended==0&&writes==0&&
+          selStart==ownerSelStart&&selEnd==ownerSelEnd,
+          "queued finalize cannot mutate selection or end composition for a changed logical owner");
+    JamoComp_Release(&svc);
+    setup(L"\ud55c");bindOwner();ownerChangeAfterWrite=TRUE;
+    check(JamoComp_Apply(&svc,&ctx,update)==S_OK&&writes==1&&wcscmp(document,L"\u314e")==0,
+          "successful inline write remains committed if owner changes inside SetText");
+    ownerChangeAfterWrite=FALSE;
+    check(!JamoComp_PrepareInput(&svc,&ctx)&&writes==1,
+          "changed logical owner cannot replay an already successful inline write");
+    JamoComp_Release(&svc);
+    setup(L"");svc.pComposition=NULL;svc.pCompContext=NULL;svc.pCompFocusHwnd=NULL;selStart=selEnd=0;
+    contextAddReentry=2;
+    check(work(COMP_OP_UPDATE,0,L'\ud55c')==E_PENDING&&writes==0&&
+          svc.pComposition==&newer.iface&&svc.pCompContext==&otherCtx&&
+          svc.pCompFocusHwnd==otherWindow&&svc.compUpdatedOnce&&svc.compBoundaryWritten,
+          "new composition context AddRef cannot stamp or write a reentrant replacement");
+    ForgetComposition(&svc);
+    SetFocus(owner);setup(L"\ud55c");bindOwner();observedOwner.deferredSafe=FALSE;
+    RiumOwner_Capture(&svc.inputOwner,&svc.inlineOwner);RiumOwnerStamp originalText=observedOwner;
+    observedOwner.kind=RIUM_OWNER_COMMAND;RiumOwner_Observe(&svc.inputOwner);
+    check(!JamoComp_PrepareInput(&svc,&ctx)&&!writes&&!comp.ended&&!requests,
+          "retirement never requests a shared-context session while COMMAND");
+    observedOwner=originalText;RiumOwner_Observe(&svc.inputOwner);
+    check(JamoComp_PrepareInput(&svc,&ctx)&&comp.ended==1&&!svc.pComposition&&
+          !writes&&!retirementSelections&&wcscmp(document,L"\ud55c")==0,
+          "return to identical DVA TEXT retires only old composition without caret or text writes");
+    selStart=selEnd=1;
+    check(JamoComp_Apply(&svc,&ctx,update)==S_OK&&wcscmp(document,L"\ud55c\u314e")==0&&
+          svc.inlineOwner.epoch==svc.inputOwner.epoch,
+          "retired original text remains while next Korean starts with fresh binding");
+    if(svc.pComposition)ForgetComposition(&svc);
+    for(int scenario=0;scenario<7;++scenario){
+        setup(L"\ud55c");bindOwner();observedOwner.deferredSafe=FALSE;
+        if(scenario==0)observedOwner.provider=2;
+        if(scenario==1)observedOwner.lifetimeToken=0;
+        RiumOwner_Capture(&svc.inputOwner,&svc.inlineOwner);originalText=observedOwner;
+        observedOwner.kind=RIUM_OWNER_COMMAND;RiumOwner_Observe(&svc.inputOwner);
+        observedOwner=originalText;if(scenario==2)++observedOwner.lifetimeToken;RiumOwner_Observe(&svc.inputOwner);
+        if(scenario==3)requestMode=1;
+        if(scenario==4)focusedContext=&otherCtx;
+        if(scenario==5)retirementTopChange=1;
+        if(scenario==6)retirementEndMode=1;
+        check(!JamoComp_PrepareInput(&svc,&ctx)&&!writes&&!retirementSelections&&!comp.ended&&
+              !queued&&svc.pComposition==&comp.iface,
+              "unproven generation, other context, host reentry or failed synchronous retirement preserves old state");
+        ForgetComposition(&svc);
+    }
+    setup(L"\ud55c");bindOwner();RiumOwner_Capture(&svc.inputOwner,&svc.inlineOwner);originalText=observedOwner;
+    observedOwner.kind=RIUM_OWNER_COMMAND;RiumOwner_Observe(&svc.inputOwner);observedOwner=originalText;RiumOwner_Observe(&svc.inputOwner);
+    retirementEndMode=2;
+    check(!JamoComp_PrepareInput(&svc,&ctx)&&svc.pComposition==&newer.iface&&svc.pCompContext==&otherCtx&&
+          !writes&&!retirementSelections&&newer.ended==0,
+          "EndComposition reentrant replacement is neither cleared nor reused by old retirement");
+    ForgetComposition(&svc);
+    for(int phase=0;phase<3;++phase){
+        SetFocus(owner);setup(L"\ud55c");bindOwner();RiumOwner_Capture(&svc.inputOwner,&svc.inlineOwner);originalText=observedOwner;
+        observedOwner.kind=RIUM_OWNER_COMMAND;RiumOwner_Observe(&svc.inputOwner);observedOwner=originalText;RiumOwner_Observe(&svc.inputOwner);
+        if(phase==0)compositionAddReentry=2;
+        if(phase==1)contextAddReentry=2;
+        if(phase==2)retirementEndMode=3;
+        check(!JamoComp_PrepareInput(&svc,&ctx)&&!writes&&!retirementSelections&&
+              (phase==2 ? (!svc.pComposition&&comp.ended==1) : (svc.pComposition==&newer.iface&&newer.ended==0)),
+              "retirement retention and End callbacks preserve replacement or detach only confirmed-ended original");
+        ForgetComposition(&svc);
+    }
+    SetFocus(owner);setup(L"");svc.pComposition=NULL;svc.pCompContext=NULL;svc.pCompFocusHwnd=NULL;selStart=selEnd=0;
+    bindOwner();observedOwner.kind=RIUM_OWNER_UNKNOWN;observedOwner.logicalObject=0;
+    observedOwner.lifetimeToken=0;observedOwner.textObject=0;
+    check(JamoComp_Apply(&svc,&ctx,update)==E_PENDING&&!svc.pComposition&&!writes&&document[0]==0,
+          "lost recognized ownership cannot originate an inline composition with an incomplete identity");
+    observedOwner.kind=RIUM_OWNER_TEXT;observedOwner.logicalObject=0x200;
+    observedOwner.lifetimeToken=1;observedOwner.textObject=0x300;
+    check(JamoComp_PrepareInput(&svc,&ctx)&&JamoComp_Apply(&svc,&ctx,update)==S_OK&&
+          svc.pComposition&&wcscmp(document,L"\u314e")==0,
+          "fresh positive text starts normally without a retained unknown composition");
+    ForgetComposition(&svc);
+    // Live preview.6: TEXT ended on blur, COMMAND set a boundary without a
+    // remaining composition, and the first new consonant inherited that flag.
+    // The following vowel then finalized the NEW consonant instead of joining it.
+    SetFocus(owner);setup(L"\ud55c");bindOwner();originalText=observedOwner;
+    ForgetComposition(&svc);Fsm_Init(&svc.fsm);selStart=selEnd=1;
+    observedOwner.kind=RIUM_OWNER_COMMAND;RiumOwner_Observe(&svc.inputOwner);
+    svc.inputOwnerBoundary=TRUE;
+    observedOwner=originalText;RiumOwner_Observe(&svc.inputOwner);
+    for(const wchar_t *key=L"rmf";*key;++key) {
+        check(JamoComp_PrepareInput(&svc,&ctx),"returning TEXT prepares the next physical Korean key");
+        FsmResult result=Fsm_ProcessKey(&svc.fsm,*key,0,NULL);
+        check(JamoComp_Apply(&svc,&ctx,result)==S_OK,"returning TEXT applies the current Korean syllable");
+    }
+    check(wcscmp(document,L"\ud55c\uae00")==0&&svc.fsm.state==STATE_CHO_JUNG_JONG&&
+          svc.compUpdatedOnce&&!svc.inputOwnerBoundary&&!cleared,
+          "command without a retained composition cannot split the first returning syllable");
+    ForgetComposition(&svc);
     SetFocus(owner);DestroyWindow(otherWindow);
     DestroyWindow(owner);
     printf("Inline composition: %d checks, %d failures.\n",checks,failures);return failures?1:0;

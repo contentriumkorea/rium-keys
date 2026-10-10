@@ -5,6 +5,7 @@
 #include "jdict.h"        // JDict_SetLightOpen
 #include "plugin_loader.h" // PluginLoader_SetDeferBodies
 #include "seq_layout.h"   // SeqLayout_SetLazyOpen — 사전은 그 자판을 처음 쓸 때 연다 (B22)
+#include "../../../input-owner-runtime.h"
 
 LONG g_DllRefCount = 0;
 HINSTANCE g_hInst = NULL;
@@ -13,7 +14,7 @@ CRITICAL_SECTION g_configLock;   // live config 접근 직렬화 (입력 스레�
 static const WCHAR c_szInfoKeyPrefix[] = L"CLSID\\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}";
 static const WCHAR c_szInprocServer32[] = L"InprocServer32";
 static const WCHAR c_szModelName[] = L"Apartment";
-static const WCHAR c_szDescription[] = L"RIUM Keys";
+static const WCHAR c_szDescription[] = L"CONTENTRIUM Keys";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
@@ -39,6 +40,7 @@ bool Jamotong_HasPendingTimers(void);
 STDAPI DllCanUnloadNow(void) {
     if (g_DllRefCount != 0) return S_FALSE;
     if (Jamotong_HasPendingTimers()) return S_FALSE;
+    if (!RiumOwnerRuntime_ReleaseUnused()) return S_FALSE;
     Jamo_UnregisterClasses();   // W2-05: 로더 잠금 밖, 인스턴스 0 인 지금
     return S_OK;
 }
