@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include "comp_state.h"
 #include "langbar.h"
+#include "../../../rium-focus-trace.h"
 
 // mingw msctf.h/libuuid 에 없는 GUID. 값 출처: Microsoft Learn 'Predefined Compartments' +
 // .NET WPF 공개 소스의 TSF interop 상수(ccf05dd8-4a87-11d7-a6e2-00065b84435c). 확인 2026-08-20.
@@ -215,4 +216,5 @@ void Compart_ReadContextDisabled(JamotongTextService *obj, ITfContext *pic) {
     obj->ctxKeyboardDisabled = RestrictionBlocks(cm, &GUID_COMPARTMENT_KEYBOARD_DISABLED) ||
                                RestrictionBlocks(cm, &GUID_COMPARTMENT_EMPTYCONTEXT);
     cm->lpVtbl->Release(cm);
+    Rium_TraceFocus(pic, &status, obj->ctxKeyboardDisabled);
 }

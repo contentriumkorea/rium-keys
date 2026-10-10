@@ -61,15 +61,22 @@ static ULONG STDMETHODCALLTYPE ES_Release(ITfEditSession *pThis) {
 
 // 삽입 후 커서(선택)를 range 끝으로 이동. 이걸 안 하면 다음 삽입이 커서 위치(앞)에 계속 들어가
 // 글자가 역순(abcd→dcba)으로 쌓인다. Clone으로 원본 range는 보존.
-static void MoveCaretToEnd(ITfContext *ctx, TfEditCookie ec, ITfRange *range) {
+static BOOL EditSessionOwnsFocus(const EditSessionData *data) {
+    return !data || !data->bindFocus || (data->focusOwner && data->focusOwner == GetFocus());
+}
+
+static void MoveCaretToEnd(ITfContext *ctx, TfEditCookie ec, ITfRange *range,
+                           const EditSessionData *data) {
+    if (!EditSessionOwnsFocus(data)) return;
     ITfRange *pEnd = NULL;
-    if (SUCCEEDED(range->lpVtbl->Clone(range, &pEnd))) {
-        pEnd->lpVtbl->Collapse(pEnd, ec, TF_ANCHOR_END);
+    if (SUCCEEDED(range->lpVtbl->Clone(range, &pEnd)) && pEnd) {
+        HRESULT hr = pEnd->lpVtbl->Collapse(pEnd, ec, TF_ANCHOR_END);
         TF_SELECTION sel;
         sel.range = pEnd;
         sel.style.ase = TF_AE_NONE;
         sel.style.fInterimChar = FALSE;
-        ctx->lpVtbl->SetSelection(ctx, ec, 1, &sel);
+        if (SUCCEEDED(hr) && EditSessionOwnsFocus(data))
+            ctx->lpVtbl->SetSelection(ctx, ec, 1, &sel);
         pEnd->lpVtbl->Release(pEnd);
     }
 }
@@ -108,23 +115,28 @@ static HRESULT ES_DoEditSession_Inner(ITfEditSession *pThis, TfEditCookie ec) {
     ITfContext *ctx = es->pContext;
     int cLen = (int)wcslen(es->data.committed);
     HRESULT hrOut = S_OK;   // 삽입 실패를 hrSession으로 전파 (RFC-0004 P2-2: S_OK로 삼키지 않음)
+    if (!EditSessionOwnsFocus(&es->data)) return E_PENDING;
 
     if (cLen > 0) {
         ITfInsertAtSelection *pIns = NULL;
         hrOut = ctx->lpVtbl->QueryInterface(ctx, &IID_ITfInsertAtSelection, (void**)&pIns);
         if (SUCCEEDED(hrOut)) {
             ITfRange *r = NULL;
+            if (!EditSessionOwnsFocus(&es->data)) {
+                pIns->lpVtbl->Release(pIns);
+                return E_PENDING;
+            }
             HRESULT hrIns = pIns->lpVtbl->InsertTextAtSelection(pIns, ec, 0, es->data.committed, cLen, &r);
             JamoDiag("INSERT U+%04X len=%d hr=0x%08lX r=%p", (unsigned)es->data.committed[0], cLen, (unsigned long)hrIns, (void*)r);
             if (SUCCEEDED(hrIns) && r) {
-                MoveCaretToEnd(ctx, ec, r);   // 커서를 삽입 글자 뒤로 (역순 방지)
+                MoveCaretToEnd(ctx, ec, r, &es->data); // A completed insertion is not retried if caret movement is skipped.
                 r->lpVtbl->Release(r);
             }
             if (FAILED(hrIns)) hrOut = hrIns;
             pIns->lpVtbl->Release(pIns);
         }
     }
-    CaptureCaretRect(es->pService, ctx, ec);   // 삽입 '후' 캐럿 = 조합 미리보기가 뜰 자리
+    if (EditSessionOwnsFocus(&es->data)) CaptureCaretRect(es->pService, ctx, ec);
     return hrOut;
 }
 static HRESULT STDMETHODCALLTYPE ES_DoEditSession(ITfEditSession *pThis, TfEditCookie ec) {
@@ -165,8 +177,9 @@ HRESULT RequestEditSessionDataEx(JamotongTextService *pService, ITfContext *pCon
 
     es->lpVtbl->Release((ITfEditSession*)es);   // 비동기면 TSF 가 자기 참조로 수명을 쥔다(힙 객체+참조계수)
     // 바깥 hr(요청 접수)만 반환하면 DoEditSession 내부 실패가 숨는다 → 세션 hr까지 전파 (RFC-0004 P2-2)
-    // 비동기 요청은 hrSession 이 의미 없다(아직 안 돌았다) → 요청 hr 만.
-    return (esFlags & TF_ES_SYNC) ? (FAILED(hr) ? hr : hrSession) : hr;
+    // ASYNCDONTCARE can execute immediately: its failure must also propagate.
+    // TF_S_ASYNC is a queued request, never evidence that insertion completed.
+    return FAILED(hr) ? hr : hrSession;
 }
 
 HRESULT RequestEditSession(JamotongTextService *pService, ITfContext *pContext, FsmResult fsmRes) {
@@ -299,7 +312,7 @@ static HRESULT Rep_DoEditSession_Inner(ITfEditSession *pThis, TfEditCookie ec) {
         pRange->lpVtbl->ShiftStart(pRange, ec, -es->replaceLen, &cch, NULL);
         int rlen = (int)wcslen(es->replacement);
         pRange->lpVtbl->SetText(pRange, ec, 0, es->replacement, rlen);
-        MoveCaretToEnd(es->pContext, ec, pRange);   // 커서를 치환 글자 뒤로 (역순 방지)
+        MoveCaretToEnd(es->pContext, ec, pRange, NULL); // Existing unbound replacement path.
         pRange->lpVtbl->Release(pRange);
     }
     pInsert->lpVtbl->Release(pInsert);

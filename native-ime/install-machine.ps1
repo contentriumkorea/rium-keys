@@ -1,6 +1,8 @@
-param([ValidateSet('Install','Upgrade','Uninstall')][string]$Operation='Install',[string]$Transaction)
+﻿param([ValidateSet('Install','Upgrade','Uninstall')][string]$Operation='Install',[string]$Transaction)
 $ErrorActionPreference='Stop'
-$version='2.0.0-preview.3'
+. (Join-Path $PSScriptRoot 'package-common.ps1')
+$config=Get-RiumPackageConfig $PSScriptRoot
+$version=$config.Version
 $root=[IO.Path]::GetFullPath((Join-Path $env:ProgramFiles "RIUM Keys\$version"))
 $class='Software\Classes\CLSID\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}'
 $tip='Software\Microsoft\CTF\TIP\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}'
@@ -61,7 +63,7 @@ $done=[Threading.EventWaitHandle]::OpenExisting("Local\RIUM.Keys.Install.$Transa
 $commit=[Threading.EventWaitHandle]::OpenExisting("Local\RIUM.Keys.Install.$Transaction.Commit")
 if($Operation -eq 'Upgrade'){
     # Reuse the existing profile and user defaults; only the versioned binaries change.
-    $previousRoot=Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.2'
+    $previousRoot=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.UpgradeFrom)
     $changedViews=@();$oldAppValues=@{};$appChanged=$false;$transcript=$false;$upgradeCommitted=$false
     try {
         if(Test-Path -LiteralPath $root){throw 'New version directory already exists; refusing to overwrite.'}
@@ -79,17 +81,13 @@ if($Operation -eq 'Upgrade'){
             $key=$base.OpenSubKey($uninstall)
             if(!$key){throw 'Missing previous installed-apps entry.'}
             try {
-                if($key.GetValue('InstallLocation') -ne $previousRoot -or $key.GetValue('DisplayVersion') -ne '2.0.0-preview.2'){throw 'Unexpected installed version.'}
+                if($key.GetValue('InstallLocation') -ne $previousRoot -or $key.GetValue('DisplayVersion') -ne $config.UpgradeFrom){throw 'Unexpected installed version.'}
                 foreach($name in @('DisplayVersion','InstallLocation','DisplayIcon','UninstallString')){$oldAppValues[$name]=$key.GetValue($name)}
             }finally{$key.Dispose()}
         }finally{$base.Dispose()}
-        $manifest=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'manifest.json') -Raw | ConvertFrom-Json
-        $required=@('x64\RiumKeysInput.dll','x64\RiumKeysControl.exe','x86\RiumKeysInput.dll','LICENSE','COPYRIGHT.md','uninstall-local.ps1','install-machine.ps1')
-        if(@($manifest).Count -ne $required.Count -or @(Compare-Object ($manifest.Path | Sort-Object -Unique) ($required | Sort-Object)).Count){throw 'Incomplete or duplicate package manifest.'}
-        foreach($entry in $manifest){
-            if($entry.Path -notin $required){throw 'Unexpected package path.'}
-            if((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $entry.Path) -Algorithm SHA256).Hash -ne $entry.Sha256){throw 'Package hash mismatch.'}
-        }
+        $manifest=@(Assert-RiumManifest $PSScriptRoot $config)
+        foreach($architecture in @('x64','x86')){Assert-RiumCandidateVersion (Join-Path $PSScriptRoot "$architecture\RiumKeysInput.dll") $config.Version}
+
         New-Item -ItemType Directory -Path $root | Out-Null
         Start-Transcript -Path (Join-Path $root 'install-result.log') -Force | Out-Null;$transcript=$true
         foreach($entry in $manifest){
@@ -125,21 +123,31 @@ if($Operation -eq 'Upgrade'){
             }finally{$key.Dispose()}
         }finally{$base.Dispose()}
         $upgradeCommitted=$true
-        'UPGRADED: verified preview.3; previous version retained; profile/defaults preserved.'
+        "UPGRADED: verified $version; previous version retained; profile/defaults preserved."
     }catch {
         Write-Output $_
+        $rollbackErrors=@()
         foreach($view in $changedViews){
             $arch=if($view -eq 'Registry64'){'x64'}else{'x86'}
-            $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
-            try {$key=$base.OpenSubKey("$class\InprocServer32",$true);try {
-                if($key.GetValue('') -ne (Join-Path $root "$arch\RiumKeysInput.dll")){throw 'Rollback COM owner mismatch; manual recovery required.'}
-                $key.SetValue('',(Join-Path $previousRoot "$arch\RiumKeysInput.dll"))
-            }finally{$key.Dispose()}}finally{$base.Dispose()}
+            try {
+                $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
+                try {$key=$base.OpenSubKey("$class\InprocServer32",$true);try {
+                    $oldDll=Join-Path $previousRoot "$arch\RiumKeysInput.dll"
+                    if(!$key -or $key.GetValue('') -notin @($oldDll,(Join-Path $root "$arch\RiumKeysInput.dll"))){throw 'Rollback COM owner mismatch.'}
+                    $key.SetValue('',$oldDll)
+                    if($key.GetValue('') -ne $oldDll){throw 'Rollback COM readback mismatch.'}
+                }finally{if($key){$key.Dispose()}}}finally{$base.Dispose()}
+            }catch{$rollbackErrors+="$view`: $($_.Exception.Message)"}
         }
         if($appChanged){
-            $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',[Microsoft.Win32.RegistryView]::Registry64)
-            try {$key=$base.OpenSubKey($uninstall,$true);try {foreach($name in $oldAppValues.Keys){$key.SetValue($name,$oldAppValues[$name])}}finally{$key.Dispose()}}finally{$base.Dispose()}
+            try {
+                $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',[Microsoft.Win32.RegistryView]::Registry64)
+                try {$key=$base.OpenSubKey($uninstall,$true);try {
+                    foreach($name in $oldAppValues.Keys){$key.SetValue($name,$oldAppValues[$name]);if($key.GetValue($name) -ne $oldAppValues[$name]){throw "Installed-app rollback mismatch: $name"}}
+                }finally{if($key){$key.Dispose()}}}finally{$base.Dispose()}
+            }catch{$rollbackErrors+=$_.Exception.Message}
         }
+        if($rollbackErrors.Count){throw ('Upgrade rollback requires recovery: '+($rollbackErrors -join '; '))}
         'Upgrade did not commit; previous COM paths restored. Staged files retained.'
     }finally {
         if($transcript){Stop-Transcript | Out-Null}
@@ -162,13 +170,9 @@ try {
         }finally{$base.Dispose()}
     }
     if(Test-Path -LiteralPath $root){throw 'Version directory already exists; do not overwrite a possibly loaded DLL.'}
-    $manifest=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'manifest.json') -Raw | ConvertFrom-Json
-    $required=@('x64\RiumKeysInput.dll','x64\RiumKeysControl.exe','x86\RiumKeysInput.dll','LICENSE','COPYRIGHT.md','uninstall-local.ps1','install-machine.ps1')
-    if(@($manifest).Count -ne $required.Count -or @(Compare-Object ($manifest.Path | Sort-Object -Unique) ($required | Sort-Object)).Count){throw 'Incomplete or duplicate package manifest.'}
-    foreach($entry in $manifest){
-        if($entry.Path -notmatch '^(x64\\RiumKeys(Input\.dll|Control\.exe)|x86\\RiumKeysInput\.dll|LICENSE|COPYRIGHT\.md|uninstall-local\.ps1|install-machine\.ps1)$'){throw 'Unexpected package path.'}
-        if((Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $entry.Path) -Algorithm SHA256).Hash -ne $entry.Sha256){throw 'Package hash mismatch.'}
-    }
+    $manifest=@(Assert-RiumManifest $PSScriptRoot $config)
+    foreach($architecture in @('x64','x86')){Assert-RiumCandidateVersion (Join-Path $PSScriptRoot "$architecture\RiumKeysInput.dll") $config.Version}
+
     New-Item -ItemType Directory -Path $root | Out-Null
     $owned=$true
     Start-Transcript -Path (Join-Path $root 'install-result.log') -Force | Out-Null

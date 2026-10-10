@@ -104,6 +104,7 @@ typedef struct JamotongTextService {
     const ITfCompositionSinkVtbl *lpVtblCompSink;   // 외부 종료 통지 sink
     ITfComposition *pComposition;   // 활성 문서 composition (입력 스레드 전용)
     ITfContext *pCompContext;       // composition 소유 컨텍스트 (AddRef 보유)
+    HWND pCompFocusHwnd;           // Focus identity only; never an EM_* capability.
     ITfContext *pPathContext;       // 경로 판정 캐시 대상 (weak — 포인터 비교 전용)
     int  pathKind;                  // JamoPathKind (pPathContext에 대한 판정)
     int  pathDemerits;              // 갱신 생존 없는 연속 외부 종료 카운트 (강등용)
@@ -118,6 +119,7 @@ typedef struct JamotongTextService {
 
     // ── RFC-0008 W1-09: 조합을 시작한 대상 — 포커스를 떠날 때 남은 음절을 여기에 확정한다 ──
     HWND compTargetHwnd;           // 조합 시작 때 포커스였던 EDIT 창 (EDIT 계열이 아니면 NULL)
+    HWND compTargetFocusHwnd;      // All window classes, captured on the service thread.
     ITfContext *compTargetCtx;     // 조합 시작 때 문맥 (AddRef 보유)
 
     // ── RFC-0012 Phase 1 compartment (compartment.c) — 한/영 상태의 표준 자리 ──
@@ -128,7 +130,10 @@ typedef struct JamotongTextService {
     DWORD cpCookieConv;            // INPUTMODE_CONVERSION advise 쿠키 (한/A 표시기는 이쪽을 바꿀 수 있다)
     wchar_t cpPendingCommit;       // 확정 못 한 음절(0=없음) — 그 대상으로 돌아와 키를 칠 때 한 번 재시도 (RFC-0008 W1-09)
     HWND cpPendingHwnd;            // 보류 대상 EDIT 창 (없으면 NULL)
+    HWND cpPendingFocusHwnd;       // Original focus identity, including custom text hosts.
     ITfContext *cpPendingCtx;      // 보류 대상 문맥 (AddRef 보유; NULL = 아무 문맥)
+    BOOL cpPendingInFlight;        // Reentrant keys cannot start a second retry.
+    ULONG cpPendingGeneration;    // Completion applies only to the captured slot.
     long  cpLastOpen, cpLastConv;  // 마지막으로 발행/수용한 값 (-1 = 아직 없음). 같으면 안 쓴다.
     BOOL  cpSelfWrite;             // 우리가 쓰는 중 — OnChange 메아리 무시
     BOOL  ctxKeyboardDisabled;     // 포커스 문맥의 KEYBOARD_DISABLED (앱이 입력기를 껐다) 캐시

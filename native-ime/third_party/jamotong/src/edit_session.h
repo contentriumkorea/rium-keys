@@ -4,6 +4,8 @@
 typedef struct {
     wchar_t committed[128];
     wchar_t composing[128];
+    HWND focusOwner; // Optional immutable target for synchronous pending delivery.
+    BOOL bindFocus;
 } EditSessionData;
 
 HRESULT RequestEditSession(JamotongTextService *pService, ITfContext *pContext, FsmResult fsmRes);

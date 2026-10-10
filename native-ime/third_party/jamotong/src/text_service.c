@@ -175,29 +175,39 @@ void Jamotong_SetPassthrough(JamotongTextService *obj, BOOL on) {
 // 포커스 알림 시점엔 이미 새 창에 포커스가 있다. 그래서 '지금 포커스'가 아니라 조합을 시작한
 // 대상(창·문맥)에 남은 음절을 넣는다. 규칙(순수)은 transition.h.
 static void CompTarget_Clear(JamotongTextService *obj) {
-    if (obj->compTargetCtx) { obj->compTargetCtx->lpVtbl->Release(obj->compTargetCtx); obj->compTargetCtx = NULL; }
+    ITfContext *context = obj->compTargetCtx;
+    obj->compTargetCtx = NULL;
     obj->compTargetHwnd = NULL;
+    obj->compTargetFocusHwnd = NULL;
+    if (context) context->lpVtbl->Release(context);
 }
 
 static void CompTarget_Remember(JamotongTextService *obj, ITfContext *pic) {
     if (!pic || obj->compTargetCtx) return;   // 조합마다 한 번 (ResetComposition 이 비운다)
+    HWND owner = GetFocus(); // Before AddRef or EDIT capability messages can reenter the host.
     pic->lpVtbl->AddRef(pic);
     obj->compTargetCtx = pic;
-    obj->compTargetHwnd = EditCtl_FocusEditWindow();
+    obj->compTargetFocusHwnd = owner;
+    HWND edit = EditCtl_FocusEditWindow();
+    obj->compTargetHwnd = edit == owner ? edit : NULL;
 }
 
 void Jamotong_PendingClear(JamotongTextService *obj) {
-    if (obj->cpPendingCtx) { obj->cpPendingCtx->lpVtbl->Release(obj->cpPendingCtx); obj->cpPendingCtx = NULL; }
+    ITfContext *context = obj->cpPendingCtx;
+    ++obj->cpPendingGeneration;
+    obj->cpPendingCtx = NULL;
     obj->cpPendingHwnd = NULL;
+    obj->cpPendingFocusHwnd = NULL;
     obj->cpPendingCommit = 0;
+    if (context) context->lpVtbl->Release(context);
 }
 
-static void Pending_Set(JamotongTextService *obj, wchar_t ch, HWND hwnd, ITfContext *ctx) {
-    if (obj->cpPendingCommit)   // 보류 칸은 하나 — 앞의 것을 밀어낸다(로그로 남긴다)
-        JamoDiag("PENDING drop U+%04X (replaced)", (unsigned)obj->cpPendingCommit);
-    Jamotong_PendingClear(obj);
+static void Pending_Set(JamotongTextService *obj, wchar_t ch, HWND hwnd, HWND focus, ITfContext *ctx) {
+    if (obj->cpPendingCommit) return; // Key sinks apply backpressure; never overwrite unresolved text.
+    ++obj->cpPendingGeneration;
     obj->cpPendingCommit = ch;
     obj->cpPendingHwnd = hwnd;
+    obj->cpPendingFocusHwnd = focus;
     if (ctx) { ctx->lpVtbl->AddRef(ctx); obj->cpPendingCtx = ctx; }
 }
 
@@ -217,13 +227,36 @@ static void Transition_FlushComposition(JamotongTextService *obj, const char *wh
     BOOL done = FALSE;
     if (a == TRANS_EDIT_REPLACE) {
         done = EditCtl_ReplaceSelection(eh, cs) ? TRUE : FALSE;   // B1 판정 (EDIT 판정이 최종)
-    } else if (a == TRANS_ASYNC_SESSION) {
-        EditSessionData esd = {0}; esd.committed[0] = ch;
-        HRESULT hr = RequestEditSessionDataEx(obj, obj->compTargetCtx, &esd, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE);
-        done = SUCCEEDED(hr);
     }
+    // A CUAS context can already point at a different control here. Do not queue
+    // InsertTextAtSelection against that shared context. Retry synchronously only
+    // when the original owner is focused; the pending slot owns the text meanwhile.
     JamoDiag("TRANS %s flush U+%04X action=%d done=%d", why, (unsigned)ch, (int)a, (int)done);
-    if (!done) Pending_Set(obj, ch, editOk ? eh : NULL, obj->compTargetCtx);
+    if (!done) Pending_Set(obj, ch, editOk ? eh : NULL, obj->compTargetFocusHwnd, obj->compTargetCtx);
+}
+
+static bool RetryPendingAtOwnedFocus(JamotongTextService *obj, ITfContext *pic) {
+    if (obj->cpPendingInFlight) return false;
+    if (!obj->cpPendingCommit) return true;
+    if (!pic || !obj->cpPendingFocusHwnd || obj->cpPendingFocusHwnd != GetFocus() ||
+        (obj->cpPendingCtx && obj->cpPendingCtx != pic)) return false;
+    wchar_t cs[2] = { obj->cpPendingCommit, L'\0' };
+    HWND owner = obj->cpPendingFocusHwnd;
+    HWND edit = obj->cpPendingHwnd;
+    ULONG generation = obj->cpPendingGeneration;
+    obj->cpPendingInFlight = TRUE;
+    bool inserted;
+    if (edit && edit == owner) {
+        inserted = EditCtl_ReplaceSelection(edit, cs);
+    } else {
+        EditSessionData data={0};data.committed[0]=cs[0];
+        data.bindFocus=TRUE;data.focusOwner=owner;
+        inserted = RequestEditSessionData(obj, pic, &data) == S_OK;
+    }
+    bool sameSlot = generation == obj->cpPendingGeneration;
+    if (inserted && sameSlot) Jamotong_PendingClear(obj);
+    obj->cpPendingInFlight = FALSE;
+    return inserted && sameSlot && !obj->cpPendingCommit;
 }
 
 // 순차 입력(중국어·일본어)의 읽기도 포커스 이동·밖에서의 전환에서 잃지 않는다 — 읽기는 미리보기(오버레이)일 뿐
@@ -304,6 +337,17 @@ void Jamotong_FlushForExternalSwitch(JamotongTextService *obj) {
     Jamotong_Transition(obj, TRANS_WHY_EXTERNAL, NULL);
 }
 
+static void DeferFallbackOnFocusChange(JamotongTextService *obj, ITfContext *pic) {
+    if (JamoComp_IsActive(obj)) return;
+    if (obj->fsm.state == STATE_EMPTY) {
+        if (!obj->seqKb.pending[0] && !obj->seqKb.reading[0]) CompTarget_Clear(obj);
+        return; // A completed syllable cannot own the next composition.
+    }
+    if (obj->compTargetCtx &&
+        (obj->compTargetCtx != pic || !obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus()))
+        Jamotong_Transition(obj, TRANS_WHY_FOCUS, NULL);
+}
+
 // 키(단축키·preserved key)로 자판을 돌릴 때 — 두 진입점이 같은 순서를 쓴다.
 static void RotateLayoutFromKey(JamotongTextService *obj, ITfContext *pic) {
     Jamotong_Transition(obj, TRANS_WHY_KEY, pic);
@@ -348,10 +392,13 @@ void Jamotong_ClearCompositionState(JamotongTextService *obj) {
 static bool OutputResult(JamotongTextService *obj, ITfContext *pic, FsmResult res, BOOL isFlush);
 static bool OutputResultSeq(JamotongTextService *obj, ITfContext *pic, FsmResult res, BOOL isFlush) {
     if (!isFlush && (obj->compFinalizePending || obj->compBoundaryWritten ||
-        (obj->pComposition && obj->pCompContext != pic))) return false;
+        (obj->pComposition && !JamoComp_OwnsFocus(obj, pic)))) return false;
     CompTarget_Remember(obj, pic);   // 조합 대상 기억 (조합마다 한 번, RFC-0008 W1-09)
+    if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus()) return false;
     // Check the context's interfaces, not the application or control class name.
-    if (pic && JamoComp_PathForContext(obj, pic) == JAMO_PATH_STANDARD) {
+    JamoPathKind path = pic ? JamoComp_PathForContext(obj, pic) : JAMO_PATH_COMMIT;
+    if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus()) return false;
+    if (pic && path == JAMO_PATH_STANDARD) {
         if (JamoComp_IsActive(obj) && isFlush) {
             if (JamoComp_Finalize(obj) != S_OK) return false;
             obj->prevChipValid = FALSE; obj->chipPendingAdv = 0;
@@ -364,6 +411,7 @@ static bool OutputResultSeq(JamotongTextService *obj, ITfContext *pic, FsmResult
                 PreeditOverlay_Hide();   // 문서가 밑줄 preedit를 직접 표시한다
                 return true;
             }
+            if (!obj->compTargetFocusHwnd || obj->compTargetFocusHwnd != GetFocus()) return false;
             // 실패: Apply가 rollback+강등까지 마쳤다 — 이 키 결과는 아래 기존 경로로 커밋.
         }
         // isFlush인데 인라인 조합이 없으면(첫 키 실패·외부 종료 직후 등) 기존 경로로 확정.
@@ -1250,18 +1298,16 @@ static HRESULT STDMETHODCALLTYPE KES_OnTestKeyDown(ITfKeyEventSink *pThis, ITfCo
     // 앱이 이 문맥의 입력기를 껐다(KEYBOARD_DISABLED) → 아무 키도 건드리지 않는다 (RFC-0012 Phase 1).
     Compart_ReadContextDisabled(obj, pic);   // RIUM: no stale focus cache on the first key
     if (obj->ctxKeyboardDisabled) return S_OK;
+    DeferFallbackOnFocusChange(obj, pic);
+    if (obj->cpPendingCommit && wParam == VK_ESCAPE) {
+        if (pfEaten) *pfEaten=TRUE;
+        return S_OK; // Predict cancellation without retrying or inserting the pending text.
+    }
+    if (wParam == VK_ESCAPE && obj->pComposition && !JamoComp_OwnsFocus(obj,pic)) return S_OK;
 
     // 밖에서 온 자판 전환 때 확정 못 한 음절이 있으면, 키 이벤트 안(동기 세션 허용)인 지금 먼저 넣는다.
     // 포커스를 떠날 때 넣지 못한 음절도 여기서 — 단 **그 대상으로 돌아왔을 때만**, 한 번만(W1-09 Q2).
-    if (obj->cpPendingCommit && pic) {
-        HWND fe = obj->cpPendingHwnd ? EditCtl_FocusEditWindow() : NULL;
-        if (Trans_PendingMatches(obj->cpPendingHwnd, obj->cpPendingCtx, fe, pic)) {
-            wchar_t cs[2] = { obj->cpPendingCommit, L'\0' };
-            Jamotong_PendingClear(obj);   // 재시도는 한 번 — 실패해도 다시 보류하지 않는다
-            bool ok = CommitText(obj, pic, cs);
-            JamoDiag("PENDING retry U+%04X ok=%d", (unsigned)cs[0], (int)ok);
-        }
-    }
+    const bool pendingReady = RetryPendingAtOwnedFocus(obj, pic);
 
     // 무간섭(직접 입력) 모드: 해제 단축키만 예측-소비하고 그 외 전부 통과 —
     // 원격 데스크톱 클라이언트 등이 키를 그대로 받아 원격 IME가 처리하게 한다.
@@ -1292,9 +1338,11 @@ static HRESULT STDMETHODCALLTYPE KES_OnTestKeyDown(ITfKeyEventSink *pThis, ITfCo
     // 이하 config/레이아웃 접근 전체를 설정 스레드의 Config_ApplyEdited(레이아웃 free)와 직렬화.
     // (기존엔 무락이라, 설정 적용 중 pHangulLayout/pChordLayout이 해제되는 순간 키가 오면 UAF.)
     EnterCriticalSection(&g_configLock);
+    if (!pendingReady && wParam != VK_ESCAPE &&
+        !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods)) goto tk_done;
     if (wParam != VK_ESCAPE && !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods) &&
         !JamoComp_PrepareInput(obj, pic)) {
-        if (pfEaten) *pfEaten = obj->pCompContext == pic;
+        if (pfEaten) *pfEaten = JamoComp_OwnsFocus(obj, pic);
         goto tk_done;
     }
 
@@ -1498,6 +1546,13 @@ static HRESULT STDMETHODCALLTYPE KES_OnKeyDown(ITfKeyEventSink *pThis, ITfContex
     // 무간섭(직접 입력) 모드: 해제 단축키만 처리, 그 외 전부 통과 (OnTestKeyDown과 동일 판단).
     Compart_ReadContextDisabled(obj, pic);   // RIUM: recheck if focus changed after preview
     if (obj->ctxKeyboardDisabled) return S_OK;   // 앱이 끈 문맥 — 통과 (OnTestKeyDown 과 동일)
+    DeferFallbackOnFocusChange(obj, pic);
+    if (obj->cpPendingCommit && wParam == VK_ESCAPE) {
+        Jamotong_PendingClear(obj);
+        if (pfEaten) *pfEaten=TRUE;
+        return S_OK;
+    }
+    if (wParam == VK_ESCAPE && obj->pComposition && !JamoComp_OwnsFocus(obj,pic)) return S_OK;
     if (obj->passthrough) {
         EnterCriticalSection(&g_configLock);
         bool ptHit = Config_IsShortcut(&obj->config, SC_FN_PASSTHROUGH,
@@ -1556,8 +1611,10 @@ static HRESULT STDMETHODCALLTYPE KES_OnKeyDown(ITfKeyEventSink *pThis, ITfContex
     // Config_RotateLayout 등과 중첩돼도 안전. 이후 모든 경로는 kd_done으로 해제.
     EnterCriticalSection(&g_configLock);
     if (wParam != VK_ESCAPE && !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods) &&
+        !RetryPendingAtOwnedFocus(obj, pic)) goto kd_done;
+    if (wParam != VK_ESCAPE && !Config_IsShortcut(&obj->config, SC_FN_ROTATE, skVk, skMods) &&
         !JamoComp_PrepareInput(obj, pic)) {
-        if (pfEaten) *pfEaten = obj->pCompContext == pic;
+        if (pfEaten) *pfEaten = JamoComp_OwnsFocus(obj, pic);
         goto kd_done;
     }
 
@@ -2166,6 +2223,7 @@ static HRESULT STDMETHODCALLTYPE KES_OnPreservedKey(ITfKeyEventSink *pThis, ITfC
     JamoDiag("PRESERVED-KEY fn=%d", fn);
     // OnKeyDown 의 해당 분기와 같은 동작·같은 락 규율 (preserved key 는 sink 이전에 매니저가 보낸다)
     EnterCriticalSection(&g_configLock);
+    DeferFallbackOnFocusChange(obj, pic);
     switch (fn) {
         case SC_FN_SETTINGS:
             SettingsUI_Show(&obj->config);

@@ -52,4 +52,11 @@ $inlineArgs = $baseArgs + @('-I',(Join-Path $SourceRoot 'src'),
     @('-o',(Join-Path $output 'InlineTests.exe'),'-static','-lole32','-loleaut32','-luuid')
 & $compiler @inlineArgs
 if ($LASTEXITCODE) { throw 'Inline composition test compilation failed.' }
+$editArgs = $baseArgs + @('-ffunction-sections','-fdata-sections','-Wl,--gc-sections',
+    '-I',(Join-Path $SourceRoot 'src'),(Join-Path $PSScriptRoot 'edit-session-tests.c'),
+    (Join-Path $SourceRoot 'src\edit_verdict.c'),(Join-Path $SourceRoot 'src\fsm.c'),
+    (Join-Path $SourceRoot 'src\layout.c'),(Join-Path $SourceRoot 'src\hangul_layout.c'),
+    '-o',(Join-Path $output 'EditSessionTests.exe'),'-static','-lole32','-loleaut32','-luuid')
+& $compiler @editArgs
+if ($LASTEXITCODE) { throw 'Edit-session test compilation failed.' }
 Write-Output "Built $dll (local preview; Installable=$Installable; not registered by build)."

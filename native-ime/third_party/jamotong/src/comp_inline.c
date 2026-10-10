@@ -17,28 +17,101 @@ typedef struct InlineEditSession {
     CompOp op;
     wchar_t commit;    // COMP_OP_UPDATE: 확정 음절 (0=없음)
     wchar_t preedit;   // COMP_OP_UPDATE: 조합 중 음절 (0=없음)
+    HWND focusHwnd;   // Captured before any reentrant host call.
     ITfComposition *expectedComposition; // Bind queued finalization to its original document.
 } InlineEditSession;
+
+// A retained, different document can finish after focus leaves its window.
+// Prove distinct COM identity; a shared CUAS context must still match its HWND.
+static BOOL SessionOwnsTarget(InlineEditSession *es) {
+    if (es->focusHwnd && es->focusHwnd == GetFocus()) return TRUE;
+    if (es->op != COMP_OP_FINALIZE || !es->svc->threadMgr) return FALSE;
+    ITfDocumentMgr *doc=NULL;ITfContext *current=NULL;
+    IUnknown *oldId=NULL,*newId=NULL;BOOL distinct=FALSE;
+    if (SUCCEEDED(es->svc->threadMgr->lpVtbl->GetFocus(es->svc->threadMgr,&doc)) && doc &&
+        SUCCEEDED(doc->lpVtbl->GetTop(doc,&current)) && current && current != es->ctx &&
+        SUCCEEDED(es->ctx->lpVtbl->QueryInterface(es->ctx,&IID_IUnknown,(void**)&oldId)) && oldId &&
+        SUCCEEDED(current->lpVtbl->QueryInterface(current,&IID_IUnknown,(void**)&newId)) && newId)
+        distinct=oldId != newId;
+    if(newId)newId->lpVtbl->Release(newId);
+    if(oldId)oldId->lpVtbl->Release(oldId);
+    if(current)current->lpVtbl->Release(current);
+    if(doc)doc->lpVtbl->Release(doc);
+    return distinct;
+}
 
 // ── 내부 헬퍼 ────────────────────────────────────────────────────────────────────
 
 // 로컬 composition 참조 정리 (문서 상태는 건드리지 않음).
 static void ForgetComposition(JamotongTextService *svc) {
-    if (svc->pComposition) {
-        svc->pComposition->lpVtbl->Release(svc->pComposition);
-        svc->pComposition = NULL;
-    }
-    if (svc->pCompContext) {
-        svc->pCompContext->lpVtbl->Release(svc->pCompContext);
-        svc->pCompContext = NULL;
-    }
+    ITfComposition *composition = svc->pComposition;
+    ITfContext *context = svc->pCompContext;
+    // Release can call back into the service. Detach the complete old state
+    // first so that cleanup cannot release or erase a replacement composition.
+    svc->pComposition = NULL;
+    svc->pCompContext = NULL;
     svc->compUpdatedOnce = FALSE;
     svc->compFinalizePending = FALSE;
     svc->compBoundaryWritten = FALSE;
+    svc->pCompFocusHwnd = NULL;
+    if (composition) composition->lpVtbl->Release(composition);
+    if (context) context->lpVtbl->Release(context);
 }
 
-// CUAS needs exactly one interim character (TF_AE_NONE), not a collapsed caret.
-static HRESULT SelectRangeEnd(ITfContext *ctx, TfEditCookie ec, ITfRange *range, BOOL interim) {
+// Missing from the pinned MinGW headers/uuid library. Value from Microsoft's
+// dotnet/wpf UnsafeNativeMethodsTextServices.cs: GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT.
+static const GUID kTransitoryExtensionParent =
+    {0x8be347f8,0xc7a0,0x11d7,{0xb4,0x08,0x00,0x06,0x5b,0x84,0x43,0x5c}};
+
+// Chromium's native TSF store also reports TRANSITORY. Only use the Korean
+// interim-character compatibility style when this document positively exposes
+// an existing transitory-extension parent. This is a display choice, never an
+// assertion about whether the app wants text or a command. Unknown => caret.
+static BOOL HasTransitoryExtensionParent(ITfContext *ctx) {
+    TF_STATUS status = {0};
+    if (ctx->lpVtbl->GetStatus(ctx, &status) != S_OK ||
+        !(status.dwStaticFlags & JAMO_TS_SS_TRANSITORY)) return FALSE;
+
+    ITfDocumentMgr *doc = NULL;
+    ITfCompartmentMgr *manager = NULL;
+    IEnumGUID *items = NULL;
+    ITfCompartment *compartment = NULL;
+    VARIANT value;
+    VariantInit(&value);
+    BOOL found = FALSE, interim = FALSE;
+    if (ctx->lpVtbl->GetDocumentMgr(ctx, &doc) != S_OK || !doc) goto done;
+    if (doc->lpVtbl->QueryInterface(doc, &IID_ITfCompartmentMgr, (void**)&manager) != S_OK || !manager)
+        goto done;
+    if (manager->lpVtbl->EnumCompartments(manager, &items) != S_OK || !items) goto done;
+    // GetCompartment can create a missing compartment. Enumerate first, and
+    // bound work if a host supplies a malformed or never-ending enumerator.
+    for (unsigned i = 0; i < 256; ++i) {
+        GUID guid;
+        ULONG fetched = 0;
+        if (items->lpVtbl->Next(items, 1, &guid, &fetched) != S_OK || fetched != 1) break;
+        if (IsEqualGUID(&guid, &kTransitoryExtensionParent)) { found = TRUE; break; }
+    }
+    if (!found || manager->lpVtbl->GetCompartment(manager, &kTransitoryExtensionParent, &compartment) != S_OK ||
+        !compartment) goto done;
+    // The predefined-compartment contract describes an IUnknown parent value.
+    // Require that representation, not the inconsistent VT_I4 table label.
+    // CUAS can expose an opaque parent that rejects ITfDocumentMgr QI; do not
+    // query or dereference it merely to choose a selection presentation.
+    interim = compartment->lpVtbl->GetValue(compartment, &value) == S_OK &&
+              value.vt == VT_UNKNOWN && value.punkVal != NULL;
+done:
+    VariantClear(&value);
+    if (compartment) compartment->lpVtbl->Release(compartment);
+    if (items) items->lpVtbl->Release(items);
+    if (manager) manager->lpVtbl->Release(manager);
+    if (doc) doc->lpVtbl->Release(doc);
+    return interim;
+}
+
+// Marked transitory extensions retain the one-character CUAS interim style.
+// Native and unconfirmed contexts use a collapsed caret with fInterimChar=FALSE.
+static HRESULT SelectRangeEnd(InlineEditSession *es, TfEditCookie ec, ITfRange *range, BOOL interim) {
+    ITfContext *ctx=es->ctx;
     ITfRange *pEnd = NULL;
     HRESULT hr = range->lpVtbl->Clone(range, &pEnd);
     if (SUCCEEDED(hr) && pEnd) {
@@ -53,7 +126,7 @@ static HRESULT SelectRangeEnd(ITfContext *ctx, TfEditCookie ec, ITfRange *range,
             sel.range = pEnd;
             sel.style.ase = interim ? TF_AE_NONE : TF_AE_END;
             sel.style.fInterimChar = interim;
-            hr = ctx->lpVtbl->SetSelection(ctx, ec, 1, &sel);
+            hr = SessionOwnsTarget(es) ? ctx->lpVtbl->SetSelection(ctx, ec, 1, &sel) : E_PENDING;
         }
         pEnd->lpVtbl->Release(pEnd);
     }
@@ -85,6 +158,8 @@ static HRESULT EnsureComposition(InlineEditSession *es, TfEditCookie ec, ITfRang
     JamotongTextService *svc = es->svc;
     *rangeOut = NULL;
 
+    if (!SessionOwnsTarget(es)) return E_PENDING;
+
     if (svc->pComposition && svc->pCompContext != es->ctx) return E_UNEXPECTED;
 
     if (svc->pComposition) {
@@ -102,11 +177,13 @@ static HRESULT EnsureComposition(InlineEditSession *es, TfEditCookie ec, ITfRang
     ITfComposition *created = NULL;
     HRESULT hr = es->ctx->lpVtbl->QueryInterface(es->ctx, &IID_ITfInsertAtSelection, (void**)&pIns);
     if (FAILED(hr)) goto done;
+    if (!SessionOwnsTarget(es)) { hr=E_PENDING; goto done; }
     // TF_IAS_QUERYONLY: 텍스트 없이 삽입 지점 range만 얻는다.
     hr = pIns->lpVtbl->InsertTextAtSelection(pIns, ec, TF_IAS_QUERYONLY, NULL, 0, &insRange);
     if (FAILED(hr) || !insRange) { if (SUCCEEDED(hr)) hr = E_UNEXPECTED; goto done; }
     hr = es->ctx->lpVtbl->QueryInterface(es->ctx, &IID_ITfContextComposition, (void**)&pCC);
     if (FAILED(hr)) goto done;
+    if (!SessionOwnsTarget(es)) { hr=E_PENDING; goto done; }
     // 실제 sink 필수 — NULL sink는 일부 경로에서 E_INVALIDARG로 실패한다(실기 교훈).
     hr = pCC->lpVtbl->StartComposition(pCC, ec, insRange,
                                        (ITfCompositionSink*)&svc->lpVtblCompSink, &created);
@@ -115,11 +192,13 @@ static HRESULT EnsureComposition(InlineEditSession *es, TfEditCookie ec, ITfRang
     if (FAILED(hr)) goto done;
     hr = created->lpVtbl->GetRange(created, rangeOut);
     if (FAILED(hr)) goto done;
+    if (!SessionOwnsTarget(es)) { hr=E_PENDING; if(*rangeOut){(*rangeOut)->lpVtbl->Release(*rangeOut);*rangeOut=NULL;} goto done; }
 
     svc->pComposition = created;   // publish (참조 이관)
     created = NULL;
     svc->pCompContext = es->ctx;
     es->ctx->lpVtbl->AddRef(es->ctx);
+    svc->pCompFocusHwnd = es->focusHwnd;
     svc->compUpdatedOnce = FALSE;
 
 done:
@@ -160,6 +239,10 @@ done:
 static HRESULT DoInlineWork(InlineEditSession *es, TfEditCookie ec) {
     JamotongTextService *svc = es->svc;
 
+    if (es->expectedComposition && es->expectedComposition != svc->pComposition) return S_FALSE;
+    if (!SessionOwnsTarget(es) || (svc->pComposition && svc->pCompContext != es->ctx))
+        return E_PENDING; // A queued cookie cannot authorize writing into a newly focused control.
+
     if (es->op == COMP_OP_FINALIZE || es->op == COMP_OP_CANCEL) {
         if (!svc->pComposition) return S_OK;
         if (es->expectedComposition && es->expectedComposition != svc->pComposition) return S_FALSE;
@@ -170,17 +253,18 @@ static HRESULT DoInlineWork(InlineEditSession *es, TfEditCookie ec) {
         if (SUCCEEDED(hr) && !range) hr = E_UNEXPECTED;
         if (SUCCEEDED(hr) && range) {
             if (es->op == COMP_OP_CANCEL) {
-                hr = range->lpVtbl->SetText(range, ec, 0, L"", 0);
+                hr = SessionOwnsTarget(es) ? range->lpVtbl->SetText(range, ec, 0, L"", 0) : E_PENDING;
             } else {
-                hr = SelectRangeEnd(es->ctx, ec, range, FALSE);
+                hr = SelectRangeEnd(es, ec, range, FALSE);
             }
             range->lpVtbl->Release(range);
         }
         // Do not leave an interim character selected and claim finalization succeeded.
         if (FAILED(hr)) { composition->lpVtbl->Release(composition); return hr; }
         HRESULT endHr = S_OK;
-        if (svc->pComposition == composition)
+        if (svc->pComposition == composition && SessionOwnsTarget(es))
             endHr = composition->lpVtbl->EndComposition(composition, ec);
+        else if (svc->pComposition == composition) endHr=E_PENDING;
         JamoDiag("COMP %s end hr=0x%08lX", es->op == COMP_OP_CANCEL ? "cancel" : "finalize",
                  (unsigned long)endHr);
         if (SUCCEEDED(endHr) && svc->pComposition == composition) ForgetComposition(svc);
@@ -208,7 +292,7 @@ static HRESULT DoInlineWork(InlineEditSession *es, TfEditCookie ec) {
     HRESULT hr = EnsureComposition(es, ec, &range);
     if (FAILED(hr)) return hr;
 
-    hr = range->lpVtbl->SetText(range, ec, 0, whole, n);   // flag 0 = 일반 갱신 (조합 밑줄은 표시 속성 몫)
+    hr = SessionOwnsTarget(es) ? range->lpVtbl->SetText(range, ec, 0, whole, n) : E_PENDING;
     if (FAILED(hr)) {
         // 방금 만든 조합이면 rollback — 실패를 감추면 증상이 엉뚱한 곳에서 나타난다.
         if (createdNow && svc->pComposition) {
@@ -227,10 +311,8 @@ static HRESULT DoInlineWork(InlineEditSession *es, TfEditCookie ec) {
     }
     // 표시 속성(밑줄) 실패는 조합을 무효로 만들지 않는다 — 밑줄이 없을 뿐이다.
     DA_ApplyToRange(es->ctx, ec, range, svc->daAtom);
-    TF_STATUS status = {0};
-    BOOL interim = es->preedit && SUCCEEDED(es->ctx->lpVtbl->GetStatus(es->ctx, &status))
-                   && (status.dwStaticFlags & JAMO_TS_SS_TRANSITORY);
-    hr = SelectRangeEnd(es->ctx, ec, range, interim);
+    BOOL interim = es->preedit && HasTransitoryExtensionParent(es->ctx);
+    hr = SelectRangeEnd(es, ec, range, interim);
     range->lpVtbl->Release(range);
     if (FAILED(hr)) return hr;
 
@@ -279,7 +361,8 @@ static HRESULT STDMETHODCALLTYPE IES_DoEditSession(ITfEditSession *pThis, TfEdit
     g_ourEditDepth++;                      // 우리 인라인 조합 편집 (light dismiss 판정용)
     HRESULT hr = IES_DoEditSession_Inner(pThis, ec);
     g_ourEditDepth--;
-    if (finalizing && matched) {
+    if (finalizing && matched &&
+        (!es->svc->pComposition || es->svc->pComposition == es->expectedComposition)) {
         es->svc->compFinalizePending = FALSE;
         if (hr == S_OK && !es->svc->pComposition) Jamotong_ClearCompositionState(es->svc);
     }
@@ -298,6 +381,7 @@ static HRESULT RequestInline(JamotongTextService *svc, ITfContext *ctx, CompOp o
     es->refCount = 1;
     es->svc = svc; es->ctx = ctx;
     es->op = op; es->commit = commit; es->preedit = preedit;
+    es->focusHwnd = op == COMP_OP_UPDATE ? GetFocus() : svc->pCompFocusHwnd;
     if (op != COMP_OP_UPDATE && svc->pComposition) {
         es->expectedComposition = svc->pComposition;
         es->expectedComposition->lpVtbl->AddRef(es->expectedComposition);
@@ -346,7 +430,6 @@ static HRESULT STDMETHODCALLTYPE CS_OnCompositionTerminated(ITfCompositionSink *
         BOOL survived = obj->compUpdatedOnce;
         JamoDiag("COMP terminated externally (survived=%d demerits=%d)",
                  (int)survived, obj->pathDemerits);
-        ForgetComposition(obj);
         Fsm_Init(&obj->fsm);   // 다음 키는 새 조합으로 시작 (이어 붙이면 자모가 겹친다)
         if (survived) {
             obj->pathDemerits = 0;
@@ -354,6 +437,9 @@ static HRESULT STDMETHODCALLTYPE CS_OnCompositionTerminated(ITfCompositionSink *
             obj->pathDemerits++;
             if (obj->pathDemerits >= JAMO_PATH_DEMOTE_LIMIT) obj->pathKind = JAMO_PATH_COMMIT;
         }
+        // No state writes after releasing host references: Release may enter
+        // another document and publish a new composition/FSM synchronously.
+        ForgetComposition(obj);
     }
     return S_OK;
 }
@@ -366,6 +452,7 @@ void JamoComp_Init(JamotongTextService *svc) {
     svc->lpVtblCompSink = &g_CompSinkVtbl;
     svc->pComposition = NULL;
     svc->pCompContext = NULL;
+    svc->pCompFocusHwnd = NULL;
     svc->pPathContext = NULL;
     svc->pathKind = JAMO_PATH_COMMIT;
     svc->pathDemerits = 0;
@@ -403,8 +490,9 @@ JamoPathKind JamoComp_PathForContext(JamotongTextService *svc, ITfContext *pic) 
 
 HRESULT JamoComp_Apply(JamotongTextService *svc, ITfContext *pic, FsmResult res) {
     if (svc->compFinalizePending || svc->compBoundaryWritten ||
-        (svc->pComposition && svc->pCompContext != pic)) return E_PENDING;
+        (svc->pComposition && !JamoComp_OwnsFocus(svc, pic))) return E_PENDING;
     HRESULT hr = RequestInline(svc, pic, COMP_OP_UPDATE, res.commitChar, res.preeditChar);
+    if (hr == E_PENDING) return hr; // Focus ownership is not a failed composition capability.
     if (FAILED(hr)) {
         JamoDiag("COMP apply failed hr=0x%08lX -> cancel+demote", (unsigned long)hr);
         JamoComp_Cancel(svc);   // 문서에 남았을 수 있는 조합 텍스트 제거 시도 (없으면 no-op)
@@ -418,16 +506,33 @@ BOOL JamoComp_IsActive(const JamotongTextService *svc) {
     return svc->pComposition != NULL;
 }
 
+BOOL JamoComp_OwnsFocus(const JamotongTextService *svc, ITfContext *ctx) {
+    return ctx && svc->pCompContext == ctx && svc->pCompFocusHwnd &&
+           svc->pCompFocusHwnd == GetFocus();
+}
+
 HRESULT JamoComp_Finalize(JamotongTextService *svc) {
     if (!svc->pComposition || !svc->pCompContext) return S_OK;
     if (svc->compFinalizePending) return TF_S_ASYNC;
+    ITfComposition *composition = svc->pComposition;
+    composition->lpVtbl->AddRef(composition);
+    if (svc->pComposition != composition || !svc->pCompContext || svc->compFinalizePending) {
+        composition->lpVtbl->Release(composition);
+        return E_PENDING;
+    }
     ITfContext *ctx = svc->pCompContext;
     ctx->lpVtbl->AddRef(ctx);   // 세션 도중 ForgetComposition이 pCompContext를 놓아도 안전
+    if (svc->pComposition != composition || svc->pCompContext != ctx || svc->compFinalizePending) {
+        ctx->lpVtbl->Release(ctx);
+        composition->lpVtbl->Release(composition);
+        return E_PENDING;
+    }
     svc->compBoundaryWritten = TRUE; // Even a failed boundary must finish before another update.
     svc->compFinalizePending = TRUE;
     HRESULT hr = RequestInline(svc, ctx, COMP_OP_FINALIZE, 0, 0);
-    if (hr != TF_S_ASYNC) svc->compFinalizePending = FALSE;
+    if (hr != TF_S_ASYNC && svc->pComposition == composition) svc->compFinalizePending = FALSE;
     ctx->lpVtbl->Release(ctx);
+    composition->lpVtbl->Release(composition);
     return hr;
 }
 
@@ -443,6 +548,11 @@ HRESULT JamoComp_CommitWithSpace(JamotongTextService *svc, wchar_t syllable) {
 
 BOOL JamoComp_PrepareInput(JamotongTextService *svc, ITfContext *ctx) {
     if (svc->compFinalizePending) return FALSE;
+    if (svc->pComposition && svc->pCompContext == ctx &&
+        svc->pCompFocusHwnd && svc->pCompFocusHwnd != GetFocus()) {
+        svc->compBoundaryWritten = TRUE;
+        return FALSE; // Retry only on the original target; new target keys belong to the app.
+    }
     if (svc->compBoundaryWritten || (svc->pComposition && svc->pCompContext != ctx))
         return JamoComp_Finalize(svc) == S_OK;
     return TRUE;
@@ -453,7 +563,7 @@ void JamoComp_Cancel(JamotongTextService *svc) {
     ITfContext *ctx = svc->pCompContext;
     ctx->lpVtbl->AddRef(ctx);
     HRESULT hr = RequestInline(svc, ctx, COMP_OP_CANCEL, 0, 0);
-    if (FAILED(hr)) ForgetComposition(svc);
+    if (FAILED(hr) && hr != E_PENDING) ForgetComposition(svc);
     ctx->lpVtbl->Release(ctx);
 }
 

@@ -3,7 +3,32 @@
 This is the Jamotong-based replacement candidate. The production updater still
 distributes the 1.1.1 tray helper. An explicitly requested **local preview
 installation** is available below; it is not a public release and has no automatic
-updater. All-application and Adobe compatibility remain unverified.
+updater. Premiere workspace shortcuts currently fail. After Effects and
+all-application compatibility remain unverified.
+
+On 2026-10-10 an external one-shot experiment restored C in the tested Premiere
+timeline and Studio One workspace while preserving the tested search/caption
+input. It is not part of the installed preview. A separate controlled policy
+gate exposes text loss in a legitimate offspot editor and unintended raw-key
+commands during text entry. The experiment must not be enabled globally or
+packaged as a completed fix. See [experiment scope and evidence](experiments/inline-preedit/README.md).
+
+`prepare-package.ps1` now runs `test-package.ps1` against both actual installable
+DLL candidates before writing package files. No known-bug expectation switch is
+accepted by that gate. Passing automated contracts is necessary but does not
+replace physical application and installer verification. The existing workspace
+routing failure currently blocks packaging.
+
+The latest candidate fixes Chromium-style interim selection and composition
+lifetime/reentrancy errors. On 2026-10-10 the exact x64 candidate passed a real
+Windows TSF own-document run with Chromium-style static flags: nine consumed
+keys, exact Hangul/backspace/space results, collapsed TSF/ACP selections without
+interim highlighting, live compositions and verified profile/mode restoration.
+This does not test Chromium itself or solve host workspace classification.
+The two architecture contract runs each pass 26 engine, 178 inline and 15
+edit-session checks; routing still fails one of 86 cases. Details and the
+official Premiere SDK/event-observer investigation are in
+[the evidence report](../docs/gureum-input-routing-analysis.md).
 
 ## Reuse and local changes
 
@@ -47,8 +72,12 @@ RIUM build scripts below.
 ./native-ime/build.ps1 -Architecture x64
 ./native-ime/build.ps1 -Architecture x86
 ./native-ime/out/x64/EngineTests.exe
+./native-ime/out/x64/InlineTests.exe
+./native-ime/out/x64/EditSessionTests.exe
 ./native-ime/out/x64/RoutingTests.exe "$PWD/native-ime/out/x64/RiumKeysInput.dll"
 ./native-ime/out/x86/EngineTests.exe
+./native-ime/out/x86/InlineTests.exe
+./native-ime/out/x86/EditSessionTests.exe
 ./native-ime/out/x86/RoutingTests.exe "$PWD/native-ime/out/x86/RiumKeysInput.dll"
 ```
 
@@ -62,7 +91,7 @@ Test results on this PC:
 - Original key sink: six failing routing cases (null, changed disabled value,
   empty, read-only, disconnected, stale cache). The added failure-injection
   suite also reproduced four compartment error/type failures before the fix.
-- Current x64 and x86: 26 engine, 49 routing/policy and 52 inline-composition checks pass in each
+- Verified preview.3 x64 and x86: 26 engine, 49 routing/policy and 52 inline-composition checks pass in each
   architecture. Routing tests exercise the real DLL with controlled contexts;
   they are not physical keyboard or all-application compatibility tests.
 - Manual TIP activation using an ordinary application client ID returned
@@ -153,7 +182,7 @@ does not terminate user applications. Recovery state is stored under
 
 This installer refuses an existing native registration/version directory and
 input configurations it cannot snapshot faithfully. It is a first-install
-preview. Use `upgrade-local.ps1` for an existing preview.2 installation. An interrupted commit is reported as unknown
+preview. The current `upgrade-local.ps1` requires preview.3 and installs preview.4; it does not accept preview.2 directly. An interrupted commit is reported as unknown
 instead of being labeled rolled back.
 
 ### Verified local installation on 2026-10-10
@@ -226,8 +255,8 @@ Escape/Hangul recovery remain available if a host rejects finalization.
 ./native-ime/upgrade-local.ps1
 ```
 
-`upgrade-local.ps1` upgrades the verified preview.2 installation only. It retains
-the previous version, stages preview.3 in its own Program Files directory, and
+The preview.3 upgrade retained
+preview.2, staged preview.3 in its own Program Files directory, and
 updates both COM views without unregistering the shared keyboard profile.
 The ordinary-user verifier checks the DLL loaded by a fresh physical fixture,
 inline preedit, exact Korean text and Space, original V down/up on a button, and
@@ -280,3 +309,104 @@ it needs a restart to load the new version. Its composer was not directly
 automated. This result verifies the installed native EDIT/button path, not
 all applications or the pending Adobe scenarios. The detailed local report is
 `native-ime/out/inline-upgrade-verification.json` (ignored).
+
+### Premiere workspace diagnosis (preview.4, local only)
+
+The running Premiere process was verified to load preview.3. After Korean input
+in Project search, clicking the timeline and pressing V produced a floating
+`ㅍ` composition instead of selecting the tool. The search EDIT exposed a native
+caret; the timeline and graphics editor did not. A native-caret-only rule would
+therefore risk disabling Korean graphics text. No such rule is enabled.
+
+Preview.4 deliberately preserves preview.3 routing while adding an opt-in,
+temporary metadata trace inside the host process. It is **not a shortcut fix**.
+Normal `RoutingTests.exe` now includes the reproduced transitory workspace
+expectation and reports that known failure. The explicit
+`--expect-known-workspace-bug` option characterizes the diagnostic baseline; it
+does not demonstrate that the bug has been repaired.
+
+For a local diagnosis, set `FocusTraceImage` (REG_SZ, exact executable basename)
+and `FocusTraceUntil` (REG_QWORD, UTC Windows FILETIME) in
+`HKCU\Software\Contentrium\RiumKeysInput` before starting the target process.
+The deadline must be within 30 minutes. Settings are sampled once per thread;
+the loaded DLL version must be checked after the user restarts the application.
+The trace writes at most 512 changed metadata rows per process, with a 100 ms
+per-thread sampling interval, to `%TEMP%\RiumKeys-focus-<pid>.log`. It captures
+context flags, handles, control class, and caret/IMM geometry. It never reads
+keys, composition text, document text, titles, or document filenames.
+Removing the registry settings prevents newly initialized threads from tracing;
+already armed threads stop at the cached deadline. Logs remain local for review.
+
+The current `upgrade-local.ps1` only stages verified preview.3 to preview.4 and
+retains preview.3 for rollback. No user application is terminated. Physical
+fixture verification is required before committing registration; successful
+installation alone does not establish Premiere shortcut compatibility.
+
+#### Preview.4 installation and Premiere results, 2026-10-10
+
+Preview.4 is installed locally, with all seven manifest hashes matching. The
+registered input profile is enabled, active, the user's default and has six
+categories. Premiere was confirmed to load the versioned Program Files DLL.
+The installed native EDIT/button physical smoke test passed after one initial
+Korean toggle; its fixture restored the previous process-local profile. Evidence:
+`out/focus-upgrade-verification.json` and the transaction's physical fixture log.
+
+Actual Premiere testing **fails** the intended shortcut behavior in both paths:
+Project search to timeline/C displays `ㅊ`, and on-video graphics Korean `한`
+to timeline/V displays `ㅍ`. The graphics editor and timeline expose the same
+writable transitory context, dynamic flags, absence of a native caret, and IMM
+composition style. Their different HWNDs and sizes are not editing contracts.
+No caret-only, dynamic-bit, window-name or application-name rule was added.
+
+The [Gureum source comparison and Premiere observations](../docs/gureum-input-routing-analysis.md)
+describe the measured ambiguity, the macOS/Windows contract differences, and
+the limits of possible follow-up diagnostics. These findings do not establish
+an application-independent classifier or a repaired shortcut path.
+
+The temporary registry trace opt-in was restored to its original absent state.
+The already armed Premiere thread retains its original deadline of
+2026-10-10 14:02:50 KST; it cannot trace past that deadline. Logs remain local.
+The source comparison and remaining feasibility gate are recorded in
+[Gureum and Windows input routing](../docs/gureum-input-routing-analysis.md).
+This installed diagnostic build is not a fixed public release.
+
+### Experimental focus ownership changes (not installed)
+
+The development source binds inline composition and deferred Korean commits to
+their original focus HWND as well as their context. A shared CUAS context is not
+enough to authorize an edit after focus moves. Edit callbacks recheck the captured
+owner before inserting text, and `RequestEditSessionDataEx` propagates the inner
+session result even when `ASYNCDONTCARE` executes synchronously. A queued result
+is not evidence of a completed insertion.
+
+Unresolved fallback text is retained rather than overwritten by another syllable.
+Escape explicitly discards that pending text; the preview callback does not
+insert it first. Returning to the original owner permits a synchronous retry.
+Reentrant key callbacks cannot retry the same slot twice, and completion only
+clears the captured slot generation. Preserved layout-switch keys apply the same
+ownership transition. A finished composition's window is not reused as owner of
+the next syllable, and temporary focus mismatch does not demote a live inline
+composition to the fallback path.
+An actual distinct native document can still finalize its retained composition
+after focus leaves; this path checks COM identity instead of guessing from a
+window class or undocumented status bits.
+
+This is an experimental ownership repair, **not the missing workspace/text
+classifier**. In a host that rejects finalization, pending fallback text can
+block new Korean composition until the original target accepts it or the user
+discards it with Escape. No installable package, machine registration update, or
+public release has been made for these source changes. This PC remains on
+preview.4, which still fails the Premiere workspace shortcut scenario.
+
+The normal routing suite deliberately retains the failing first-V assertion.
+Passing with `--expect-known-workspace-bug` characterizes that failure; it must
+not be used as a release success. The added `EditSessionTests.exe` exercises the
+production edit-session code, including inner errors, asynchronous scheduling,
+reference lifetime, and focus changes during host callbacks.
+
+The current fixture builds on 2026-10-10 passed 26 engine, 76 inline, 15 edit-session,
+and 86 routing characterization checks per architecture (x64 and x86). Normal
+routing reports **one failure out of 86** in each: `transitory workspace without
+text focus passes first V`. Local results are saved in ignored
+`out/ownership-x64-results.json` and `out/ownership-x86-results.json`. These are
+source-level tests, not installed-build Adobe compatibility evidence.

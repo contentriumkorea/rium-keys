@@ -8,7 +8,7 @@
 // It is not an application adapter and must never be used with user documents.
 class FixtureStore final: public ITextStoreACP,public ITfContextOwnerCompositionSink {
     LONG refs=1;DWORD lock=0,pending=0;ComPtr<ITextStoreACPSink> sink;
-    TS_SELECTION_ACP selection{0,0,{TS_AE_END,FALSE}};HWND window;
+    TS_SELECTION_ACP selection{0,0,{TS_AE_END,FALSE}};HWND window;DWORD advertisedStaticFlags;
     bool Range(LONG start,LONG end)const{return start>=0&&end>=start&&end<=static_cast<LONG>(text.size());}
     bool Readable()const{return (lock&TS_LF_READ)!=0;}
     bool Writable()const{return (lock&TS_LF_READWRITE)==TS_LF_READWRITE;}
@@ -17,14 +17,16 @@ public:
     bool rejectNextWrite=false,rejectNextText=false,rejectNextSelection=false,readOnly=false;
     void Clear(){auto previous=static_cast<LONG>(text.size());text.clear();selection.acpStart=selection.acpEnd=0;if(sink){TS_TEXTCHANGE change{0,previous,0};sink->OnTextChange(0,&change);sink->OnSelectionChange();}}
     void InsertFromApplication(const std::wstring& value){auto start=selection.acpStart,end=selection.acpEnd;text.replace(static_cast<size_t>(start),static_cast<size_t>(end-start),value);selection.acpStart=selection.acpEnd=start+static_cast<LONG>(value.size());if(sink){TS_TEXTCHANGE change{start,end,selection.acpEnd};sink->OnTextChange(0,&change);sink->OnSelectionChange();}}
-    explicit FixtureStore(HWND value):window(value){}
+    explicit FixtureStore(HWND value,DWORD staticFlags=TS_SS_NOHIDDENTEXT):window(value),advertisedStaticFlags(staticFlags){}
+    // A copy of this disposable document's state; never queries another application.
+    TS_SELECTION_ACP SelectionSnapshotForFixture()const{return selection;}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out)override{if(!out)return E_POINTER;*out=nullptr;if(id==IID_IUnknown||id==IID_ITextStoreACP)*out=static_cast<ITextStoreACP*>(this);else if(id==IID_ITfContextOwnerCompositionSink)*out=static_cast<ITfContextOwnerCompositionSink*>(this);else return E_NOINTERFACE;AddRef();return S_OK;}
     ULONG STDMETHODCALLTYPE AddRef()override{return InterlockedIncrement(&refs);}
     ULONG STDMETHODCALLTYPE Release()override{auto n=InterlockedDecrement(&refs);if(!n)delete this;return n;}
     HRESULT STDMETHODCALLTYPE AdviseSink(REFIID id,IUnknown* value,DWORD)override{if(id!=IID_ITextStoreACPSink||!value)return E_INVALIDARG;if(sink)return CONNECT_E_ADVISELIMIT;return value->QueryInterface(IID_PPV_ARGS(&sink));}
     HRESULT STDMETHODCALLTYPE UnadviseSink(IUnknown* value)override{if(!value||!sink)return CONNECT_E_NOCONNECTION;ComPtr<IUnknown> a,b;value->QueryInterface(IID_PPV_ARGS(&a));sink.As(&b);if(a.Get()!=b.Get())return CONNECT_E_NOCONNECTION;sink.Reset();return S_OK;}
     HRESULT STDMETHODCALLTYPE RequestLock(DWORD flags,HRESULT* result)override{if(!result)return E_POINTER;if(!sink)return E_UNEXPECTED;if(rejectNextWrite&&(flags&TS_LF_READWRITE)==TS_LF_READWRITE){rejectNextWrite=false;*result=E_FAIL;return S_OK;}if(lock){if(flags&TS_LF_SYNC)*result=TS_E_SYNCHRONOUS;else{pending|=flags;*result=TS_S_ASYNC;}return S_OK;}lock=flags;*result=sink->OnLockGranted(flags);lock=0;for(int i=0;pending&&i<16;++i){auto next=pending;pending=0;lock=next;sink->OnLockGranted(next);lock=0;}return S_OK;}
-    HRESULT STDMETHODCALLTYPE GetStatus(TS_STATUS* value)override{if(!value)return E_POINTER;*value={readOnly?static_cast<DWORD>(TS_SD_READONLY):0UL,TS_SS_NOHIDDENTEXT};return S_OK;}
+    HRESULT STDMETHODCALLTYPE GetStatus(TS_STATUS* value)override{if(!value)return E_POINTER;*value={readOnly?static_cast<DWORD>(TS_SD_READONLY):0UL,advertisedStaticFlags};return S_OK;}
     HRESULT STDMETHODCALLTYPE QueryInsert(LONG start,LONG end,ULONG,LONG* a,LONG* b)override{if(!a||!b)return E_POINTER;if(!Range(start,end))return TS_E_INVALIDPOS;*a=start;*b=end;return S_OK;}
     HRESULT STDMETHODCALLTYPE GetSelection(ULONG index,ULONG count,TS_SELECTION_ACP* out,ULONG* fetched)override{if(!out||!fetched)return E_POINTER;*fetched=0;if(!Readable())return TS_E_NOLOCK;if(index!=0&&index!=TS_DEFAULT_SELECTION)return E_INVALIDARG;if(count){*out=selection;*fetched=1;}return S_OK;}
     HRESULT STDMETHODCALLTYPE SetSelection(ULONG count,const TS_SELECTION_ACP* value)override{if(!value||count!=1)return E_INVALIDARG;if(!Writable())return TS_E_NOLOCK;if(rejectNextSelection){rejectNextSelection=false;return E_FAIL;}if(!Range(value->acpStart,value->acpEnd))return TS_E_INVALIDPOS;selection=*value;return S_OK;}

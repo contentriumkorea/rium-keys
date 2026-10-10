@@ -1,14 +1,18 @@
-param([switch]$Preflight)
+﻿param([switch]$Preflight,[string]$PackageRoot)
 $ErrorActionPreference='Stop'
 $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Start installation from the ordinary user session.'}
-$package=Join-Path $PSScriptRoot 'out\local-package'
+. (Join-Path $PSScriptRoot 'package-common.ps1')
+$package=Resolve-RiumPackageRoot $PSScriptRoot $PackageRoot
+$config=Get-RiumPackageConfig $package
+$verifiedManifest=@(Assert-RiumManifest $package $config)
+foreach($architecture in @('x64','x86')){Assert-RiumCandidateVersion (Join-Path $package "$architecture\RiumKeysInput.dll") $config.Version}
 $control=Join-Path $package 'x64\RiumKeysControl.exe'
-$target=Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.3'
+$target=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.Version)
 $legacyDir=Join-Path $env:LOCALAPPDATA 'Programs\RIUM Keys'
 $legacyExe=Join-Path $legacyDir 'RiumKeys.exe'
 $legacyUninstaller=Join-Path $legacyDir 'Uninstall.exe'
-$fixtureSource=Join-Path $PSScriptRoot 'out\x64\RiumImeFixture.exe'
+$fixtureSource=Join-Path $package 'x64\RiumImeFixture.exe'
 function Assert-NativeRegistryAbsent {
     foreach($view in @([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)){
         $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
@@ -21,22 +25,18 @@ function Assert-NativeRegistryAbsent {
     }
 }
 Assert-NativeRegistryAbsent
-$manifest=Get-Content -LiteralPath (Join-Path $package 'manifest.json') -Raw | ConvertFrom-Json
-foreach($entry in $manifest){
-    if((Get-FileHash -LiteralPath (Join-Path $package $entry.Path) -Algorithm SHA256).Hash -ne $entry.Sha256){throw 'Package integrity check failed.'}
-}
 $beforeText=& $control --status
 if($LASTEXITCODE){throw 'Cannot read the current input profile.'}
 $before=$beforeText | ConvertFrom-Json
 if($before.registered -or $before.categories -ne 0 -or (Test-Path -LiteralPath $target)){throw 'An existing native installation or version directory needs inspection.'}
 if($before.koreanDefault -notmatch '^0x0412:\{[0-9A-Fa-f-]{36}\}\{[0-9A-Fa-f-]{36}\}$'){throw 'Cannot capture the previous Korean input profile.'}
-if(!(Test-Path -LiteralPath $legacyExe) -or !(Test-Path -LiteralPath $legacyUninstaller)){throw 'Expected legacy installation is absent.'}
+$hasLegacy=Test-RiumLegacyMigration $legacyDir
 if(!(Test-Path -LiteralPath $fixtureSource)){throw 'Build the physical fixture before installation.'}
-if($Preflight){'PREFLIGHT PASS: package hashes, native absence, previous input profile, legacy uninstaller and fixture verified.';exit 0}
+if($Preflight){'PREFLIGHT PASS: package hashes/version, native absence, previous input profile, optional legacy migration and packaged fixture verified.';exit 0}
 $transaction=[guid]::NewGuid().ToString()
 $recovery=Join-Path $env:LOCALAPPDATA ("Contentrium\RIUM Keys\Recovery\"+(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+$transaction)
 New-Item -ItemType Directory -Path $recovery | Out-Null
-Copy-Item -LiteralPath $legacyExe,$legacyUninstaller -Destination $recovery
+if($hasLegacy){Copy-Item -LiteralPath $legacyExe,$legacyUninstaller -Destination $recovery}
 $legacySettings=Get-ItemProperty 'HKCU:\Software\Contentrium\RiumKeys' -ErrorAction SilentlyContinue
 $legacySettings | Select-Object * -ExcludeProperty PSPath,PSParentPath,PSChildName,PSDrive,PSProvider | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $recovery 'legacy-settings.json') -Encoding UTF8
 $state=[ordered]@{UserSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;PreviousTip=$before.defaultTip;PreviousActiveTip=$before.activeTip;InstallRoot=$target;LegacyDirectory=$legacyDir;Status='Preparing';Created=(Get-Date).ToString('o')}
@@ -47,7 +47,7 @@ $ready=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::Manua
 $done=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Done")
 $commit=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Commit")
 $machine=$null;$fixture=$null;$enabled=$false;$selected=$false;$committed=$false;$commitRequested=$false
-$wasRunning=@(Get-Process RiumKeys -ErrorAction SilentlyContinue).Count -gt 0
+$wasRunning=$hasLegacy -and @(Get-Process RiumKeys -ErrorAction SilentlyContinue).Count -gt 0
 try {
     $fixtureDir=Join-Path $recovery 'physical-test'
     New-Item -ItemType Directory -Path $fixtureDir | Out-Null
@@ -96,6 +96,7 @@ try {
     [void]$commit.Set();[void]$done.Set()
     if(!$machine.WaitForExit(45000) -or $machine.ExitCode -ne 0){throw 'Machine installation did not commit.'}
     $committed=$true
+    if($hasLegacy){
     Save-State 'NativeInstalledRemovingLegacy'
     $remove=Start-Process -FilePath $legacyUninstaller -ArgumentList '/S' -WindowStyle Hidden -PassThru
     if(!$remove.WaitForExit(30000)){throw 'Legacy uninstaller timed out; native IME remains installed.'}
@@ -104,9 +105,10 @@ try {
     if((Test-Path -LiteralPath $legacyExe) -or (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeys') -or (Get-Process RiumKeys -ErrorAction SilentlyContinue)){throw 'Legacy removal is incomplete; native IME remains installed.'}
     $run=Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name RiumKeys -ErrorAction SilentlyContinue
     if($run){throw 'Legacy startup registration remains.'}
+    }
     Save-State 'Installed'
     Get-Content -LiteralPath (Join-Path $target 'install-result.log')
-    "INSTALLED: RIUM Keys 2.0.0-preview.3; native profile selected; legacy utility removed. Recovery: $statePath"
+    "INSTALLED: RIUM Keys $($config.Version); native profile selected; legacy migration performed when present. Recovery: $statePath"
 } catch {
     $failure=$_
     if($commitRequested -and !$committed -and $machine -and !$machine.HasExited){

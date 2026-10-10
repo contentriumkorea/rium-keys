@@ -1,18 +1,20 @@
-param([switch]$Preflight)
+﻿param([switch]$Preflight,[string]$PackageRoot)
 $ErrorActionPreference='Stop'
 $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Start the upgrade in the ordinary user session.'}
-$package=Join-Path $PSScriptRoot 'out\local-package'
-$target=Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.3'
-$previousRoot=Join-Path $env:ProgramFiles 'RIUM Keys\2.0.0-preview.2'
+. (Join-Path $PSScriptRoot 'package-common.ps1')
+$package=Resolve-RiumPackageRoot $PSScriptRoot $PackageRoot
+$config=Get-RiumPackageConfig $package
+$verifiedManifest=@(Assert-RiumManifest $package $config)
+foreach($architecture in @('x64','x86')){Assert-RiumCandidateVersion (Join-Path $package "$architecture\RiumKeysInput.dll") $config.Version}
+$target=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.Version)
+$previousRoot=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.UpgradeFrom)
 $control=Join-Path $package 'x64\RiumKeysControl.exe'
 $stateKey='HKCU:\Software\Contentrium\RiumKeysInput'
 $previousStatePath=(Get-ItemProperty $stateKey -Name InstallState).InstallState
 $previous=Get-Content -LiteralPath $previousStatePath -Raw | ConvertFrom-Json
 if($previous.UserSid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -or $previous.InstallRoot -ne $previousRoot -or $previous.Status -ne 'Installed'){throw 'The previous installation state needs inspection.'}
 if(Test-Path -LiteralPath $target){throw 'The new version directory already exists; inspect the previous attempt.'}
-$manifest=Get-Content -LiteralPath (Join-Path $package 'manifest.json') -Raw | ConvertFrom-Json
-foreach($entry in $manifest){if((Get-FileHash -LiteralPath (Join-Path $package $entry.Path) -Algorithm SHA256).Hash -ne $entry.Sha256){throw 'Package hash mismatch.'}}
 foreach($entry in (Get-Content -LiteralPath (Join-Path $previousRoot 'manifest.json') -Raw | ConvertFrom-Json)){
     if((Get-FileHash -LiteralPath (Join-Path $previousRoot $entry.Path) -Algorithm SHA256).Hash -ne $entry.Sha256){throw 'Previous installation has unexpected changes.'}
 }
@@ -20,7 +22,7 @@ $beforeText=& $control --status
 if($LASTEXITCODE){throw 'Cannot capture input profile state.'}
 $before=$beforeText | ConvertFrom-Json
 if(!$before.registered -or !$before.enabled -or $before.categories -ne 6){throw 'The previous native input profile is incomplete.'}
-$fixtureSource=Join-Path $PSScriptRoot 'out\x64\RiumImeFixture.exe'
+$fixtureSource=Join-Path $package 'x64\RiumImeFixture.exe'
 if(!(Test-Path -LiteralPath $fixtureSource)){throw 'Build the native physical fixture first.'}
 if($Preflight){'PREFLIGHT PASS: previous install, original fallback state, package integrity and fixture verified.';exit 0}
 $transaction=[guid]::NewGuid().ToString()
@@ -44,6 +46,11 @@ $done=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::Manual
 $commit=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Commit")
 $machine=$null;$fixture=$null;$commitRequested=$false;$committed=$false
 try {
+    $launchInfo=[Diagnostics.ProcessStartInfo]::new((Join-Path $fixtureDir 'RiumInstalledSmoke.exe'),'--launch-check')
+    $launchInfo.UseShellExecute=$false;$launchInfo.CreateNoWindow=$true
+    $launchCheck=[Diagnostics.Process]::Start($launchInfo)
+    if(!$launchCheck.WaitForExit(5000)){Stop-Process -InputObject $launchCheck;throw 'Fixture launch check timed out.'}
+    if($launchCheck.ExitCode -ne 0){throw 'Fixture must launch under the ordinary user token.'}
     Save-State 'AwaitingAdministrator'
     $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $machine=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-File',('"'+(Join-Path $package 'install-machine.ps1')+'"'),'-Operation','Upgrade','-Transaction',$transaction) -Verb RunAs -WindowStyle Hidden -PassThru
@@ -62,7 +69,7 @@ try {
         Start-Sleep -Milliseconds 100
     }
     if(!$loaded){throw 'Could not confirm the installed DLL in a fresh process.'}
-    "UPGRADE TEST READY: installed preview.3 loaded. Recovery: $recovery"
+    "UPGRADE TEST READY: installed $($config.Version) loaded. Recovery: $recovery"
     if(!$fixture.WaitForExit(390000)){throw 'Physical verification timed out.'}
     Get-Content -LiteralPath (Join-Path $fixtureDir 'fixture-result.log')
     if($fixture.ExitCode -ne 0){throw 'Installed input did not pass physical verification.'}
@@ -78,7 +85,7 @@ try {
     Save-State 'Installed'
     Set-ItemProperty $stateKey -Name InstallState -Value $statePath
     Get-Content -LiteralPath (Join-Path $target 'install-result.log')
-    "INSTALLED: RIUM Keys 2.0.0-preview.3. Recovery: $statePath"
+    "INSTALLED: RIUM Keys $($config.Version). Recovery: $statePath"
 }catch {
     $failure=$_
     if($fixture -and !$fixture.HasExited){
@@ -99,7 +106,7 @@ try {
                     }finally{if($key){$key.Dispose()}}}finally{$base.Dispose()}
                 }
                 $app=Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeysInput'
-                if($app.InstallLocation -ne $previousRoot -or $app.DisplayVersion -ne '2.0.0-preview.2'){throw 'Installed-app rollback mismatch.'}
+                if($app.InstallLocation -ne $previousRoot -or $app.DisplayVersion -ne $config.UpgradeFrom){throw 'Installed-app rollback mismatch.'}
                 $rollbackText=& $control --status
                 if($LASTEXITCODE){throw 'Cannot read rollback input state.'}
                 $rollback=$rollbackText | ConvertFrom-Json

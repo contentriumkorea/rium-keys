@@ -11,7 +11,8 @@
 // 서비스 생성 시 sink vtbl 초기화 (JamotongTextService_Create).
 void JamoComp_Init(JamotongTextService *svc);
 
-// Context capability check; transitory contexts use a one-character interim selection.
+// Context capability check. Only positively marked transitory extensions use
+// a one-character interim selection; native TSF stores keep a collapsed caret.
 JamoPathKind JamoComp_PathForContext(JamotongTextService *svc, ITfContext *pic);
 
 // 순차 FSM 한 키 결과를 표준 composition으로 반영(한 키 = 한 동기 세션).
@@ -21,6 +22,8 @@ HRESULT JamoComp_Apply(JamotongTextService *svc, ITfContext *pic, FsmResult res)
 
 // 활성 문서 composition 존재 여부.
 BOOL JamoComp_IsActive(const JamotongTextService *svc);
+// Ownership only: a shared CUAS context is not proof of the same input target.
+BOOL JamoComp_OwnsFocus(const JamotongTextService *svc, ITfContext *ctx);
 
 // 확정: 조합 텍스트는 문서에 그대로 두고 composition만 종료(플러시·포커스 이동·한자키).
 // preedit 재삽입 금지 — 텍스트는 이미 문서 안에 있다.
