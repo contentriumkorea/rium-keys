@@ -44,10 +44,18 @@ static void ReusedEngineSession(){
     Require(UserTip(true),"enable temporary reused-engine profile");Check(RefreshTipCache(),"refresh temporary profile cache");
     WNDCLASSW cls{};cls.lpfnWndProc=DefWindowProcW;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"RiumReusedEngineFixture";
     RegisterClassW(&cls);
-    HWND window=CreateWindowExW(0,cls.lpszClassName,L"CONTENTRIUM Keys - input engine test",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,620,190,nullptr,nullptr,cls.hInstance,nullptr);
+    HWND window=CreateWindowExW(0,cls.lpszClassName,L"CONTENTRIUM Keys - 입력 확인",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,680,290,nullptr,nullptr,cls.hInstance,nullptr);
     Require(window!=nullptr,"create isolated native fixture");
-    HWND edit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,20,20,550,32,window,nullptr,cls.hInstance,nullptr);
-    HWND button=CreateWindowExW(0,L"BUTTON",L"Shortcut surface (V)",WS_CHILD|WS_VISIBLE|WS_TABSTOP,20,70,240,30,window,nullptr,cls.hInstance,nullptr);
+    HWND guide=CreateWindowExW(0,L"STATIC",
+        L"1. 아래 입력칸에 '한글'을 쓰고 Space를 누르세요.\n"
+        L"2. '단축키 확인' 버튼을 클릭하고 영문 V 키를 누르세요.\n"
+        L"3. 입력칸 끝에 '한글'과 Space를 한 번 더 입력하세요.\n"
+        L"한/영 키는 누르지 마세요. 통과하면 이 창은 자동으로 닫힙니다.",
+        WS_CHILD|WS_VISIBLE,20,12,630,84,window,nullptr,cls.hInstance,nullptr);
+    HWND edit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,20,104,620,32,window,nullptr,cls.hInstance,nullptr);
+    HWND button=CreateWindowExW(0,L"BUTTON",L"단축키 확인 (V)",WS_CHILD|WS_VISIBLE|WS_TABSTOP,20,152,270,30,window,nullptr,cls.hInstance,nullptr);
+    HWND progress=CreateWindowExW(0,L"STATIC",L"입력기 준비 중...",WS_CHILD|WS_VISIBLE,20,199,620,24,window,nullptr,cls.hInstance,nullptr);
+    for(auto control:{guide,edit,button,progress})SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),TRUE);
     ReusedButtonCounter counter;SetWindowLongPtrW(button,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&counter));
     counter.previous=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(button,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(ReusedButtonProc)));
     ShowWindow(window,SW_SHOW);ShowWindow(window,SW_SHOW);SetForegroundWindow(window);SetFocus(edit);
@@ -68,8 +76,9 @@ static void ReusedEngineSession(){
         ComPtr<ITfCompartmentMgr> compartments;Check(thread.As(&compartments),"mode compartment manager");ComPtr<ITfCompartment> open;Check(compartments->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,&open),"open mode compartment");
         VARIANT value;VariantInit(&value);value.vt=VT_I4;value.lVal=1;Check(open->SetValue(client,&value),"select Korean in fixture only");
         counter.profiles=profiles;counter.open=open;
+        SetWindowTextW(progress,L"1 / 3  한글 입력 후 Space를 눌러주세요.");
         Line("READY: type gksrmf + Space; click Shortcut surface and press V; return and type gksrmf + Space.");
-        auto end=GetTickCount64()+360000;bool first=false,inlineSeen=false;size_t lastLength=static_cast<size_t>(-1);
+        auto end=GetTickCount64()+360000;bool first=false,inlineSeen=false,shortcutSeen=false;size_t lastLength=static_cast<size_t>(-1);
         while(GetTickCount64()<end&&IsWindow(window)){
             MSG message;
             while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
@@ -86,7 +95,10 @@ static void ReusedEngineSession(){
                 ImmReleaseContext(edit,imc);
             }
             if(actual.size()!=lastLength){Print("Fixture text length: %zu\n",actual.size());lastLength=actual.size();}
-            if(actual==L"\ud55c\uae00 "&&ReusedKoreanMode(profiles.Get(),open.Get())){first=true;counter.firstWord=true;}
+            if(!first&&actual==L"\ud55c\uae00 "&&ReusedKoreanMode(profiles.Get(),open.Get())){
+                first=true;counter.firstWord=true;SetWindowTextW(progress,L"2 / 3  단축키 확인 버튼을 클릭하고 V 키를 눌러주세요.");
+            }
+            if(first&&!shortcutSeen&&counter.down>0&&counter.up>0){shortcutSeen=true;SetWindowTextW(progress,L"3 / 3  입력칸 끝에 한글 + Space를 한 번 더 입력하세요.");}
             if(first&&counter.down>0&&counter.up>0&&actual==L"\ud55c\uae00 \ud55c\uae00 "){
                 TF_INPUTPROCESSORPROFILE now{};auto read=profiles->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD,&now);
                 VARIANT mode;VariantInit(&mode);auto modeRead=open->GetValue(&mode);

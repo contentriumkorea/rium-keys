@@ -31,7 +31,7 @@ $badConfig=@{PayloadPaths=@('..\escape')}
 Write-Manifest @([pscustomobject]@{Path='..\escape';Sha256=('A'*64)})
 Reject {Assert-RiumManifest $testRoot $badConfig} 'manifest traversal rejected even if configured'
 Reject {Assert-RiumCandidateVersion (Join-Path $testRoot 'x64\RiumKeysInput.dll') $config.Version} 'unversioned candidate rejected'
-Check ($config.Version -eq '2.0.0-preview.9' -and $config.UpgradeFrom -eq '2.0.0-preview.8' -and $config.Channel -eq 'manual-prerelease') 'approved upgrade contract'
+Check ($config.Version -eq '2.0.0-preview.10' -and $config.UpgradeFrom -eq '2.0.0-preview.9' -and $config.Channel -eq 'manual-prerelease') 'approved upgrade contract'
 $legacy=Join-Path $testRoot 'legacy'
 Check (!(Test-RiumLegacyMigration $legacy)) 'clean installation requires no legacy program'
 New-Item -ItemType Directory -Path $legacy | Out-Null
@@ -39,7 +39,7 @@ Set-Content -LiteralPath (Join-Path $legacy 'RiumKeys.exe') -Value 'fixture'
 Reject {Test-RiumLegacyMigration $legacy} 'partial legacy installation rejected'
 Set-Content -LiteralPath (Join-Path $legacy 'Uninstall.exe') -Value 'fixture'
 Check (Test-RiumLegacyMigration $legacy) 'complete legacy pair opts into migration'
-foreach($name in @('install-local.ps1','upgrade-local.ps1','install-machine.ps1','uninstall-local.ps1','prepare-package.ps1','package-common.ps1')){
+foreach($name in @('install-local.ps1','upgrade-local.ps1','install-machine.ps1','uninstall-local.ps1','prepare-package.ps1','package-common.ps1','setup.ps1','build-setup.ps1')){
     $tokens=$null;$errors=$null
     [void][Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $name),[ref]$tokens,[ref]$errors)
     Check ($errors.Count -eq 0) "$name parses"
@@ -56,4 +56,28 @@ $hash=(Get-FileHash -LiteralPath $sentinel).Hash
 Reject {& (Join-Path $gateRoot 'prepare-package.ps1')} 'native test failure blocks packaging'
 Check ((Get-FileHash -LiteralPath $sentinel).Hash -eq $hash) 'native gate failure preserves previous package'
 Check (@(Get-ChildItem -LiteralPath (Join-Path $gateRoot 'out') -Directory).Count -eq 1) 'native gate runs before staging writes'
-Write-Output "Installer script contracts: $script:checks checks passed. No registry, elevation, native launch or installation exercised. Fixtures retained: $testRoot"
+# Real registry value types and aliased handles, only in a disposable HKCU key.
+$testKeyPath='Software\Contentrium\InstallerTests\'+[guid]::NewGuid()
+$testKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($testKeyPath)
+$alias=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($testKeyPath,$true)
+try {
+    $productRoot=Join-Path $env:ProgramFiles 'RIUM Keys'
+    $oldIcon=Join-Path $productRoot '2.0.0-preview.2\x64\RiumKeysInput.dll'
+    $newIcon=Join-Path $productRoot ($config.Version+'\x64\RiumKeysInput.dll')
+    $testKey.SetValue('Description','RIUM Keys')
+    $testKey.SetValue('IconFile',$oldIcon)
+    $testKey.SetValue('IconIndex',-100,[Microsoft.Win32.RegistryValueKind]::DWord)
+    $first=Get-RiumProfileBranding $testKey $productRoot
+    $second=Get-RiumProfileBranding $alias $productRoot
+    Set-RiumProfileBranding $testKey $first $newIcon
+    Set-RiumProfileBranding $alias $second $newIcon
+    Check ($alias.GetValue('IconFile') -eq $newIcon -and $alias.GetValue('Description') -eq 'CONTENTRIUM Keys') 'both aliased views upgrade stale icon and name'
+    Set-RiumProfileBranding $testKey $first $newIcon -Restore
+    Set-RiumProfileBranding $alias $second $newIcon -Restore
+    Check ($alias.GetValue('IconFile') -eq $oldIcon -and $alias.GetValue('Description') -eq 'RIUM Keys') 'both aliased views restore original icon and name'
+    $testKey.SetValue('IconFile','C:\Foreign\Input.dll')
+    Reject {Get-RiumProfileBranding $testKey $productRoot} 'foreign icon owner rejected'
+    Reject {Set-RiumProfileBranding $testKey $first $newIcon -Restore} 'rollback preserves concurrent foreign icon'
+    Check ($testKey.GetValue('IconFile') -eq 'C:\Foreign\Input.dll') 'concurrent owner not overwritten'
+} finally { $alias.Dispose(); $testKey.Dispose(); [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($testKeyPath) }
+Write-Output "Installer script contracts: $script:checks checks passed. Only disposable HKCU test values changed; no elevation or installation. Fixtures retained: $testRoot"

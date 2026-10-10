@@ -10,7 +10,7 @@ foreach ($candidateArchitecture in @('x64', 'x86')) {
     $candidateDll = Join-Path $candidateDirectory 'RiumKeysInput.dll'
     $candidateHash = (Get-FileHash -LiteralPath $candidateDll -Algorithm SHA256).Hash
     $candidateSuites=@('EngineTests', 'InlineTests', 'EditSessionTests', 'RoutingTests',
-        'InputOwnerTests', 'PendingTests', 'ResendTests', 'RuntimeTests')
+        'InputOwnerTests', 'PendingTests', 'ResendTests', 'RuntimeTests', 'LangbarTests')
     if($candidateArchitecture -eq 'x64'){$candidateSuites+=@('CclOwnerTests','DvaOwnerTests','DvaMonitorTests','DvaSnapshotTests','DvaCaptureTests','AeOwnerTests','AeLifecycleTests')}
     foreach ($candidateSuite in $candidateSuites) {
         $candidateExecutable = Join-Path $candidateDirectory ($candidateSuite + '.exe')
@@ -19,7 +19,7 @@ foreach ($candidateArchitecture in @('x64', 'x86')) {
         }
         # Routing must exercise this exact candidate DLL. Never pass the
         # diagnostic --expect-known-workspace-bug switch to a package gate.
-        if ($candidateSuite -eq 'RoutingTests') {
+        if ($candidateSuite -in @('RoutingTests','LangbarTests')) {
             $candidateOutput = @(& $candidateExecutable $candidateDll 2>&1)
         } else {
             $candidateOutput = @(& $candidateExecutable 2>&1)

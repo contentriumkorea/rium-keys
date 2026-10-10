@@ -288,3 +288,19 @@ hashes and the native physical transition now passed. Native unattended updates 
 validated by these checks; the stable updater is unchanged.
 
 Only verified application behavior can expand the documented support scope.
+
+## Preview.10 status display and public installer
+
+Preview.10 separates the white 가/A mode button from the fixed CK profile brand,
+updates the stale preview.2 profile icon path, and adds a single NSIS installer
+with Korean physical-test instructions. All 25 suites (1,506 assertions) and
+30 installer contracts passed. On 2026-10-11 at 07:10:26 KST the packaged EXE
+successfully upgraded preview.9 after the user approved elevation and completed
+the physical Korean / original V down-up / Korean fixture. All installed payload
+hashes, both COM paths, both profile icon paths, enabled/default/active profile
+and installed-app version were read back. Same-version packaged preflight passed.
+
+The detailed scope and exact release hashes are in
+[preview-10-release.md](preview-10-release.md). Earlier application-specific
+results remain preview.8 evidence; this presentation/installer change does not
+expand the tested application scope or enable unattended native updates.

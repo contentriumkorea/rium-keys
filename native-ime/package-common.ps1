@@ -1,5 +1,10 @@
-# Pure package helpers: no registry, process, elevation or installation operations.
+# Package helpers never open registry keys or elevate. Branding helpers operate
+# only on explicitly supplied keys, allowing rollback tests in an isolated hive.
 function Get-RiumPackageConfig([string]$Directory) {
+    # NSIS launched from a PowerShell 7 parent can inherit a module search path
+    # that omits Windows PowerShell's inbox script functions. Import that exact
+    # built-in module, not an arbitrary module from a caller's search path.
+    Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
     $config = Import-PowerShellDataFile -LiteralPath (Join-Path $Directory 'package-config.psd1')
     if ($config.Version -notmatch '^2\.0\.0-preview\.[1-9][0-9]*$' -or
         $config.UpgradeFrom -notmatch '^2\.0\.0-preview\.[1-9][0-9]*$' -or
@@ -50,4 +55,34 @@ function Test-RiumLegacyMigration([string]$Directory) {
     $uninstaller=Test-Path -LiteralPath (Join-Path $Directory 'Uninstall.exe') -PathType Leaf
     if($exe -ne $uninstaller){throw 'Incomplete legacy installation needs inspection.'}
     return $exe
+}
+
+function Get-RiumProfileBranding($Key, [string]$ProductRoot) {
+    if (!$Key) { throw 'Missing owned language profile.' }
+    $values = @{}
+    foreach ($name in @('Description','IconFile','IconIndex')) { $values[$name] = $Key.GetValue($name) }
+    $prefix = [regex]::Escape([IO.Path]::GetFullPath($ProductRoot).TrimEnd('\'))
+    if ($values.Description -notin @('RIUM Keys','CONTENTRIUM Keys') -or
+        $Key.GetValueKind('Description') -ne [Microsoft.Win32.RegistryValueKind]::String -or
+        $Key.GetValueKind('IconFile') -ne [Microsoft.Win32.RegistryValueKind]::String -or
+        $Key.GetValueKind('IconIndex') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or
+        $values.IconFile -notmatch ('^' + $prefix + '\\2\.0\.0-preview\.[1-9][0-9]*\\x64\\RiumKeysInput\.dll$') -or
+        $values.IconIndex -ne -100) { throw 'Unexpected input profile branding owner.' }
+    return $values
+}
+function Set-RiumProfileBranding($Key, $Before, [string]$TargetDll, [switch]$Restore) {
+    $after = @{ Description = 'CONTENTRIUM Keys'; IconFile = $TargetDll; IconIndex = -100 }
+    # Both registry views may reference the same CTF key. Accept a value already
+    # written by the other view, but never overwrite a third-party concurrent edit.
+    foreach ($name in $after.Keys) {
+        if (!$Key -or $Key.GetValue($name) -notin @($Before[$name],$after[$name])) {
+            throw "Input profile branding changed concurrently: $name"
+        }
+    }
+    $desired = if ($Restore) { $Before } else { $after }
+    foreach ($name in $desired.Keys) {
+        $kind = if ($name -eq 'IconIndex') { [Microsoft.Win32.RegistryValueKind]::DWord } else { [Microsoft.Win32.RegistryValueKind]::String }
+        $Key.SetValue($name,$desired[$name],$kind)
+        if ($Key.GetValue($name) -ne $desired[$name]) { throw "Profile branding readback mismatch: $name" }
+    }
 }

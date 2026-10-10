@@ -53,7 +53,7 @@ try {
     if($launchCheck.ExitCode -ne 0){throw 'Fixture must launch under the ordinary user token.'}
     Save-State 'AwaitingAdministrator'
     $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $machine=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-File',('"'+(Join-Path $package 'install-machine.ps1')+'"'),'-Operation','Upgrade','-Transaction',$transaction) -Verb RunAs -WindowStyle Hidden -PassThru
+    $machine=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+(Join-Path $package 'install-machine.ps1')+'"'),'-Operation','Upgrade','-Transaction',$transaction) -Verb RunAs -WindowStyle Hidden -PassThru
     $deadline=[DateTime]::UtcNow.AddSeconds(45)
     while(!$ready.WaitOne(250)){if($machine.HasExited -or [DateTime]::UtcNow -gt $deadline){throw 'Machine upgrade did not become ready.'}}
     Save-State 'AwaitingPhysicalTest'

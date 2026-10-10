@@ -1,10 +1,10 @@
 #include "langbar.h"
 #include "compartment.h"
+#include "comp_state.h"
 #include "jamotong.h"
 #include "settings_ui.h"
 #include "version.h"
 #include "disk_version.h"   // 0.69.1: 업그레이드 전부터 떠 있던 프로세스면 About 에 알린다
-#include "layout_icon.h"   // 자판마다 다른 아이콘 (2026-10-04)
 #include <stddef.h>
 
 extern HINSTANCE g_hInst;
@@ -126,8 +126,8 @@ static HRESULT STDMETHODCALLTYPE LBI_GetTooltipString(ITfLangBarItemButton *pThi
         } else {
             EnterCriticalSection(&g_configLock);
             LayoutConfig *layout = Config_GetCurrentLayout(&obj->pService->config);
-            tooltip = (layout && layout->type == LAYOUT_TYPE_PASSTHROUGH)
-                ? L"CONTENTRIUM Keys · English" : L"CONTENTRIUM Keys · 한글";
+            tooltip = (layout && CompState_IsHangulType(layout->type))
+                ? L"CONTENTRIUM Keys · 한글" : L"CONTENTRIUM Keys · English";
             LeaveCriticalSection(&g_configLock);
         }
     }
@@ -217,27 +217,20 @@ static HRESULT STDMETHODCALLTYPE LBI_OnMenuSelect(ITfLangBarItemButton *pThis, U
     return S_OK;
 }
 
-// Retain the upstream layout icon only as a resource-load fallback.
-static HICON CreateAbbrevIcon(const wchar_t *abbrev) { return LayoutIcon_Create(abbrev, 0); }
-
 static HRESULT STDMETHODCALLTYPE LBI_GetIcon(ITfLangBarItemButton *pThis, HICON *phIcon) {
     JamotongLangBarItem *obj = IMPL_LBI_BUTTON(pThis);
     if (!phIcon) return E_INVALIDARG;
     if (!obj->pService) { *phIcon = NULL; return S_OK; }   // Deactivate 후 — UAF 방어
-    // The shell owns this private HICON. Never use LR_SHARED here.
-    // Resource 100 contains the transparent CONTENTRIUM Keys PNG at each tray size.
-    *phIcon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(100), IMAGE_ICON,
-                              GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
-    if (*phIcon) return S_OK;
-    if (obj->pService->passthrough) {   // 무간섭 모드: 자판 대신 "--" 표시
-        *phIcon = CreateAbbrevIcon(L"--");
-        return S_OK;
-    }
+    // Keep the mode separate from the fixed profile-brand icon (resource 100).
+    // Snapshot the actual layout under its lock, then perform GDI work outside it.
     EnterCriticalSection(&g_configLock);
     LayoutConfig *layout = Config_GetCurrentLayout(&obj->pService->config);
-    const wchar_t *ab = (layout && layout->abbrev[0]) ? layout->abbrev : L"?";
-    *phIcon = CreateAbbrevIcon(ab);   // 셸이 소유·파괴. 현재 자판 축약 표시.
+    BOOL korean = !obj->pService->passthrough && layout && CompState_IsHangulType(layout->type);
     LeaveCriticalSection(&g_configLock);
+    // 101 = white 가, 102 = white A, both with transparent backgrounds.
+    // The shell owns this private HICON. Never use LR_SHARED here.
+    *phIcon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(korean ? 101 : 102), IMAGE_ICON,
+                              GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     return S_OK;   // API contract permits a successful NULL icon.
 }
 

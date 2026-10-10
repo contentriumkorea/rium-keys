@@ -1,8 +1,9 @@
+param(
+    [string]$Source = (Join-Path $PSScriptRoot '..\assets\contentrium-keys.png'),
+    [string]$Destination = (Join-Path $PSScriptRoot '..\src\rium-keys.ico')
+)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
-$root = Split-Path -Parent $PSScriptRoot
-$source = Join-Path $root 'assets\contentrium-keys.png'
-$destination = Join-Path $root 'src\rium-keys.ico'
 $image = [Drawing.Bitmap]::FromFile($source)
 $frames = [Collections.Generic.List[object]]::new()
 try {

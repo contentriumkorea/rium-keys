@@ -11,7 +11,7 @@ if($LASTEXITCODE){throw 'Could not restore the previous input method; registrati
 & $control --disable
 if($LASTEXITCODE){throw 'Could not disable the RIUM input profile.'}
 $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$process=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-File',('"'+(Join-Path $PSScriptRoot 'install-machine.ps1')+'"'),'-Operation','Uninstall') -Verb RunAs -WindowStyle Hidden -PassThru
+$process=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+(Join-Path $PSScriptRoot 'install-machine.ps1')+'"'),'-Operation','Uninstall') -Verb RunAs -WindowStyle Hidden -PassThru
 $process.WaitForExit()
 if($process.ExitCode){throw 'Machine removal failed. See uninstall-result.log in the installed directory.'}
 Remove-ItemProperty 'HKCU:\Software\Contentrium\RiumKeysInput' -Name InstallState -ErrorAction SilentlyContinue

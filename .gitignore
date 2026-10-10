@@ -3,9 +3,12 @@
 !README.md
 !assets/
 !assets/contentrium-keys.png
+!assets/input-mode-*.png
+!assets/input-mode-*.ico
 !assets/README.md
 !scripts/
 !scripts/build-brand-icon.ps1
+!scripts/build-mode-icons.ps1
 !build.ps1
 !sign-release.ps1
 !test-processes.ps1
@@ -43,6 +46,10 @@
 !docs/cross-language-shortcut-research.md
 !docs/input-owner-validation.md
 !docs/input-owner-audio-proof.md
+!docs/legacy-tray-1.1.1.md
+!docs/native-preview-history.md
+!docs/installation.md
+!docs/preview-10-release.md
 !input-core/
 !input-core/*.h
 !input-core/*.cpp
@@ -57,6 +64,7 @@ upstream-research/
 !native-ime/*.cpp
 !native-ime/*.h
 !native-ime/*.rc
+!native-ime/*.nsi
 !native-ime/providers/
 !native-ime/providers/README.md
 !native-ime/providers/ccl/

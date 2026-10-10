@@ -66,7 +66,7 @@ try {
     }
     Save-State 'AwaitingAdministrator'
     $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $machine=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-File',('"'+(Join-Path $package 'install-machine.ps1')+'"'),'-Transaction',$transaction) -Verb RunAs -WindowStyle Hidden -PassThru
+    $machine=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+(Join-Path $package 'install-machine.ps1')+'"'),'-Transaction',$transaction) -Verb RunAs -WindowStyle Hidden -PassThru
     $deadline=[DateTime]::UtcNow.AddSeconds(30)
     while(!$ready.WaitOne(250)){
         if($machine.HasExited -or [DateTime]::UtcNow -gt $deadline){throw "Machine registration failed. See $target\install-result.log"}

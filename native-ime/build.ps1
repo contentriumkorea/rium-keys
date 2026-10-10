@@ -57,6 +57,11 @@ $argsTest = $baseArgs + @('-municode','-I',(Join-Path $SourceRoot 'src'),
     '-static','-lole32','-loleaut32','-luuid')
 & $compiler @argsTest
 if ($LASTEXITCODE) { throw 'Routing test compilation failed.' }
+$langbarArgs=$baseArgs+@('-municode','-I',(Join-Path $SourceRoot 'src'),
+    (Join-Path $PSScriptRoot 'langbar-tests.c'),(Join-Path $SourceRoot 'src\langbar.c'),(Join-Path $SourceRoot 'src\comp_state.c'),
+    '-o',(Join-Path $output 'LangbarTests.exe'),'-static','-lole32','-loleaut32','-luuid','-lgdi32')
+& $compiler @langbarArgs
+if($LASTEXITCODE){throw 'Langbar test compilation failed.'}
 $engineSources = @('fsm.c','layout.c','hangul_layout.c','comp_path.c','transition.c') |
     ForEach-Object { Join-Path $SourceRoot "src\$_" }
 $engineArgs = $baseArgs + @('-I',(Join-Path $SourceRoot 'src'),

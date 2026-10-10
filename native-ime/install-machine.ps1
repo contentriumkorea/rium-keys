@@ -65,7 +65,7 @@ $commit=[Threading.EventWaitHandle]::OpenExisting("Local\RIUM.Keys.Install.$Tran
 if($Operation -eq 'Upgrade'){
     # Reuse the existing profile and user defaults; only the versioned binaries change.
     $previousRoot=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.UpgradeFrom)
-    $changedViews=@();$oldDescriptions=@{};$oldAppValues=@{};$appChanged=$false;$transcript=$false;$upgradeCommitted=$false
+    $changedViews=@();$oldBranding=@{};$oldAppValues=@{};$appChanged=$false;$transcript=$false;$upgradeCommitted=$false
     try {
         if(Test-Path -LiteralPath $root){throw 'New version directory already exists; refusing to overwrite.'}
         foreach($view in $views){
@@ -113,17 +113,15 @@ if($Operation -eq 'Upgrade'){
         }
         [void]$ready.Set()
         if(!$done.WaitOne(600000) -or !$commit.WaitOne(0)){throw 'Upgrade was not committed by the ordinary-user verifier.'}
-        # CTF keys can alias across views: snapshot ALL names before changing
-        # either view, so rollback never records the new name as the old name.
+        # Snapshot BOTH views before writing: CTF keys can alias. Include the
+        # icon path because old previews left it pointing at preview.2's K icon.
         foreach($view in $views){
             $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
             try {
                 $key=$base.OpenSubKey($profileDescription)
                 if(!$key){throw "Missing owned language profile: $view"}
                 try {
-                    $old=$key.GetValue('Description')
-                    if($old -notin @('RIUM Keys','CONTENTRIUM Keys') -or $key.GetValueKind('Description') -ne [Microsoft.Win32.RegistryValueKind]::String){throw 'Unexpected input profile description.'}
-                    $oldDescriptions[$view]=$old
+                    $oldBranding[$view]=Get-RiumProfileBranding $key (Join-Path $env:ProgramFiles 'RIUM Keys')
                 }finally{$key.Dispose()}
             }finally{$base.Dispose()}
         }
@@ -133,9 +131,7 @@ if($Operation -eq 'Upgrade'){
                 $key=$base.OpenSubKey($profileDescription,$true)
                 if(!$key){throw "Missing owned language profile: $view"}
                 try {
-                    if($key.GetValue('Description') -notin @($oldDescriptions[$view],'CONTENTRIUM Keys')){throw 'Input profile name changed during upgrade.'}
-                    $key.SetValue('Description','CONTENTRIUM Keys')
-                    if($key.GetValue('Description') -ne 'CONTENTRIUM Keys'){throw 'Input profile name readback mismatch.'}
+                    Set-RiumProfileBranding $key $oldBranding[$view] (Join-Path $root 'x64\RiumKeysInput.dll')
                 }finally{$key.Dispose()}
             }finally{$base.Dispose()}
         }
@@ -147,7 +143,7 @@ if($Operation -eq 'Upgrade'){
                 $key.SetValue('DisplayVersion',$version);$key.SetValue('InstallLocation',$root)
                 $key.SetValue('DisplayIcon',(Join-Path $root 'x64\RiumKeysInput.dll'))
                 $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-                $key.SetValue('UninstallString',('"'+$shell+'" -NoProfile -File "'+(Join-Path $root 'uninstall-local.ps1')+'"'))
+                $key.SetValue('UninstallString',('"'+$shell+'" -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $root 'uninstall-local.ps1')+'"'))
             }finally{$key.Dispose()}
         }finally{$base.Dispose()}
         $upgradeCommitted=$true
@@ -167,13 +163,11 @@ if($Operation -eq 'Upgrade'){
                 }finally{if($key){$key.Dispose()}}}finally{$base.Dispose()}
             }catch{$rollbackErrors+="$view`: $($_.Exception.Message)"}
         }
-        foreach($view in $oldDescriptions.Keys){
+        foreach($view in $oldBranding.Keys){
             try {
                 $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
                 try {$key=$base.OpenSubKey($profileDescription,$true);try {
-                    if(!$key -or $key.GetValue('Description') -notin @($oldDescriptions[$view],'CONTENTRIUM Keys')){throw 'Profile description rollback owner mismatch.'}
-                    $key.SetValue('Description',$oldDescriptions[$view])
-                    if($key.GetValue('Description') -ne $oldDescriptions[$view]){throw 'Profile description rollback readback mismatch.'}
+                    Set-RiumProfileBranding $key $oldBranding[$view] (Join-Path $root 'x64\RiumKeysInput.dll') -Restore
                 }finally{if($key){$key.Dispose()}}}finally{$base.Dispose()}
             }catch{$rollbackErrors+=$_.Exception.Message}
         }
@@ -241,7 +235,7 @@ try {
             $key.SetValue('Publisher','Contentrium');$key.SetValue('InstallLocation',$root)
             $key.SetValue('DisplayIcon',(Join-Path $root 'x64\RiumKeysInput.dll'))
             $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $key.SetValue('UninstallString',('"'+$shell+'" -NoProfile -File "'+(Join-Path $root 'uninstall-local.ps1')+'"'))
+            $key.SetValue('UninstallString',('"'+$shell+'" -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $root 'uninstall-local.ps1')+'"'))
             $key.SetValue('NoModify',1,[Microsoft.Win32.RegistryValueKind]::DWord)
             $key.SetValue('NoRepair',1,[Microsoft.Win32.RegistryValueKind]::DWord)
         }finally{$key.Dispose()}
