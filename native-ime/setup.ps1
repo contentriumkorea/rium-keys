@@ -40,9 +40,10 @@ try {
             if($LASTEXITCODE){throw 'Cannot verify installed input profile.'}
             $status=$statusText | ConvertFrom-Json
             if(!$status.registered -or !$status.enabled -or $status.categories -ne 6){throw 'Installed input profile requires recovery.'}
+            if(!$Preflight){Test-RiumInstalledLoad $expected $logRoot}
             Write-Output 'ALREADY INSTALLED: same version and all installed files verified.'
             exit 0
-        }else{throw "Unsupported preview upgrade: $($app.DisplayVersion). Remove the existing native preview from Windows Installed Apps first; then run Setup again."}
+        }else{throw "Unsupported upgrade from $($app.DisplayVersion). Remove the existing input method from Windows Installed Apps first; then run Setup again."}
     }
     $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arguments=@('-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+(Join-Path $PSScriptRoot $entry)+'"'),'-PackageRoot',('"'+$PSScriptRoot+'"'))
@@ -50,6 +51,6 @@ try {
     $child=Start-Process -FilePath $shell -ArgumentList $arguments -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput ($log+'.out') -RedirectStandardError ($log+'.err')
     Get-Content -LiteralPath ($log+'.out'),($log+'.err')
     if($child.ExitCode -ne 0){throw "Installation did not complete. Exit=$($child.ExitCode). See $log.out and $log.err"}
-    Write-Output $(if($Preflight){'PREFLIGHT PASS: no installation or elevation performed.'}else{'INSTALLED: physical input verification passed. Restart open applications to load this version.'})
+    Write-Output $(if($Preflight){'PREFLIGHT PASS: no installation or elevation performed.'}else{'INSTALLED: automatic installation checks passed. Restart open applications to load this version.'})
 }catch { Write-Output $_;exit 1 }
 finally { if($transcribing){Stop-Transcript | Out-Null} }

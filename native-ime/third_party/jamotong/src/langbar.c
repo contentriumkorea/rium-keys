@@ -153,7 +153,7 @@ static HRESULT STDMETHODCALLTYPE LBI_OnClick(ITfLangBarItemButton *pThis, TfLBIC
         // InitMenu(ITfMenu)는 호출되지 않는다(BTN_MENU 전용) — Mozc와 동일 방식.
         HMENU menu = CreatePopupMenu();
         if (menu) {
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"CONTENTRIUM Keys 2.0 Preview");
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"CONTENTRIUM Keys");
             AppendMenuW(menu, MF_STRING, 2, L"한/영 전환");
             // 무간섭(직접 입력) 모드 — 원격 데스크톱 등에서 모든 키를 앱에 그대로 통과.
             AppendMenuW(menu, MF_STRING | (!obj->pService->passthrough ? MF_CHECKED : 0),

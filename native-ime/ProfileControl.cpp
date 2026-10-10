@@ -62,10 +62,39 @@ static std::wstring DefaultTip(ITfInputProcessorProfiles* profiles){
     HKL layout=nullptr;CLSID cls;GUID profile;
     if(!SystemParametersInfoW(SPI_GETDEFAULTINPUTLANG,0,&layout,0))throw std::runtime_error("Read default input language failed");
     LANGID lang=LOWORD(reinterpret_cast<ULONG_PTR>(layout));
-    // This local preview refuses a configuration it cannot snapshot faithfully.
+    // Refuse a configuration whose fallback cannot be captured faithfully.
     Check(profiles->GetDefaultLanguageProfile(lang,GUID_TFCAT_TIP_KEYBOARD,&cls,&profile),"read actual default input profile");
-    if(cls==GUID_NULL||profile==GUID_NULL)throw std::runtime_error("Default keyboard layout is not supported by this preview installer");
+    if(cls==GUID_NULL||profile==GUID_NULL)throw std::runtime_error("Select a Korean input method as the default before installation");
     return Tip(lang,cls,profile);
+}
+static void VerifyInstalledLoad(const wchar_t* expectedDll){
+    HANDLE token=nullptr;
+    if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))throw std::runtime_error("Cannot read verification token");
+    TOKEN_ELEVATION elevation{};DWORD size=0;
+    BOOL read=GetTokenInformation(token,TokenElevation,&elevation,sizeof(elevation),&size);
+    CloseHandle(token);
+    if(!read||elevation.TokenIsElevated)throw std::runtime_error("Load verification requires an ordinary user token");
+    const wchar_t* key=L"Software\\Classes\\CLSID\\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}\\InprocServer32";
+    wchar_t path[32768]{};DWORD bytes=sizeof(path);
+    if(RegGetValueW(HKEY_LOCAL_MACHINE,key,nullptr,RRF_RT_REG_SZ,nullptr,path,&bytes)!=ERROR_SUCCESS ||
+       _wcsicmp(path,expectedDll)!=0)throw std::runtime_error("Registered DLL path does not match the installed version");
+    wchar_t model[32]{};bytes=sizeof(model);
+    if(RegGetValueW(HKEY_LOCAL_MACHINE,key,L"ThreadingModel",RRF_RT_REG_SZ,nullptr,model,&bytes)!=ERROR_SUCCESS ||
+       wcscmp(model,L"Apartment")!=0)throw std::runtime_error("Unexpected COM threading model");
+    // COM resolves the live registration (including any per-user override).
+    // Do not activate a profile, attach a key sink or create a document/window.
+    ComPtr<ITfTextInputProcessorEx> service;
+    Check(CoCreateInstance(Service,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&service)),"load installed text service");
+    ComPtr<ITfKeyEventSink> keySink;Check(service.As(&keySink),"input key interface");
+    ComPtr<ITfDisplayAttributeProvider> attributes;Check(service.As(&attributes),"inline composition interface");
+    HMODULE module=nullptr;
+    const void* vtable=*reinterpret_cast<const void* const*>(service.Get());
+    if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(vtable),&module))throw std::runtime_error("Cannot identify loaded text service module");
+    DWORD length=GetModuleFileNameW(module,path,static_cast<DWORD>(_countof(path)));
+    if(!length||length>=_countof(path)||_wcsicmp(path,expectedDll)!=0)throw std::runtime_error("COM loaded a different DLL than the installed version");
+    wprintf(L"PASS: registered %u-bit text service loaded from %ls; required COM interfaces available.\n",
+            static_cast<unsigned>(sizeof(void*)*8),path);
 }
 int wmain(int argc,wchar_t** argv){
     HRESULT co=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);if(FAILED(co))return 1;
@@ -77,7 +106,13 @@ int wmain(int argc,wchar_t** argv){
         ComPtr<ITfCategoryMgr> categories;
         Check(CoCreateInstance(CLSID_TF_CategoryMgr,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&categories)),"categories");
         std::wstring mode=argc>1?argv[1]:L"--status";
-        if(mode==L"--register"&&argc==3){
+        if(mode==L"--verify-install"&&argc==3){
+            TF_INPUTPROCESSORPROFILE native{};BOOL enabled=FALSE;
+            Check(profiles->GetProfile(TF_PROFILETYPE_INPUTPROCESSOR,0x412,Service,Profile,nullptr,&native),"installed profile");
+            Check(legacy->IsEnabledLanguageProfile(Service,0x412,Profile,&enabled),"installed user profile");
+            if(!enabled||CategoryCount(categories.Get())!=6)throw std::runtime_error("Installed profile is disabled or incomplete");
+            VerifyInstalledLoad(argv[2]);
+        }else if(mode==L"--register"&&argc==3){
             TF_INPUTPROCESSORPROFILE existing{};
             if(profiles->GetProfile(TF_PROFILETYPE_INPUTPROCESSOR,0x412,Service,Profile,nullptr,&existing)==S_OK)
                 throw std::runtime_error("Profile already exists; refusing replacement");
@@ -129,7 +164,7 @@ int wmain(int argc,wchar_t** argv){
             bool registered=profiles->GetProfile(TF_PROFILETYPE_INPUTPROCESSOR,0x412,Service,Profile,nullptr,&native)==S_OK;
             auto activeHr=profiles->GetActiveProfile(GUID_TFCAT_TIP_KEYBOARD,&active);
             Check(activeHr,"capture active profile");
-            if(active.dwProfileType!=TF_PROFILETYPE_INPUTPROCESSOR)throw std::runtime_error("Active keyboard layout is not supported by this preview installer");
+            if(active.dwProfileType!=TF_PROFILETYPE_INPUTPROCESSOR)throw std::runtime_error("Select a Korean input method before installation");
             auto defaultTip=DefaultTip(legacy.Get());
             Check(legacy->GetDefaultLanguageProfile(0x412,GUID_TFCAT_TIP_KEYBOARD,&defClass,&defProfile),"read Korean default");
             BOOL enabled=FALSE;legacy->IsEnabledLanguageProfile(Service,0x412,Profile,&enabled);

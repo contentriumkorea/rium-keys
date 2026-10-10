@@ -7,8 +7,7 @@ $config=Get-RiumPackageConfig $PSScriptRoot
 $output=Join-Path $PSScriptRoot 'out\release'
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 $installer=Join-Path $output 'CONTENTRIUM-Keys-Setup.exe'
-$sequence=($config.Version -split '\.')[-1]
-& $Nsis /V2 ("/DAPP_VERSION="+$config.Version) ("/DFILE_VERSION=2.0.0."+$sequence) ("/DPAYLOAD="+(Join-Path $PSScriptRoot 'out\local-package')) ("/DOUTPUT="+$installer) (Join-Path $PSScriptRoot 'ContentriumKeys.nsi')
+& $Nsis /V2 ("/DAPP_VERSION="+$config.Version) ("/DFILE_VERSION="+$config.FileVersion) ("/DPAYLOAD="+(Join-Path $PSScriptRoot 'out\local-package')) ("/DOUTPUT="+$installer) (Join-Path $PSScriptRoot 'ContentriumKeys.nsi')
 if($LASTEXITCODE -ne 0){throw 'Native installer build failed.'}
 $digest=(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'),($digest+'  CONTENTRIUM-Keys-Setup.exe'+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))

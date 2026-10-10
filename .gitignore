@@ -47,9 +47,10 @@
 !docs/input-owner-validation.md
 !docs/input-owner-audio-proof.md
 !docs/legacy-tray-1.1.1.md
-!docs/native-preview-history.md
+!docs/native-history.md
 !docs/installation.md
-!docs/preview-10-release.md
+!docs/release-build10.md
+!docs/release-2.0.0.md
 !input-core/
 !input-core/*.h
 !input-core/*.cpp

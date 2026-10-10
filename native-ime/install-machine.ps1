@@ -114,7 +114,7 @@ if($Operation -eq 'Upgrade'){
         [void]$ready.Set()
         if(!$done.WaitOne(600000) -or !$commit.WaitOne(0)){throw 'Upgrade was not committed by the ordinary-user verifier.'}
         # Snapshot BOTH views before writing: CTF keys can alias. Include the
-        # icon path because old previews left it pointing at preview.2's K icon.
+        # icon path because early builds left it pointing at the original K icon.
         foreach($view in $views){
             $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',$view)
             try {
@@ -197,7 +197,7 @@ try {
         try {
             foreach($path in @($class,$tip,$uninstall)){
                 $existing=$base.OpenSubKey($path)
-                if($existing){$existing.Dispose();throw 'Existing native registration found; upgrade is not supported by this preview installer.'}
+                if($existing){$existing.Dispose();throw 'Existing native registration found; use the supported upgrade or remove the previous input method first.'}
             }
         }finally{$base.Dispose()}
     }

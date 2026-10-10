@@ -31,7 +31,7 @@ $badConfig=@{PayloadPaths=@('..\escape')}
 Write-Manifest @([pscustomobject]@{Path='..\escape';Sha256=('A'*64)})
 Reject {Assert-RiumManifest $testRoot $badConfig} 'manifest traversal rejected even if configured'
 Reject {Assert-RiumCandidateVersion (Join-Path $testRoot 'x64\RiumKeysInput.dll') $config.Version} 'unversioned candidate rejected'
-Check ($config.Version -eq '2.0.0-preview.10' -and $config.UpgradeFrom -eq '2.0.0-preview.9' -and $config.Channel -eq 'manual-prerelease') 'approved upgrade contract'
+Check ($config.Version -eq '2.0.0' -and $config.UpgradeFrom -eq '2.0.0-preview.10' -and $config.Channel -eq 'manual-release') 'release upgrades the previous installed build'
 $legacy=Join-Path $testRoot 'legacy'
 Check (!(Test-RiumLegacyMigration $legacy)) 'clean installation requires no legacy program'
 New-Item -ItemType Directory -Path $legacy | Out-Null
@@ -71,6 +71,7 @@ try {
     $second=Get-RiumProfileBranding $alias $productRoot
     Set-RiumProfileBranding $testKey $first $newIcon
     Set-RiumProfileBranding $alias $second $newIcon
+    Check ((Get-RiumProfileBranding $alias $productRoot).IconFile -eq $newIcon) 'release icon owner accepted on repeat setup'
     Check ($alias.GetValue('IconFile') -eq $newIcon -and $alias.GetValue('Description') -eq 'CONTENTRIUM Keys') 'both aliased views upgrade stale icon and name'
     Set-RiumProfileBranding $testKey $first $newIcon -Restore
     Set-RiumProfileBranding $alias $second $newIcon -Restore
@@ -79,5 +80,9 @@ try {
     Reject {Get-RiumProfileBranding $testKey $productRoot} 'foreign icon owner rejected'
     Reject {Set-RiumProfileBranding $testKey $first $newIcon -Restore} 'rollback preserves concurrent foreign icon'
     Check ($testKey.GetValue('IconFile') -eq 'C:\Foreign\Input.dll') 'concurrent owner not overwritten'
+    foreach($badVersion in @('2.0.0-foreign','2.0.0-preview.0','2.0.0\..\elsewhere')){
+        $testKey.SetValue('IconFile',(Join-Path $productRoot ($badVersion+'\x64\RiumKeysInput.dll')))
+        Reject {Get-RiumProfileBranding $testKey $productRoot} "invalid branding version rejected: $badVersion"
+    }
 } finally { $alias.Dispose(); $testKey.Dispose(); [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($testKeyPath) }
 Write-Output "Installer script contracts: $script:checks checks passed. Only disposable HKCU test values changed; no elevation or installation. Fixtures retained: $testRoot"

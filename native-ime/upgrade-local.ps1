@@ -22,9 +22,7 @@ $beforeText=& $control --status
 if($LASTEXITCODE){throw 'Cannot capture input profile state.'}
 $before=$beforeText | ConvertFrom-Json
 if(!$before.registered -or !$before.enabled -or $before.categories -ne 6){throw 'The previous native input profile is incomplete.'}
-$fixtureSource=Join-Path $package 'x64\RiumImeFixture.exe'
-if(!(Test-Path -LiteralPath $fixtureSource)){throw 'Build the native physical fixture first.'}
-if($Preflight){'PREFLIGHT PASS: previous install, original fallback state, package integrity and fixture verified.';exit 0}
+if($Preflight){'PREFLIGHT PASS: previous install, original fallback state and package integrity verified.';exit 0}
 $transaction=[guid]::NewGuid().ToString()
 $recovery=Join-Path $env:LOCALAPPDATA ('Contentrium\RIUM Keys\Recovery\'+(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+$transaction)
 New-Item -ItemType Directory -Path $recovery | Out-Null
@@ -37,42 +35,19 @@ $state=[ordered]@{
 $statePath=Join-Path $recovery 'install-state.json'
 function Save-State([string]$status){$state.Status=$status;$state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding UTF8}
 Save-State 'PreparingUpgrade'
-$fixtureDir=Join-Path $recovery 'physical-test'
-New-Item -ItemType Directory -Path $fixtureDir | Out-Null
-Copy-Item -LiteralPath $fixtureSource -Destination (Join-Path $fixtureDir 'RiumInstalledSmoke.exe')
-Copy-Item -LiteralPath (Join-Path $package 'x64\RiumKeysInput.dll') -Destination $fixtureDir
 $ready=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Ready")
 $done=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Done")
 $commit=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,"Local\RIUM.Keys.Install.$transaction.Commit")
-$machine=$null;$fixture=$null;$commitRequested=$false;$committed=$false
+$machine=$null;$commitRequested=$false;$committed=$false
 try {
-    $launchInfo=[Diagnostics.ProcessStartInfo]::new((Join-Path $fixtureDir 'RiumInstalledSmoke.exe'),'--launch-check')
-    $launchInfo.UseShellExecute=$false;$launchInfo.CreateNoWindow=$true
-    $launchCheck=[Diagnostics.Process]::Start($launchInfo)
-    if(!$launchCheck.WaitForExit(5000)){Stop-Process -InputObject $launchCheck;throw 'Fixture launch check timed out.'}
-    if($launchCheck.ExitCode -ne 0){throw 'Fixture must launch under the ordinary user token.'}
     Save-State 'AwaitingAdministrator'
     $shell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $machine=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+(Join-Path $package 'install-machine.ps1')+'"'),'-Operation','Upgrade','-Transaction',$transaction) -Verb RunAs -WindowStyle Hidden -PassThru
     $deadline=[DateTime]::UtcNow.AddSeconds(45)
     while(!$ready.WaitOne(250)){if($machine.HasExited -or [DateTime]::UtcNow -gt $deadline){throw 'Machine upgrade did not become ready.'}}
-    Save-State 'AwaitingPhysicalTest'
-    $fixture=Start-Process -FilePath (Join-Path $fixtureDir 'RiumInstalledSmoke.exe') -ArgumentList '--native-fixture' -WindowStyle Hidden -PassThru
-    $loaded=$false;$deadline=[DateTime]::UtcNow.AddSeconds(15)
-    while(!$fixture.HasExited -and [DateTime]::UtcNow -lt $deadline){
-        $fixture.Refresh()
-        $dll=@($fixture.Modules | Where-Object ModuleName -eq 'RiumKeysInput.dll')
-        if($dll.Count){
-            if($dll[0].FileName -ne (Join-Path $target 'x64\RiumKeysInput.dll')){throw 'Fresh process loaded the wrong DLL version.'}
-            $loaded=$true;break
-        }
-        Start-Sleep -Milliseconds 100
-    }
-    if(!$loaded){throw 'Could not confirm the installed DLL in a fresh process.'}
-    "UPGRADE TEST READY: installed $($config.Version) loaded. Recovery: $recovery"
-    if(!$fixture.WaitForExit(390000)){throw 'Physical verification timed out.'}
-    Get-Content -LiteralPath (Join-Path $fixtureDir 'fixture-result.log')
-    if($fixture.ExitCode -ne 0){throw 'Installed input did not pass physical verification.'}
+    Save-State 'VerifyingInstallation'
+    [void](Assert-RiumManifest $target $config)
+    Test-RiumInstalledLoad $target $recovery
     $afterText=& $control --status
     if($LASTEXITCODE){throw 'Input profile readback failed.'}
     $after=$afterText | ConvertFrom-Json
@@ -90,10 +65,6 @@ try {
     "INSTALLED: CONTENTRIUM Keys $($config.Version). Recovery: $statePath"
 }catch {
     $failure=$_
-    if($fixture -and !$fixture.HasExited){
-        Stop-Process -InputObject $fixture
-        if(!$fixture.WaitForExit(5000)){Save-State 'RecoveryRequired';throw "Owned fixture exit is unconfirmed; inspect the pending transaction. Original error: $failure"}
-    }
     if($commitRequested -and $machine -and !$machine.HasExited){Save-State 'CommitStatusUnknown';throw "Inspect the machine log before retrying: $failure"}
     if(!$committed){
         [void]$done.Set()

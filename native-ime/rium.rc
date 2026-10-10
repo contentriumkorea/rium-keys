@@ -2,10 +2,10 @@
 101 ICON "../assets/input-mode-korean.ico"
 102 ICON "../assets/input-mode-english.ico"
 1 VERSIONINFO
- FILEVERSION 2,0,0,10
- PRODUCTVERSION 2,0,0,10
+ FILEVERSION 2,0,0,11
+ PRODUCTVERSION 2,0,0,11
  FILEFLAGSMASK 0x3fL
- FILEFLAGS 0x2L
+ FILEFLAGS 0x0L
  FILEOS 0x40004L
  FILETYPE 0x2L
 BEGIN
@@ -15,9 +15,9 @@ BEGIN
   BEGIN
    VALUE "CompanyName", "Contentrium"
    VALUE "FileDescription", "CONTENTRIUM Keys"
-   VALUE "FileVersion", "2.0.0.10"
+   VALUE "FileVersion", "2.0.0.11"
    VALUE "ProductName", "CONTENTRIUM Keys"
-   VALUE "ProductVersion", "2.0.0-preview.10"
+   VALUE "ProductVersion", "2.0.0"
    VALUE "OriginalFilename", "RiumKeysInput.dll"
    VALUE "LegalCopyright", "Contentrium; includes Jamotong by rubidus-api (MIT). See LICENSE and COPYRIGHT.md."
   END
