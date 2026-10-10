@@ -189,7 +189,19 @@ confirmation was cancelled. It recorded `FailedRolledBack` before the machine
 upgrade began. Independent readback confirmed preview.8 still `Installed`,
 the installed-app name `CONTENTRIUM Keys`, and the native profile still
 registered/enabled/active/default with six categories. Preview.9 is built and
-published as development source, but its logo is not yet installed on this PC.
+published as development source; at that point its logo was not yet installed.
+
+The user requested another administrator prompt and approved it at 06:32 KST.
+The preview.9 upgrade committed at 06:34 KST after a fresh ordinary-user fixture
+loaded the installed DLL and physical G/K/S/R/M/F/Space produced `한글 `, a
+button received original V down/up with the Korean profile still selected, and
+returning to the input field produced exact `한글 한글 `. Inline composition
+and profile restoration passed; the fixture and installer exited 0. Independent
+readback confirmed `Installed`, the CONTENTRIUM Keys name, version preview.9,
+both installed DLL hashes matching the verified package and both COM paths.
+The native input profile remained registered/enabled/active/default with six
+categories. Already running applications may retain an earlier loaded DLL until
+they are restarted; they were not forcibly closed for this logo update.
 
 ## Routing behavior
 
@@ -271,8 +283,8 @@ Preview.8 installation, loaded DLL paths, native original-key down/up and the
 Premiere/Studio One transitions above passed. Complete After Effects physical
 shortcut and return-to-text tests, fast continuous typing, and the modern text
 host presentation check in a freshly restarted host. Literal Unicode automation
-is not a physical IME test. Preview.9 also needs its own installation/resource
-readback. Native unattended updates and unsupported application builds are not
+is not a physical IME test. Preview.9 installation, installed payload/resource
+hashes and the native physical transition now passed. Native unattended updates and unsupported application builds are not
 validated by these checks; the stable updater is unchanged.
 
 Only verified application behavior can expand the documented support scope.

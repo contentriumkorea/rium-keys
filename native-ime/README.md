@@ -3,9 +3,9 @@
 This is the Jamotong-based replacement candidate. The production updater still
 distributes the 1.1.1 tray helper. An explicitly requested **local preview
 installation** is available below; it is not a public release and has no automatic
-updater. The locally installed preview.8 contains the new logical input-owner
+updater. The locally installed preview.9 contains the new logical input-owner
 providers and passed its installed native EDIT/button physical test on
-2026-10-11. The preview.8 candidate additionally fixes the reproduced first
+2026-10-11. It retains the preview.8 fix for the reproduced first
 syllable split after a command-to-text transition and passes 1,202 native
 assertions. The installed preview.8 subsequently passed physical text/command/text
 transitions in the tested Premiere search, caption and timeline routes and Studio
@@ -27,6 +27,9 @@ embedded at nine Windows sizes and loaded by both the native input button and
 legacy executable. Input mode and enabled state remain available in the tooltip
 and existing right-click menu. Preview.9 upgrades preview.8; input routing and
 composition behavior are unchanged by the icon addition.
+Its local installation committed on 2026-10-11 at 06:34 KST after the installed
+physical Korean/shortcut/Korean test passed again. Both installed DLL hashes,
+COM views, installed-app name/version and profile state were verified afterward.
 
 On 2026-10-10 an external one-shot experiment restored C in the tested Premiere
 timeline and Studio One workspace while preserving the tested search/caption
