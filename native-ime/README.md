@@ -1,7 +1,7 @@
 # CONTENTRIUM Keys native input engine
 
-Current release: **2.0.1**, Windows x64.
-[Installation](../docs/installation.md) · [Release evidence](../docs/release-2.0.1.md) · [Application evidence](../docs/input-owner-validation.md).
+Current release: **2.0.2**, Windows x64.
+[Installation](../docs/installation.md) · [Release evidence](../docs/release-2.0.2.md) · [Application evidence](../docs/input-owner-validation.md).
 
 This native TSF input method is based on Jamotong and replaces the 1.1.1 tray helper. Windows loads it when selected, without a companion hook/UIA process or startup executable. Native updates are installed manually. The legacy updater retains its unchanged signed 1.1.1 manifest and never automatically installs the native input method.
 
@@ -43,7 +43,7 @@ Setup runs as the ordinary user. Only machine registration requests UAC. PowerSh
 
 The load check never activates a profile, attaches an input sink or opens a window. No typing test is part of installation. A failed check blocks commit and preserves recovery files. Same-version setup verifies files, registration, shell brand extraction, ownership and loadability without reinstalling. The ordinary-user refresh requests shell icon-cache invalidation. Setup offers a Windows restart with Later selected by default; it never forcibly stops Explorer or user applications. Silent success returns 3010 (restart required); preflight success returns 0.
 
-2.0.0 upgrades directly to 2.0.1. Development build 10 can first use the archived 2.0.0 installer, then 2.0.1. Other older native builds must be removed through Installed Apps first. Exact legacy version identifiers remain in migration checks and historical evidence to recognize existing installations.
+2.0.1 upgrades directly to 2.0.2. Version 2.0.0 can first use the archived 2.0.1 installer. Development build 10 starts with the archived 2.0.0 installer, then follows that sequence. Other older native builds must be removed through Installed Apps first. Exact legacy version identifiers remain in migration checks and historical evidence to recognize existing installations.
 
 ## Development diagnostics
 
@@ -62,7 +62,9 @@ The default DLL build without -Installable is fixture-only and cannot activate o
 
 ## Upstream and history
 
-Jamotong is pinned to aa78c1a328bab5d193f5f9932c5f824d5fb222d5 (0.73.1). Its [MIT license](third_party/jamotong/LICENSE) and [copyright notices](third_party/jamotong/COPYRIGHT.md) are preserved and packaged. Upstream dictionaries, auxiliary helper and settings window are not distributed.
+Contentrium's original code/documentation is licensed under the root [MIT License](../LICENSE), with the project URL in the copyright notice. Setup displays and installs that same text. Redistribution preserves copyright and license notices; MIT does not require on-screen attribution or source publication. See [third-party notices](../THIRD_PARTY_NOTICES.md).
+
+Jamotong is pinned to aa78c1a328bab5d193f5f9932c5f824d5fb222d5 (0.73.1). Its [MIT license](third_party/jamotong/LICENSE) and [copyright notices](third_party/jamotong/COPYRIGHT.md) are unchanged and packaged under `licenses/jamotong`. The original LLVM, MinGW-w64 runtime and Winpthreads notices are also packaged. Upstream dictionaries, auxiliary helper and settings window are not distributed.
 
 Configuration uses `%APPDATA%\RIUM Keys` and `HKCU\Software\Contentrium\RiumKeysInput`. Recovery uses `%LOCALAPPDATA%\Contentrium\RIUM Keys\Recovery`. Input/document contents are not uploaded; the native input method has no network updater.
 

@@ -13,8 +13,13 @@ $sources=@{
     'x86\RiumKeysInput.dll'='out\installable\x86\RiumKeysInput.dll'
     'x64\RiumKeysControl.exe'='out\installable\x64\RiumKeysControl.exe'
     'x86\RiumKeysControl.exe'='out\installable\x86\RiumKeysControl.exe'
-    'LICENSE'='third_party\jamotong\LICENSE'
-    'COPYRIGHT.md'='third_party\jamotong\COPYRIGHT.md'
+    'LICENSE'='..\LICENSE'
+    'THIRD_PARTY_NOTICES.md'='..\THIRD_PARTY_NOTICES.md'
+    'licenses\jamotong\LICENSE'='third_party\jamotong\LICENSE'
+    'licenses\jamotong\COPYRIGHT.md'='third_party\jamotong\COPYRIGHT.md'
+    'licenses\LLVM-LICENSE.txt'='..\licenses\LLVM-LICENSE.txt'
+    'licenses\MinGW-w64-runtime.txt'='..\licenses\MinGW-w64-runtime.txt'
+    'licenses\Winpthreads.txt'='..\licenses\Winpthreads.txt'
 }
 foreach($relative in $config.PayloadPaths){if(!$sources.ContainsKey($relative)){$sources[$relative]=$relative}}
 $output=Join-Path $PSScriptRoot 'out'
