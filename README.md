@@ -4,7 +4,9 @@ Windows용 한글 입력기. 입력칸에서는 한글을 조합하고, 지원�
 
 **현재 버전 2.0.2 · Windows x64 · 두벌식 한글 · MIT License**
 
-[설치 파일 다운로드](https://github.com/contentriumkorea/rium-keys/releases/download/v2.0.2/CONTENTRIUM-Keys-Setup.exe) · [배포 페이지](https://github.com/contentriumkorea/rium-keys/releases/tag/v2.0.2) · [설치·복구 안내](docs/installation.md)
+[최신 설치 파일 다운로드](https://github.com/contentriumkorea/rium-keys/releases/latest/download/CONTENTRIUM-Keys-Setup.exe) · [배포 페이지](https://github.com/contentriumkorea/rium-keys/releases/latest) · [설치·복구 안내](docs/installation.md)
+
+설치 파일은 **최신 버전만 공개**합니다. 이전 배포는 비공개 초안으로 보관하며 일반 방문자는 이전 설치 파일을 다운로드할 수 없습니다.
 
 ## 설치하기
 
@@ -44,11 +46,11 @@ Premiere·Studio One의 실기 결과는 같은 입력 처리 코드를 사용�
 
 - **RIUM Keys 1.1.1 유틸리티**: 위 설치 파일로 전환합니다. 새 입력기 자동 점검이 통과하면 기존 유틸리티를 제거합니다.
 - **CONTENTRIUM Keys 2.0.1**: 같은 EXE로 2.0.2로 업데이트합니다. 기본 입력기 설정과 원래 입력기로 돌아갈 복구 정보를 보존합니다.
-- **그보다 오래된 입력기**: [단계별 업데이트 안내](docs/installation.md#기존-버전에서-설치)를 따르거나 Windows 설정 → 앱 → 설치된 앱에서 기존 입력기를 제거한 뒤 설치합니다.
+- **그보다 오래된 입력기**: Microsoft 입력기로 전환하고 Windows 설정 → 앱 → 설치된 앱에서 기존 입력기를 제거한 뒤, Windows를 재시작하고 최신 설치 파일로 새로 설치합니다. [기존 버전별 안내](docs/installation.md#기존-버전에서-설치)를 참고하세요.
 - **2.0.2가 이미 설치됨**: 파일·등록·로딩·CK 로고를 확인하고 표시 갱신을 요청합니다. 중복 설치는 생략합니다.
 - **제거**: Windows 설정 → 앱 → 설치된 앱 → CONTENTRIUM Keys → 제거. 설치 전 입력기로 복구하며 개인 설정과 복구 기록은 남깁니다.
 
-업데이트는 GitHub에서 설치 파일을 받아 진행합니다. 2.0.2에는 자동 업데이트 기능이 없습니다. 구형 1.1.1의 업데이트 경로는 유지되며 새 입력기로 자동 전환하지 않습니다. 저장소 주소는 기존 링크 호환을 위해 `rium-keys`를 유지합니다.
+업데이트는 GitHub에서 최신 설치 파일을 받아 진행합니다. 2.0.2에는 자동 업데이트 기능이 없습니다. 구형 1.x 유틸리티의 설치 파일과 자동 업데이트 배포는 종료했습니다. 기존 유틸리티는 새 입력기로 자동 전환되지 않으므로 위 설치 안내를 따르세요. 저장소 주소는 기존 링크 호환을 위해 `rium-keys`를 유지합니다.
 
 ## 개인정보
 

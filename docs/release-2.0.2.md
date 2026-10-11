@@ -64,3 +64,14 @@ The unchanged installer transaction was exercised for [2.0.1](release-2.0.1.md).
 Application evidence remains in [input-owner-validation.md](input-owner-validation.md);
 this release makes no new application-compatibility claim. Native automatic
 updates and code signing are not included.
+
+## Public download policy update — 2026-10-11
+
+At the owner's request, only the latest installer remains publicly downloadable.
+The six earlier releases are retained as unpublished drafts with their assets.
+The legacy `update.json` asset was removed from the public 2.0.2 release; its
+unchanged copies remain with the archived releases. The hashes and legacy-feed
+checks above record the original publication, not the current public asset list.
+The 2.0.2 installer and checksum file are unchanged. Current installation
+instructions link to the latest release and explain removing older native
+versions before a fresh installation, without intermediate installer downloads.

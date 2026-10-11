@@ -1,10 +1,10 @@
 # RIUM Keys 1.1.1 — historical tray utility
 
-아래는 구형 유틸리티의 설명입니다. 새 CONTENTRIUM Keys 입력기 설치는 [현재 안내](installation.md)를 사용하세요.
+아래는 구형 유틸리티의 과거 설명입니다. 구형 설치 파일과 자동 업데이트 배포는 종료했으며 이전 배포는 비공개 초안으로 보관합니다. 새 CONTENTRIUM Keys 입력기 설치는 [현재 안내](installation.md)를 사용하세요.
 
 한글 입력 상태를 유지하면서 PC 전반의 인식 가능한 비텍스트 영역에서 단축키를 전달하는 Windows 트레이 유틸리티입니다.
 
-[설치 파일 다운로드](https://github.com/contentriumkorea/rium-keys/releases/latest/download/RIUM-Keys-Setup.exe)
+[현재 CONTENTRIUM Keys 다운로드](https://github.com/contentriumkorea/rium-keys/releases/latest)
 
 ## 설치와 사용
 
