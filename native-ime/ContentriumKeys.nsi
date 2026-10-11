@@ -22,6 +22,8 @@ VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 !define MUI_WELCOMEPAGE_TEXT "Windows 한글 입력기 ${APP_VERSION}$\r$\n$\r$\n작업 중인 문서를 저장하고 앱을 종료한 뒤 진행하세요.$\r$\n$\r$\nWindows 관리자 확인창에서 예를 누르면 입력기를 설치하고 자동으로 확인합니다.$\r$\n$\r$\n지원 프로그램과 업데이트 안내는 GitHub 저장소에서 확인할 수 있습니다."
 !define MUI_FINISHPAGE_TITLE "CONTENTRIUM Keys"
 !define MUI_FINISHPAGE_TEXT "설치된 파일을 확인했습니다.$\r$\n$\r$\n열려 있던 앱을 다시 실행하세요. 이전 아이콘이 남으면 Windows에서 로그아웃한 뒤 다시 로그인하세요.$\r$\n$\r$\n입력기 선택: Windows + Space → CONTENTRIUM Keys$\r$\n한글: 가 / 영어·직접 입력: A$\r$\n$\r$\n사용 중에는 별도 설정 창이나 트레이 프로그램을 실행할 필요가 없습니다."
+!define MUI_FINISHPAGE_TEXT_REBOOT "설치와 CK 로고 등록을 확인했습니다.$\r$\n$\r$\n기존 입력기와 Windows의 아이콘 표시까지 모두 갱신하려면 컴퓨터를 다시 시작하세요. 나중에 다시 시작해도 됩니다.$\r$\n$\r$\n입력기 로고: CK$\r$\n한글: 가 / 영어·직접 입력: A"
+!define MUI_FINISHPAGE_REBOOTLATER_DEFAULT
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "third_party\jamotong\LICENSE"
 !insertmacro MUI_PAGE_INSTFILES
@@ -68,5 +70,11 @@ Section
     SetErrorLevel 1
     Abort
   ${EndIf}
-  SetErrorLevel 0
+  ${If} $Preflight == ""
+    SetRebootFlag true
+    ; Silent setup never reboots; 3010 tells deployment tools a restart is needed.
+    SetErrorLevel 3010
+  ${Else}
+    SetErrorLevel 0
+  ${EndIf}
 SectionEnd

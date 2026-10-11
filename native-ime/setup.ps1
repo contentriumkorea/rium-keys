@@ -40,7 +40,12 @@ try {
             if($LASTEXITCODE){throw 'Cannot verify installed input profile.'}
             $status=$statusText | ConvertFrom-Json
             if(!$status.registered -or !$status.enabled -or $status.categories -ne 6){throw 'Installed input profile requires recovery.'}
-            if(!$Preflight){Test-RiumInstalledLoad $expected $logRoot}
+            Test-RiumInstalledBranding $expected
+            if(!$Preflight){
+                Test-RiumInstalledLoad $expected $logRoot
+                & (Join-Path $expected 'x64\RiumKeysControl.exe') --refresh
+                if($LASTEXITCODE){throw 'Cannot refresh the installed input brand.'}
+            }
             Write-Output 'ALREADY INSTALLED: same version and all installed files verified.'
             exit 0
         }else{throw "Unsupported upgrade from $($app.DisplayVersion). Remove the existing input method from Windows Installed Apps first; then run Setup again."}

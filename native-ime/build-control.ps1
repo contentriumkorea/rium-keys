@@ -9,6 +9,6 @@ $output=Join-Path $PSScriptRoot "out\installable\$Architecture"
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 Push-Location $output
 try {
-    & "$vc\bin\Hostx64\$Architecture\cl.exe" /nologo /std:c++17 /utf-8 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE "$PSScriptRoot\ProfileControl.cpp" /link /OUT:RiumKeysControl.exe ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib
+    & "$vc\bin\Hostx64\$Architecture\cl.exe" /nologo /std:c++17 /utf-8 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE "$PSScriptRoot\ProfileControl.cpp" /link /OUT:RiumKeysControl.exe ole32.lib oleaut32.lib uuid.lib user32.lib advapi32.lib shell32.lib
     if($LASTEXITCODE){throw 'Profile controller build failed'}
 } finally {Pop-Location}

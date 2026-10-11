@@ -68,6 +68,7 @@ try {
     Save-State 'VerifyingInstallation'
     [void](Assert-RiumManifest $target $config)
     Test-RiumInstalledLoad $target $recovery
+    Test-RiumInstalledBranding $target
     Save-State 'SelectingNativeInput'
     $selected=$true # default selection changes before activation/readback
     & $control --select
@@ -76,6 +77,8 @@ try {
     if($LASTEXITCODE){throw 'Cannot verify selected input method.'}
     $native=$nativeText | ConvertFrom-Json
     if(!$native.registered -or !$native.enabled -or !$native.active -or $native.categories -ne 6){throw 'Native registration or activation is incomplete.'}
+    & $control --refresh
+    if($LASTEXITCODE){throw 'Installed input brand cache could not be refreshed.'}
     $commitRequested=$true
     [void]$commit.Set();[void]$done.Set()
     if(!$machine.WaitForExit(45000) -or $machine.ExitCode -ne 0){throw 'Machine installation did not commit.'}

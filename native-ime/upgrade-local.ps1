@@ -48,17 +48,20 @@ try {
     Save-State 'VerifyingInstallation'
     [void](Assert-RiumManifest $target $config)
     Test-RiumInstalledLoad $target $recovery
+    Test-RiumInstalledBranding $target
+    & $control --refresh
+    if($LASTEXITCODE){throw 'Installed input name could not be read back.'}
     $afterText=& $control --status
     if($LASTEXITCODE){throw 'Input profile readback failed.'}
     $after=$afterText | ConvertFrom-Json
-    if(!$after.registered -or !$after.enabled -or $after.categories -ne 6 -or $after.defaultTip -ne $before.defaultTip -or $after.activeTip -ne $before.activeTip){throw 'Upgrade changed input profile state unexpectedly.'}
+    foreach($field in @('registered','enabled','categories','active','koreanDefault','defaultTip','activeTip')){
+        if($after.$field -ne $before.$field){throw "Brand registration changed $field."}
+    }
     Save-State 'CommittingUpgrade';$commitRequested=$true
     [void]$commit.Set();[void]$done.Set()
     if(!$machine.WaitForExit(45000)){throw 'Machine commit status is not yet known.'}
     if($machine.ExitCode -ne 0){throw 'Machine upgrade did not commit.'}
     $committed=$true
-    & $control --refresh
-    if($LASTEXITCODE){throw 'Installed input name could not be read back.'}
     Save-State 'Installed'
     Set-ItemProperty $stateKey -Name InstallState -Value $statePath
     Get-Content -LiteralPath (Join-Path $target 'install-result.log')

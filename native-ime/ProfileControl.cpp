@@ -1,6 +1,7 @@
 // Installation/profile control only. Never hooks keys or polls user applications.
 #include <windows.h>
 #include <msctf.h>
+#include <shlobj.h>
 #include <wrl/client.h>
 #include <cstdio>
 #include <string>
@@ -67,6 +68,49 @@ static std::wstring DefaultTip(ITfInputProcessorProfiles* profiles){
     if(cls==GUID_NULL||profile==GUID_NULL)throw std::runtime_error("Select a Korean input method as the default before installation");
     return Tip(lang,cls,profile);
 }
+static std::wstring VerifyBranding(const wchar_t* expectedDll,bool allowLegacyName=false){
+    const wchar_t* key=L"Software\\Microsoft\\CTF\\TIP\\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}\\LanguageProfile\\0x00000412\\{EA007E57-6806-4596-BB29-88EBFBC620B5}";
+    wchar_t value[32768]{};DWORD bytes=sizeof(value),index=0;
+    if(RegGetValueW(HKEY_LOCAL_MACHINE,key,L"IconFile",RRF_RT_REG_SZ,nullptr,value,&bytes)!=ERROR_SUCCESS ||
+       _wcsicmp(value,expectedDll)!=0)throw std::runtime_error("Registered brand DLL does not match the installed version");
+    bytes=sizeof(value);
+    if(RegGetValueW(HKEY_LOCAL_MACHINE,key,L"Description",RRF_RT_REG_SZ,nullptr,value,&bytes)!=ERROR_SUCCESS ||
+       (wcscmp(value,L"CONTENTRIUM Keys")!=0&&(!allowLegacyName||wcscmp(value,L"RIUM Keys")!=0)))throw std::runtime_error("Registered product name mismatch");
+    std::wstring name=value;
+    bytes=sizeof(index);
+    if(RegGetValueW(HKEY_LOCAL_MACHINE,key,L"IconIndex",RRF_RT_REG_DWORD,nullptr,&index,&bytes)!=ERROR_SUCCESS ||
+       index!=static_cast<DWORD>(-100))throw std::runtime_error("Registered brand resource mismatch");
+    // Use the shell's extraction path, not only LoadImage from an already loaded DLL.
+    HICON brandLarge=nullptr,brandSmall=nullptr;
+    UINT extracted=ExtractIconExW(expectedDll,-100,&brandLarge,&brandSmall,1);
+    bool valid=extracted>0&&extracted!=UINT_MAX&&brandLarge&&brandSmall;
+    if(brandLarge)DestroyIcon(brandLarge);if(brandSmall)DestroyIcon(brandSmall);
+    if(!valid)throw std::runtime_error("Windows cannot extract the installed CK brand icon");
+    return name;
+}
+static void RefreshBranding(ITfInputProcessorProfileMgr* profiles,ITfInputProcessorProfiles* legacy,const wchar_t* dll){
+    HANDLE token=nullptr;TOKEN_ELEVATION elevation{};DWORD bytes=0;
+    if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))throw std::runtime_error("Cannot read registration token");
+    BOOL read=GetTokenInformation(token,TokenElevation,&elevation,sizeof(elevation),&bytes);CloseHandle(token);
+    if(!read||!elevation.TokenIsElevated)throw std::runtime_error("Brand registration requires administrator approval");
+    auto name=VerifyBranding(dll,true); // Preserve an owned legacy name during rollback.
+    TF_INPUTPROCESSORPROFILE before{},after{};BOOL enabledBefore=FALSE,enabledAfter=FALSE;
+    Check(profiles->GetProfile(TF_PROFILETYPE_INPUTPROCESSOR,0x412,Service,Profile,nullptr,&before),"existing brand profile");
+    Check(legacy->IsEnabledLanguageProfile(Service,0x412,Profile,&enabledBefore),"existing user enable state");
+    const wchar_t* key=L"Software\\Microsoft\\CTF\\TIP\\{E1985813-4FA4-4B93-8EF4-F8EE7777E291}\\LanguageProfile\\0x00000412\\{EA007E57-6806-4596-BB29-88EBFBC620B5}";
+    DWORD enabledDefault=0;bytes=sizeof(enabledDefault);
+    if(RegGetValueW(HKEY_LOCAL_MACHINE,key,L"Enable",RRF_RT_REG_DWORD,nullptr,&enabledDefault,&bytes)!=ERROR_SUCCESS ||
+       enabledDefault>1)throw std::runtime_error("Cannot preserve default enable state");
+    Check(profiles->RegisterProfile(Service,0x412,Profile,name.c_str(),static_cast<ULONG>(name.size()),dll,
+        static_cast<ULONG>(wcslen(dll)),static_cast<ULONG>(-100),nullptr,0,enabledDefault!=0,0),"refresh brand through Windows profile API");
+    if(VerifyBranding(dll,true)!=name)throw std::runtime_error("Brand refresh changed the registered name");
+    Check(profiles->GetProfile(TF_PROFILETYPE_INPUTPROCESSOR,0x412,Service,Profile,nullptr,&after),"refreshed brand profile");
+    Check(legacy->IsEnabledLanguageProfile(Service,0x412,Profile,&enabledAfter),"refreshed user enable state");
+    if(before.dwCaps!=after.dwCaps||before.dwFlags!=after.dwFlags||enabledBefore!=enabledAfter)
+        throw std::runtime_error("Brand refresh changed profile capabilities or enable state");
+    Refresh();
+    puts("PASS: CK brand re-registered through the Windows profile API; profile state preserved.");
+}
 static void VerifyInstalledLoad(const wchar_t* expectedDll){
     HANDLE token=nullptr;
     if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))throw std::runtime_error("Cannot read verification token");
@@ -106,7 +150,11 @@ int wmain(int argc,wchar_t** argv){
         ComPtr<ITfCategoryMgr> categories;
         Check(CoCreateInstance(CLSID_TF_CategoryMgr,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&categories)),"categories");
         std::wstring mode=argc>1?argv[1]:L"--status";
-        if(mode==L"--verify-install"&&argc==3){
+        if(mode==L"--verify-branding"&&argc==3){
+            VerifyBranding(argv[2]);puts("PASS: installed brand name, DLL, resource ID and shell icon extraction verified.");
+        }else if(mode==L"--refresh-branding"&&argc==3){
+            RefreshBranding(profiles.Get(),legacy.Get(),argv[2]);
+        }else if(mode==L"--verify-install"&&argc==3){
             TF_INPUTPROCESSORPROFILE native{};BOOL enabled=FALSE;
             Check(profiles->GetProfile(TF_PROFILETYPE_INPUTPROCESSOR,0x412,Service,Profile,nullptr,&native),"installed profile");
             Check(legacy->IsEnabledLanguageProfile(Service,0x412,Profile,&enabled),"installed user profile");
@@ -129,6 +177,7 @@ int wmain(int argc,wchar_t** argv){
             bool matches=description&&wcscmp(description,L"CONTENTRIUM Keys")==0;
             printf("Profile description: %ls\n",description?description:L"");SysFreeString(description);
             if(!matches)throw std::runtime_error("Input method name readback mismatch");
+            SHChangeNotify(SHCNE_ASSOCCHANGED,SHCNF_IDLIST|SHCNF_FLUSHNOWAIT,nullptr,nullptr);
         }else if(mode==L"--unregister"){
             HRESULT first=S_OK;
             for(auto& category:Categories){auto hr=categories->UnregisterCategory(Service,category,Service);if(FAILED(hr)&&SUCCEEDED(first))first=hr;}
