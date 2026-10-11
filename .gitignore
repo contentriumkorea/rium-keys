@@ -1,6 +1,14 @@
 *
 !.gitignore
+!.gitattributes
 !README.md
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!licenses/
+!licenses/*.txt
+!licenses/jamotong/
+!licenses/jamotong/LICENSE
+!licenses/jamotong/COPYRIGHT.md
 !assets/
 !assets/contentrium-keys.png
 !assets/input-mode-*.png
@@ -52,6 +60,7 @@
 !docs/release-build10.md
 !docs/release-2.0.0.md
 !docs/release-2.0.1.md
+!docs/release-2.0.2.md
 !input-core/
 !input-core/*.h
 !input-core/*.cpp

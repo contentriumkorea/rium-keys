@@ -25,7 +25,9 @@ VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 !define MUI_FINISHPAGE_TEXT_REBOOT "설치와 CK 로고 등록을 확인했습니다.$\r$\n$\r$\n기존 입력기와 Windows의 아이콘 표시까지 모두 갱신하려면 컴퓨터를 다시 시작하세요. 나중에 다시 시작해도 됩니다.$\r$\n$\r$\n입력기 로고: CK$\r$\n한글: 가 / 영어·직접 입력: A"
 !define MUI_FINISHPAGE_REBOOTLATER_DEFAULT
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "third_party\jamotong\LICENSE"
+!define MUI_LICENSEPAGE_TEXT_TOP "사용·수정·재배포·상업적 이용을 허용합니다. 배포할 때 저작권 표시와 라이선스 고지를 유지하세요."
+!define MUI_LICENSEPAGE_TEXT_BOTTOM "MIT 라이선스와 외부 구성요소 고지는 설치 폴더에 함께 보관됩니다."
+!insertmacro MUI_PAGE_LICENSE "${PAYLOAD}\LICENSE"
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipPreflightFinish
 !insertmacro MUI_PAGE_FINISH

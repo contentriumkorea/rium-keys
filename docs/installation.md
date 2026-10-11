@@ -1,10 +1,10 @@
 # CONTENTRIUM Keys 설치·복구 안내
 
-대상: **2.0.1 · Windows x64 · 두벌식 한글**. 별도 .NET 런타임은 필요하지 않습니다. Windows ARM64·32비트 운영체제는 지원 대상으로 검증하지 않았습니다.
+대상: **2.0.2 · Windows x64 · 두벌식 한글**. 별도 .NET 런타임은 필요하지 않습니다. Windows ARM64·32비트 운영체제는 지원 대상으로 검증하지 않았습니다.
 
 ## 다운로드와 준비
 
-[CONTENTRIUM-Keys-Setup.exe 다운로드](https://github.com/contentriumkorea/rium-keys/releases/download/v2.0.1/CONTENTRIUM-Keys-Setup.exe). `Source code.zip`은 설치 파일이 아닙니다. `update.json`은 구형 유틸리티 호환용이므로 따로 받지 않아도 됩니다.
+[CONTENTRIUM-Keys-Setup.exe 다운로드](https://github.com/contentriumkorea/rium-keys/releases/download/v2.0.2/CONTENTRIUM-Keys-Setup.exe). `Source code.zip`은 설치 파일이 아닙니다. `update.json`은 구형 유틸리티 호환용이므로 따로 받지 않아도 됩니다.
 
 설치 파일은 현재 코드 서명이 없습니다. 게시자를 확인할 수 없다는 표시가 나올 수 있으며 배포 페이지의 `SHA256SUMS.txt`로 파일 SHA-256을 대조할 수 있습니다.
 
@@ -29,10 +29,11 @@
 | 기존 설치 | 진행 |
 | --- | --- |
 | 없음 / RIUM Keys 1.1.1 유틸리티 | 새 설치. 자동 점검 성공 후 기존 유틸리티 제거 |
-| CONTENTRIUM Keys 2.0.0 | 같은 EXE에서 2.0.1로 업데이트 |
-| 개발 빌드 10 | [2.0.0 설치 파일](https://github.com/contentriumkorea/rium-keys/releases/download/v2.0.0/CONTENTRIUM-Keys-Setup.exe)을 먼저 설치한 뒤 2.0.1 설치 |
+| CONTENTRIUM Keys 2.0.1 | 같은 EXE에서 2.0.2로 업데이트 |
+| CONTENTRIUM Keys 2.0.0 | [2.0.1 설치 파일](https://github.com/contentriumkorea/rium-keys/releases/download/v2.0.1/CONTENTRIUM-Keys-Setup.exe)을 먼저 설치한 뒤 2.0.2 설치 |
+| 개발 빌드 10 | [2.0.0 설치 파일](https://github.com/contentriumkorea/rium-keys/releases/download/v2.0.0/CONTENTRIUM-Keys-Setup.exe) → 2.0.1 → 2.0.2 순서로 설치 |
 | 그보다 오래된 입력기 | 설치된 앱에서 기존 입력기 제거 → 새 설치 |
-| CONTENTRIUM Keys 2.0.1 | 현재 파일·등록·로딩·CK 로고를 확인하고 캐시 갱신 요청. 중복 설치 생략 |
+| CONTENTRIUM Keys 2.0.2 | 현재 파일·등록·로딩·CK 로고를 확인하고 캐시 갱신 요청. 중복 설치 생략 |
 
 업데이트·제거에는 저장된 복구 정보가 필요합니다. 다른 사용자 계정의 설치이거나 복구 기록이 없으면 덮어쓰지 않고 중단합니다.
 
@@ -48,10 +49,12 @@
 
 복구 기록: `%LOCALAPPDATA%\Contentrium\RIUM Keys\Recovery`
 
-설치 폴더: `C:\Program Files\RIUM Keys\2.0.1`. 기존 등록·설정 호환을 위해 내부 폴더 이름은 유지합니다.
+설치 폴더: `C:\Program Files\RIUM Keys\2.0.2`. 기존 등록·설정 호환을 위해 내부 폴더 이름은 유지합니다.
+
+설치 화면에는 CONTENTRIUM Keys의 MIT 라이선스가 표시됩니다. 설치 폴더의 `LICENSE`에 콘텐츠리움 저작권과 프로젝트 주소를, `THIRD_PARTY_NOTICES.md`와 `licenses` 폴더에 외부 구성요소의 원문 고지를 함께 보관합니다. 수정·재배포할 때는 해당 고지를 유지하세요. [이용 조건과 출처 표기](../README.md#라이선스와-출처-표기).
 
 제거: Windows 설정 → 앱 → 설치된 앱 → **CONTENTRIUM Keys → 제거**. 설치 전 입력기로 되돌린 뒤 등록을 제거합니다. 실행 중인 앱이 사용 중인 DLL은 바로 삭제되지 않을 수 있습니다. 개인 설정과 복구 기록은 보존합니다.
 
-업데이트는 GitHub의 새 설치 파일로 진행합니다. 자동 업데이트 기능은 포함하지 않습니다. 검증 환경과 결과는 [2.0.1 배포 기록](release-2.0.1.md)에 정리합니다.
+업데이트는 GitHub의 새 설치 파일로 진행합니다. 자동 업데이트 기능은 포함하지 않습니다. 검증 환경과 결과는 [2.0.2 배포 기록](release-2.0.2.md)에 정리합니다.
 
 무인 설치: `/S`는 자동으로 재시작하지 않습니다. 성공 시 종료 코드 **3010**은 설치 성공·재시작 필요를 뜻합니다. 읽기 전용 사전 점검 `/S /PREFLIGHT`는 성공 시 **0**을 반환하고 설치나 관리자 확인을 수행하지 않습니다.
