@@ -100,6 +100,12 @@ function Test-RiumInstalledLoad([string]$InstallRoot, [string]$LogDirectory) {
         Invoke-RiumLoadCheck (Join-Path $InstallRoot "$architecture\RiumKeysControl.exe") (Join-Path $InstallRoot "$architecture\RiumKeysInput.dll") (Join-Path $LogDirectory "automatic-check-$architecture.log")
     }
 }
+function Test-RiumInstalledBranding([string]$InstallRoot) {
+    foreach($architecture in @('x64','x86')){
+        & (Join-Path $InstallRoot "$architecture\RiumKeysControl.exe") --verify-branding (Join-Path $InstallRoot 'x64\RiumKeysInput.dll')
+        if($LASTEXITCODE){throw "Installed $architecture brand registration or shell icon extraction failed."}
+    }
+}
 function Set-RiumProfileBranding($Key, $Before, [string]$TargetDll, [switch]$Restore) {
     $after = @{ Description = 'CONTENTRIUM Keys'; IconFile = $TargetDll; IconIndex = -100 }
     # Both registry views may reference the same CTF key. Accept a value already

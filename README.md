@@ -2,19 +2,20 @@
 
 Windows용 한글 입력기. 입력칸에서는 한글을 조합하고, 지원되는 작업 영역에서는 한/영 전환 없이 원래 키보드 단축키를 사용할 수 있습니다.
 
-**현재 버전 2.0.0 · Windows x64 · 두벌식 한글**
+**현재 버전 2.0.1 · Windows x64 · 두벌식 한글**
 
-[설치 파일 다운로드](https://github.com/contentriumkorea/rium-keys/releases/download/v2.0.0/CONTENTRIUM-Keys-Setup.exe) · [배포 페이지](https://github.com/contentriumkorea/rium-keys/releases/tag/v2.0.0) · [설치·복구 안내](docs/installation.md)
+[설치 파일 다운로드](https://github.com/contentriumkorea/rium-keys/releases/download/v2.0.1/CONTENTRIUM-Keys-Setup.exe) · [배포 페이지](https://github.com/contentriumkorea/rium-keys/releases/tag/v2.0.1) · [설치·복구 안내](docs/installation.md)
 
 ## 설치하기
 
 1. 한국어와 Microsoft 입력기가 설치된 Windows x64에서 사용합니다. 새 설치 전에는 기본 입력 방법과 현재 입력기를 **한국어 Microsoft 입력기**로 선택합니다. Microsoft 입력기는 유지하세요.
 2. 작업을 저장하고 편집 프로그램을 종료한 다음, `CONTENTRIUM-Keys-Setup.exe`를 **일반 실행**합니다.
 3. 다음 → 라이선스 확인 → 설치를 진행하고, Windows 관리자 확인창에서 **예**를 누릅니다.
-4. 파일·등록·DLL 로딩을 자동 점검합니다. **직접 타이핑하거나 단축키 시험을 할 필요가 없습니다.** 완료 화면에서 마침을 누릅니다.
-5. 작업 프로그램을 다시 실행합니다. **Windows + Space → CONTENTRIUM Keys**로 선택할 수 있습니다.
+4. 파일·등록·DLL 로딩·CK 로고를 자동 점검합니다. **직접 타이핑하거나 단축키 시험을 할 필요가 없습니다.**
+5. 완료 화면에서 Windows를 **지금 다시 시작**하거나 **나중에 다시 시작**하도록 선택하고 마침을 누릅니다. 기본 선택은 나중에 다시 시작입니다.
+6. 재시작하면 기존 입력기와 아이콘 표시가 모두 갱신됩니다. **Windows + Space → CONTENTRIUM Keys**로 선택할 수 있습니다.
 
-별도 백그라운드 트레이 앱 없이 Windows가 선택된 입력기를 불러옵니다. 기본 입력기를 CONTENTRIUM Keys로 유지하면 로그인 후에도 사용할 수 있습니다. 기존 아이콘이 남아 있으면 로그아웃 후 다시 로그인하세요.
+별도 백그라운드 트레이 앱 없이 Windows가 선택된 입력기를 불러옵니다. 기본 입력기를 CONTENTRIUM Keys로 유지하면 로그인 후에도 사용할 수 있습니다. 2.0.1은 업데이트할 때 CK 로고를 Windows 공식 API로 다시 등록하고 아이콘 캐시 갱신을 요청합니다. 재시작을 미루면 실행 중이던 앱이나 작업 표시줄에 이전 표시가 남을 수 있습니다.
 
 ## 우측 하단 표시
 
@@ -37,17 +38,17 @@ Windows용 한글 입력기. 입력칸에서는 한글을 조합하고, 지원�
 | Studio One **6.6.4.102451** | 검색 → 작업 영역 C 단축키 → 검색, 앱 전환 후의 시험 경로 | 다른 버전과 나머지 입력칸 |
 | After Effects **26.5.0.89** | 한글 입력 일부와 내부 입력 위치 판별 | 실제 단축키 및 입력칸 복귀 |
 
-Premiere·Studio One의 실기 결과는 같은 입력 처리 코드를 사용하는 개발 빌드 8에서 확인했습니다. 2.0.0은 제품 표시와 설치 과정을 정리한 버전입니다. 프로그램 업데이트로 내부 구조가 바뀌면 지원 범위도 달라질 수 있습니다. 모든 Windows 프로그램의 단축키 호환성을 보장하지 않습니다. [검증 기록](docs/input-owner-validation.md) · [버전별 내부 지원 범위](native-ime/providers/README.md)
+Premiere·Studio One의 실기 결과는 같은 입력 처리 코드를 사용하는 개발 빌드 8에서 확인했습니다. 2.0.1은 CK 로고의 설치·갱신 과정을 보완한 버전입니다. 프로그램 업데이트로 내부 구조가 바뀌면 지원 범위도 달라질 수 있습니다. 모든 Windows 프로그램의 단축키 호환성을 보장하지 않습니다. [검증 기록](docs/input-owner-validation.md) · [버전별 내부 지원 범위](native-ime/providers/README.md)
 
 ## 업데이트와 제거
 
 - **RIUM Keys 1.1.1 유틸리티**: 위 설치 파일로 전환합니다. 새 입력기 자동 점검이 통과하면 기존 유틸리티를 제거합니다.
-- **직전 개발 빌드 10**: 같은 EXE로 2.0.0으로 업데이트합니다. 기본 입력기 설정과 원래 입력기로 돌아갈 복구 정보를 보존합니다.
-- **그보다 오래된 입력기**: Windows 설정 → 앱 → 설치된 앱에서 기존 입력기를 제거한 뒤 설치합니다.
-- **2.0.0이 이미 설치됨**: 파일·등록·로딩을 확인하고 중복 설치를 생략합니다.
+- **CONTENTRIUM Keys 2.0.0**: 같은 EXE로 2.0.1로 업데이트합니다. 기본 입력기 설정과 원래 입력기로 돌아갈 복구 정보를 보존합니다.
+- **그보다 오래된 입력기**: 개발 빌드 10은 [2.0.0 설치 파일](https://github.com/contentriumkorea/rium-keys/releases/download/v2.0.0/CONTENTRIUM-Keys-Setup.exe)로 먼저 업데이트한 뒤 2.0.1을 설치할 수 있습니다. 그 외에는 Windows 설정 → 앱 → 설치된 앱에서 기존 입력기를 제거한 뒤 설치합니다.
+- **2.0.1이 이미 설치됨**: 파일·등록·로딩·CK 로고를 확인하고 표시 갱신을 요청합니다. 중복 설치는 생략합니다.
 - **제거**: Windows 설정 → 앱 → 설치된 앱 → CONTENTRIUM Keys → 제거. 설치 전 입력기로 복구하며 개인 설정과 복구 기록은 남깁니다.
 
-업데이트는 GitHub에서 설치 파일을 받아 진행합니다. 2.0.0에는 자동 업데이트 기능이 없습니다. 구형 1.1.1의 업데이트 경로는 유지되며 새 입력기로 자동 전환하지 않습니다. 저장소 주소는 기존 링크 호환을 위해 `rium-keys`를 유지합니다.
+업데이트는 GitHub에서 설치 파일을 받아 진행합니다. 2.0.1에는 자동 업데이트 기능이 없습니다. 구형 1.1.1의 업데이트 경로는 유지되며 새 입력기로 자동 전환하지 않습니다. 저장소 주소는 기존 링크 호환을 위해 `rium-keys`를 유지합니다.
 
 ## 개인정보와 라이선스
 
@@ -55,4 +56,4 @@ Premiere·Studio One의 실기 결과는 같은 입력 처리 코드를 사용�
 
 [MIT 라이선스 Jamotong](native-ime/third_party/jamotong/LICENSE)의 한글 조합 엔진을 기반으로 만들었습니다. [저작권 안내](native-ime/third_party/jamotong/COPYRIGHT.md)를 포함합니다. macOS 구름 입력기와는 별개의 Windows 프로젝트입니다.
 
-[개발 및 빌드](native-ime/README.md) · [2.0.0 배포 기록](docs/release-2.0.0.md) · [예전 1.1.1 설명](docs/legacy-tray-1.1.1.md)
+[개발 및 빌드](native-ime/README.md) · [2.0.1 배포 기록](docs/release-2.0.1.md) · [예전 1.1.1 설명](docs/legacy-tray-1.1.1.md)

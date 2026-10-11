@@ -31,7 +31,7 @@ $badConfig=@{PayloadPaths=@('..\escape')}
 Write-Manifest @([pscustomobject]@{Path='..\escape';Sha256=('A'*64)})
 Reject {Assert-RiumManifest $testRoot $badConfig} 'manifest traversal rejected even if configured'
 Reject {Assert-RiumCandidateVersion (Join-Path $testRoot 'x64\RiumKeysInput.dll') $config.Version} 'unversioned candidate rejected'
-Check ($config.Version -eq '2.0.0' -and $config.UpgradeFrom -eq '2.0.0-preview.10' -and $config.Channel -eq 'manual-release') 'release upgrades the previous installed build'
+Check ($config.Version -eq '2.0.1' -and $config.UpgradeFrom -eq '2.0.0' -and $config.Channel -eq 'manual-release') 'release upgrades the previous installed build'
 $legacy=Join-Path $testRoot 'legacy'
 Check (!(Test-RiumLegacyMigration $legacy)) 'clean installation requires no legacy program'
 New-Item -ItemType Directory -Path $legacy | Out-Null

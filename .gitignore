@@ -51,6 +51,7 @@
 !docs/installation.md
 !docs/release-build10.md
 !docs/release-2.0.0.md
+!docs/release-2.0.1.md
 !input-core/
 !input-core/*.h
 !input-core/*.cpp

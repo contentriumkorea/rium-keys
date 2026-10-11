@@ -1,7 +1,7 @@
 # CONTENTRIUM Keys native input engine
 
-Current release: **2.0.0**, Windows x64.
-[Installation](../docs/installation.md) · [Release evidence](../docs/release-2.0.0.md) · [Application evidence](../docs/input-owner-validation.md).
+Current release: **2.0.1**, Windows x64.
+[Installation](../docs/installation.md) · [Release evidence](../docs/release-2.0.1.md) · [Application evidence](../docs/input-owner-validation.md).
 
 This native TSF input method is based on Jamotong and replaces the 1.1.1 tray helper. Windows loads it when selected, without a companion hook/UIA process or startup executable. Native updates are installed manually. The legacy updater retains its unchanged signed 1.1.1 manifest and never automatically installs the native input method.
 
@@ -13,7 +13,7 @@ Premiere 26.5.2.5 and Studio One 6.6.4.102451 passed the physical transitions re
 
 Mode resource 101 is white **가** for Hangul layouts; 102 is white **A** for Latin/direct input. Switches notify the shell. Resource 100 is the separate CK brand icon. Windows owns placement and each private HICON returned to it.
 
-Service/profile GUIDs and RIUM Keys internal installation/settings paths are retained. Branding upgrades snapshot both registry views before mutation, including aliased CTF keys, and restore them on commit failure.
+Service/profile GUIDs and RIUM Keys internal installation/settings paths are retained. Branding upgrades snapshot both registry views before mutation, including aliased CTF keys, and restore them on commit failure. Upgrade and rollback then re-register the owned branding with ITfInputProcessorProfileMgr::RegisterProfile. Description lengths are calculated, and the machine default-enable value and user enable/capability flags are preserved.
 
 ## Build and test
 
@@ -39,11 +39,11 @@ Setup runs as the ordinary user. Only machine registration requests UAC. PowerSh
 1. Verify package hashes, version, previous installation/input state and user identity.
 2. Save recovery data; stage versioned binaries in Program Files with elevation.
 3. Run each architecture's controller in a fresh ordinary-user process. Verify enabled registration, six categories and COM path/model; instantiate the registered text service and check its loaded DLL path and required interfaces.
-4. Commit or roll back. New installs select the native profile and remove a detected legacy utility after automatic checks. Upgrades preserve selection/defaults and the original uninstall fallback.
+4. Verify the registered CK resource through shell icon extraction. Commit or roll back. New installs select the native profile and remove a detected legacy utility after automatic checks. Upgrades preserve selection/defaults and the original uninstall fallback.
 
-The load check never activates a profile, attaches an input sink or opens a window. No typing test is part of installation. A failed check blocks commit and preserves recovery files. Same-version setup verifies files, registration, branding, ownership and loadability without reinstalling.
+The load check never activates a profile, attaches an input sink or opens a window. No typing test is part of installation. A failed check blocks commit and preserves recovery files. Same-version setup verifies files, registration, shell brand extraction, ownership and loadability without reinstalling. The ordinary-user refresh requests shell icon-cache invalidation. Setup offers a Windows restart with Later selected by default; it never forcibly stops Explorer or user applications. Silent success returns 3010 (restart required); preflight success returns 0.
 
-Development build 10 can upgrade directly to 2.0.0. Older native builds must be removed through Installed Apps first. Exact legacy version identifiers remain in migration checks and historical evidence to recognize existing installations.
+2.0.0 upgrades directly to 2.0.1. Development build 10 can first use the archived 2.0.0 installer, then 2.0.1. Other older native builds must be removed through Installed Apps first. Exact legacy version identifiers remain in migration checks and historical evidence to recognize existing installations.
 
 ## Development diagnostics
 
@@ -53,9 +53,10 @@ Physical EDIT / V / EDIT fixtures remain outside the distributed installer:
 ./native-ime/build-fixture.ps1
 ./native-ime/test-fixture-launch.ps1
 ./native-ime/test-installed-load.ps1
+./native-ime/test-installed-branding.ps1
 ```
 
-The last command is a read-only test against an already installed input method. It verifies both COM architectures, rejects the wrong DLL path and checks input selection preservation. Physical fixtures require deliberate developer operation; Setup never starts them.
+The last two commands are read-only tests against an already installed input method. They verify both COM architectures and shell brand extraction, reject foreign paths and unelevated brand mutation, and check input selection preservation. Physical fixtures require deliberate developer operation; Setup never starts them.
 
 The default DLL build without -Installable is fixture-only and cannot activate outside RiumImeFixture.exe. Builds never register or activate an input method. Installer rollback tests use disposable HKCU keys. Code signing, unattended updates, broader clean-machine coverage and remaining application scenarios are not included in this release.
 

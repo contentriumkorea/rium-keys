@@ -111,8 +111,6 @@ if($Operation -eq 'Upgrade'){
                 }finally{$key.Dispose()}
             }finally{$base.Dispose()}
         }
-        [void]$ready.Set()
-        if(!$done.WaitOne(600000) -or !$commit.WaitOne(0)){throw 'Upgrade was not committed by the ordinary-user verifier.'}
         # Snapshot BOTH views before writing: CTF keys can alias. Include the
         # icon path because early builds left it pointing at the original K icon.
         foreach($view in $views){
@@ -135,6 +133,12 @@ if($Operation -eq 'Upgrade'){
                 }finally{$key.Dispose()}
             }finally{$base.Dispose()}
         }
+        # Registry readback alone does not refresh Windows' input-switcher cache.
+        Invoke-Control -Arguments @('--refresh-branding',(Join-Path $root 'x64\RiumKeysInput.dll'))
+        # Branding is staged with COM, so ordinary-user checks can still reject
+        # it and roll both back before installed-app metadata is committed.
+        [void]$ready.Set()
+        if(!$done.WaitOne(600000) -or !$commit.WaitOne(0)){throw 'Upgrade was not committed by the ordinary-user verifier.'}
         $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',[Microsoft.Win32.RegistryView]::Registry64)
         try {
             $key=$base.OpenSubKey($uninstall,$true);$appChanged=$true
@@ -169,6 +173,11 @@ if($Operation -eq 'Upgrade'){
                 try {$key=$base.OpenSubKey($profileDescription,$true);try {
                     Set-RiumProfileBranding $key $oldBranding[$view] (Join-Path $root 'x64\RiumKeysInput.dll') -Restore
                 }finally{if($key){$key.Dispose()}}}finally{$base.Dispose()}
+            }catch{$rollbackErrors+=$_.Exception.Message}
+        }
+        if($oldBranding.Count -and !$rollbackErrors.Count){
+            try {
+                Invoke-Control -Arguments @('--refresh-branding',$oldBranding[[Microsoft.Win32.RegistryView]::Registry64].IconFile)
             }catch{$rollbackErrors+=$_.Exception.Message}
         }
         if($appChanged){
@@ -225,6 +234,7 @@ try {
     }
     $registrationAttempted=$true
     Invoke-Control -Arguments @('--register',(Join-Path $root 'x64\RiumKeysInput.dll'))
+    Invoke-Control -Arguments @('--verify-branding',(Join-Path $root 'x64\RiumKeysInput.dll'))
     [void]$ready.Set()
     if(!$done.WaitOne(600000) -or !$commit.WaitOne(0)){throw 'Installation was not committed by the user-session verifier.'}
     $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine',[Microsoft.Win32.RegistryView]::Registry64)
