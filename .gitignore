@@ -18,6 +18,10 @@
 !assets/contentrium-keys-indicators.png
 !assets/download-windows.svg
 !assets/contentrium-home.svg
+!assets/release-version.svg
+!assets/platform-windows.svg
+!assets/license-mit.svg
+!assets/input-shortcut-flow.svg
 !scripts/
 !scripts/build-brand-icon.ps1
 !scripts/build-mode-icons.ps1

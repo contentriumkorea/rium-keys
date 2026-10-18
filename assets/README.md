@@ -17,3 +17,5 @@ The Windows input indicator hosts a fixed brand icon and a separate changing mod
 `contentrium-keys-indicators.png` displays the three shipped PNG icons on an illustrative background. Original icon files, transparency and executable resources are unchanged. The README identifies this layout as an illustration, not a Windows screenshot.
 
 `download-windows.svg` and `contentrium-home.svg` are static, accessible link buttons with text, no scripts or embedded external content. They link separately to the installer and the company website. These presentation assets are not part of the 2.0.2 installer payload.
+
+The fixed README layout uses `release-version.svg`, `platform-windows.svg` and `license-mit.svg` for locally stored, factual badges. `input-shortcut-flow.svg` explains the input-field → supported editing-area → input-field flow; it is explicitly a diagram, not a product screenshot. These SVGs contain font-rendered text and geometry only, without scripts, external requests or font binaries.

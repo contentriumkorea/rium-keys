@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="450" viewBox="0 0 1440 450" role="img" aria-labelledby="title desc">
+  <title id="title">한글 입력과 단축키를 이어가는 사용 흐름</title>
+  <desc id="desc">입력칸에서 한글을 작성하고, 지원되는 편집 영역에서 원래 단축키를 사용한 다음, 입력칸으로 돌아와 한글을 계속 작성합니다. 실제 화면이 아닌 기능 설명도입니다.</desc>
+  <rect width="1440" height="450" rx="24" fill="#0d141c"/>
+  <g font-family="Malgun Gothic,Apple SD Gothic Neo,sans-serif">
+    <text x="48" y="64" fill="#edf6f3" font-size="34" font-weight="700">가 상태로 이어지는 편집 흐름</text>
+    <g fill="#192c35" stroke="#3d5961" stroke-width="2">
+      <rect x="48" y="108" width="380" height="222" rx="18"/>
+      <rect x="530" y="108" width="380" height="222" rx="18"/>
+      <rect x="1012" y="108" width="380" height="222" rx="18"/>
+    </g>
+    <g fill="#a7c1c4" font-size="25" text-anchor="middle">
+      <text x="238" y="158">01 · 입력칸</text>
+      <text x="720" y="158">02 · 지원되는 작업 영역</text>
+      <text x="1202" y="158">03 · 입력칸으로 복귀</text>
+    </g>
+    <g fill="#82e5c5" font-size="45" font-weight="700" text-anchor="middle">
+      <text x="238" y="231">한글 작성</text>
+      <text x="720" y="231">V · C</text>
+      <text x="1202" y="231">한글 계속</text>
+    </g>
+    <g fill="#e0eaee" font-size="23" text-anchor="middle">
+      <text x="238" y="288">검색·자막 등의 텍스트 입력</text>
+      <text x="720" y="288">원래 편집 단축키 사용</text>
+      <text x="1202" y="288">입력 상태를 유지해 작성</text>
+    </g>
+    <g stroke="#82e5c5" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <path d="M451 219h54m-13-13 13 13-13 13"/>
+      <path d="M933 219h54m-13-13 13 13-13 13"/>
+    </g>
+    <text x="48" y="389" fill="#b1c0ca" font-size="24">프로그램·버전·영역에 따라 지원 범위가 다릅니다.</text>
+    <text x="48" y="422" fill="#8398a5" font-size="20">기능 설명도 · 실제 Windows 또는 편집 프로그램 화면이 아닙니다.</text>
+  </g>
+</svg>
