@@ -75,3 +75,25 @@ checks above record the original publication, not the current public asset list.
 The 2.0.2 installer and checksum file are unchanged. Current installation
 instructions link to the latest release and explain removing older native
 versions before a fresh installation, without intermediate installer downloads.
+
+## Distribution presentation refresh — 2026-10-18
+
+The repository introduction and the existing release description were refreshed
+to the Contentrium Dev Skill presentation guidance. The README now has a
+project-specific cover, a prominent Windows installer link, the actual CK/가/A
+icons in an explicitly illustrative layout, concise installation instructions,
+support limits, and a separate Contentrium website button.
+
+This is a documentation/presentation republication of **the same 2.0.2 binary**.
+The existing tag and asset names are retained. The anonymous latest-download
+path returned the 676,411-byte installer and the 94-byte checksum file; both
+SHA-256 values matched the existing release assets. The installer digest remains
+`651429eda83e33232ed25fca0e7d2aebfaa8098ff81dbd91d7ba70f970f5e03e`.
+
+No new installer build, installation, registry test, editor trial or restart was
+performed for this refresh. Earlier test counts describe their original dates,
+not fresh runs. The unfinished online installer/automatic updater is excluded
+from this publication. The current release remains an installer containing its
+payload; it has no unattended updater. There is no portable ZIP because the
+input method requires Windows registration. Source archives are not portable
+applications. The six older releases remain drafts with their assets intact.

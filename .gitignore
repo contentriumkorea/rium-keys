@@ -14,6 +14,10 @@
 !assets/input-mode-*.png
 !assets/input-mode-*.ico
 !assets/README.md
+!assets/contentrium-keys-cover.png
+!assets/contentrium-keys-indicators.png
+!assets/download-windows.svg
+!assets/contentrium-home.svg
 !scripts/
 !scripts/build-brand-icon.ps1
 !scripts/build-mode-icons.ps1
