@@ -15,7 +15,7 @@ try {
     $app=Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeysInput' -ErrorAction SilentlyContinue
     $entry='install-local.ps1'
     if($app){
-        if($app.DisplayVersion -eq $config.UpgradeFrom){$entry='upgrade-local.ps1'}
+        if($app.DisplayVersion -in @(Get-RiumUpgradeVersions $config)){$entry='upgrade-local.ps1'}
         elseif($app.DisplayVersion -eq $config.Version){
             $expected=Join-Path $env:ProgramFiles ('RIUM Keys\'+$config.Version)
             if($app.InstallLocation -ne $expected){throw 'Unexpected installation location.'}

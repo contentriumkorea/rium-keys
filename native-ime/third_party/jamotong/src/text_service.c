@@ -308,12 +308,17 @@ static void OwnerQuarantine(JamotongTextService *obj) {
 }
 
 bool Jamotong_HasPendingTimers(void);
-static bool OwnerPassesCommand(JamotongTextService *obj, WPARAM key, UINT mods) {
-    RiumOwnerKind kind=RiumOwnerRuntime_AtBoundary(&obj->inputOwner,
-        !obj->pComposition && obj->fsm.state==STATE_EMPTY && !obj->cpPendingCommit &&
+static bool OwnerInputIdle(JamotongTextService *obj) {
+    return !obj->pComposition && obj->fsm.state==STATE_EMPTY && !obj->cpPendingCommit &&
         !obj->cpPendingInFlight && !obj->compFinalizePending && !Jamotong_InOurEdit() &&
-        !obj->compTargetCtx && !Jamotong_HasPendingTimers() &&
-        !obj->seqKb.pending[0] && !obj->seqKb.reading[0]);
+        !Jamotong_HasPendingTimers() && !obj->seqKb.pending[0] && !obj->seqKb.reading[0];
+}
+static bool OwnerPassesCommand(JamotongTextService *obj, WPARAM key, UINT mods) {
+    // Host termination can leave only the completed target reference behind.
+    // Release it before classification; Release may reenter, so check idle again.
+    if (OwnerInputIdle(obj) && obj->compTargetCtx) CompTarget_Clear(obj);
+    RiumOwnerKind kind=RiumOwnerRuntime_AtBoundary(&obj->inputOwner,
+        OwnerInputIdle(obj) && !obj->compTargetCtx);
     if (kind!=RIUM_OWNER_COMMAND) return false;
     OwnerQuarantine(obj);
     if (key<'A' || key>'Z' || mods) return false;

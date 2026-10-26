@@ -1,7 +1,8 @@
 @{
-    Version = '2.0.2'
-    FileVersion = '2.0.2.0'
-    UpgradeFrom = '2.0.1'
+    Version = '2.0.3'
+    FileVersion = '2.0.3.0'
+    UpgradeFrom = '2.0.2'
+    AlsoUpgradeFrom = @('2.0.1')
     Channel = 'manual-release'
     PayloadPaths = @(
         'x64\RiumKeysInput.dll', 'x86\RiumKeysInput.dll', 'x64\RiumKeysControl.exe',

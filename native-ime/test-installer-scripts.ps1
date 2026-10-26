@@ -31,7 +31,12 @@ $badConfig=@{PayloadPaths=@('..\escape')}
 Write-Manifest @([pscustomobject]@{Path='..\escape';Sha256=('A'*64)})
 Reject {Assert-RiumManifest $testRoot $badConfig} 'manifest traversal rejected even if configured'
 Reject {Assert-RiumCandidateVersion (Join-Path $testRoot 'x64\RiumKeysInput.dll') $config.Version} 'unversioned candidate rejected'
-Check ($config.Version -eq '2.0.2' -and $config.UpgradeFrom -eq '2.0.1' -and $config.Channel -eq 'manual-release') 'release upgrades the previous installed build'
+Check ($config.Version -eq '2.0.3' -and $config.UpgradeFrom -eq '2.0.2' -and $config.Channel -eq 'manual-release') 'release upgrades the previous installed build'
+Check ((Get-RiumUpgradeVersions $config) -contains '2.0.1') 'installed 2.0.1 upgrades directly'
+Check ((Get-RiumUpgradeVersions $config) -contains '2.0.2') 'installed 2.0.2 upgrades directly'
+Reject {Get-RiumUpgradeVersions @{Version='2.0.3';UpgradeFrom='..\foreign'}} 'upgrade source traversal rejected'
+Reject {Get-RiumUpgradeVersions @{Version='2.0.3';UpgradeFrom='2.0.3'}} 'upgrade to itself rejected'
+Reject {Get-RiumUpgradeVersions @{Version='2.0.3';UpgradeFrom='2.0.2';AlsoUpgradeFrom=@('2.0.2')}} 'duplicate upgrade sources rejected'
 $legacy=Join-Path $testRoot 'legacy'
 Check (!(Test-RiumLegacyMigration $legacy)) 'clean installation requires no legacy program'
 New-Item -ItemType Directory -Path $legacy | Out-Null
@@ -56,10 +61,18 @@ $hash=(Get-FileHash -LiteralPath $sentinel).Hash
 Reject {& (Join-Path $gateRoot 'prepare-package.ps1')} 'native test failure blocks packaging'
 Check ((Get-FileHash -LiteralPath $sentinel).Hash -eq $hash) 'native gate failure preserves previous package'
 Check (@(Get-ChildItem -LiteralPath (Join-Path $gateRoot 'out') -Directory).Count -eq 1) 'native gate runs before staging writes'
-# Real registry value types and aliased handles, only in a disposable HKCU key.
-$testKeyPath='Software\Contentrium\InstallerTests\'+[guid]::NewGuid()
-$testKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($testKeyPath)
-$alias=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($testKeyPath,$true)
+# Pure typed-value/alias model. Never create or rename host registry keys here.
+class RiumTestValues {
+    [hashtable]$Values=@{}
+    [hashtable]$Kinds=@{}
+    [object]GetValue([string]$Name){return $this.Values[$Name]}
+    [Microsoft.Win32.RegistryValueKind]GetValueKind([string]$Name){return $this.Kinds[$Name]}
+    [void]SetValue([string]$Name,[object]$Value){$this.SetValue($Name,$Value,[Microsoft.Win32.RegistryValueKind]::String)}
+    [void]SetValue([string]$Name,[object]$Value,[Microsoft.Win32.RegistryValueKind]$Kind){$this.Values[$Name]=$Value;$this.Kinds[$Name]=$Kind}
+    [void]Dispose(){}
+}
+$testKey=[RiumTestValues]::new()
+$alias=$testKey
 try {
     $productRoot=Join-Path $env:ProgramFiles 'RIUM Keys'
     $oldIcon=Join-Path $productRoot '2.0.0-preview.2\x64\RiumKeysInput.dll'
@@ -84,5 +97,5 @@ try {
         $testKey.SetValue('IconFile',(Join-Path $productRoot ($badVersion+'\x64\RiumKeysInput.dll')))
         Reject {Get-RiumProfileBranding $testKey $productRoot} "invalid branding version rejected: $badVersion"
     }
-} finally { $alias.Dispose(); $testKey.Dispose(); [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($testKeyPath) }
-Write-Output "Installer script contracts: $script:checks checks passed. Only disposable HKCU test values changed; no elevation or installation. Fixtures retained: $testRoot"
+} finally { $alias.Dispose(); $testKey.Dispose() }
+Write-Output "Installer script contracts: $script:checks checks passed. Typed-value model only; no registry writes, elevation or installation. Fixtures retained: $testRoot"

@@ -69,6 +69,7 @@
 !docs/release-2.0.0.md
 !docs/release-2.0.1.md
 !docs/release-2.0.2.md
+!docs/release-2.0.3.md
 !input-core/
 !input-core/*.h
 !input-core/*.cpp

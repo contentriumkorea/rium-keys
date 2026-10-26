@@ -19,9 +19,33 @@ static OwnerCommandEvidence AudioCandidate(OwnerSnapshot& s){
     s.parents[1].delegate.state=ORead;s.parents[1].delegate.colOffset=0;s.parents[1].delegate.typeRva=0x2B2B35B8;
     return e;
 }
+// The 2026-10-26 blank timeline focuses the existing route at its third
+// audited delegate. Derive that exact eight-node suffix from the old witness;
+// this is a synthetic regression, not another physical-input result.
+static OwnerCommandEvidence BlankTimeline(OwnerSnapshot& s){
+    auto e=TimelineWitness(s);
+    for(unsigned i=0;i<8;++i)s.parents[i]=s.parents[i+2];
+    for(unsigned i=8;i<kOwnerParents;++i)s.parents[i]={};
+    s.parentCount=8;s.focusNode=s.parents[0].object.pointer;s.focusToken=s.parents[0].selfToken;
+    return e;
+}
 int main(){
     auto s=std::make_unique<OwnerSnapshot>();OwnerNativeEditFacts edit{};auto e=TimelineWitness(*s);
     Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_COMMAND,"actual-timeline-witness-command");
+    e=BlankTimeline(*s);Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_COMMAND,"blank-timeline-eight-node-audited-suffix-command");
+    s->parentCount=9;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-other-depth-not-inferred-command");
+    e=BlankTimeline(*s);s->parentCount=7;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-truncated-chain-unknown");
+    e=BlankTimeline(*s);s->parents[0].delegate.vtable++;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-other-owner-unknown");
+    e=BlankTimeline(*s);s->parents[0].keyRva++;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-unknown-dispatch-unknown");
+    e=BlankTimeline(*s);s->parents[1].parentToken++;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-stale-parent-token-unknown");
+    e=BlankTimeline(*s);s->parents[0].callbackEmpty=0;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-custom-key-callback-unknown");
+    e=BlankTimeline(*s);s->windows[0].property.pointer++;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-different-native-window-unknown");
+    e=BlankTimeline(*s);e.samplesEqual=0;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-changing-metadata-unknown");
+    e=BlankTimeline(*s);e.loadedSpansVerified=0;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-unverified-image-unknown");
+    e=BlankTimeline(*s);e.dvaModifiers=2;s->modifiers=2;s->observerModifiers=2;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-shift-outside-command-domain");
+    e=BlankTimeline(*s);s->windows[0].property=Object(0x20000,0x265085F0);s->windows[0].propertyToken=101;s->windows[0].propertyRefcount=2;
+    edit.standardClass=1;edit.writable=1;edit.instanceProc=0x10000;edit.classProc=0x11000;
+    Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_TEXT,"blank-timeline-native-text-focus-remains-text");edit={};
     e=AudioTimelineWitness(*s);Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"original-audio-capture-unsupported-types-remain-unknown");
     e=AudioCandidate(*s);Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_COMMAND,"live-audio-route-plus-static-exact-type-proof-command");
     s->parents[0].delegate=Object(s->parents[0].delegate.pointer,0x272E8C50);Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"mixed-video-content-audio-track-rejected");

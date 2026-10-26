@@ -8,7 +8,9 @@ $config=Get-RiumPackageConfig $package
 $verifiedManifest=@(Assert-RiumManifest $package $config)
 foreach($architecture in @('x64','x86')){Assert-RiumCandidateVersion (Join-Path $package "$architecture\RiumKeysInput.dll") $config.Version}
 $target=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.Version)
-$previousRoot=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.UpgradeFrom)
+$previousVersion=(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeysInput').DisplayVersion
+if($previousVersion -notin @(Get-RiumUpgradeVersions $config)){throw 'Unsupported previous installed version.'}
+$previousRoot=Join-Path $env:ProgramFiles ("RIUM Keys\"+$previousVersion)
 $control=Join-Path $package 'x64\RiumKeysControl.exe'
 $stateKey='HKCU:\Software\Contentrium\RiumKeysInput'
 $previousStatePath=(Get-ItemProperty $stateKey -Name InstallState).InstallState
@@ -82,7 +84,7 @@ try {
                     }finally{if($key){$key.Dispose()}}}finally{$base.Dispose()}
                 }
                 $app=Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeysInput'
-                if($app.InstallLocation -ne $previousRoot -or $app.DisplayVersion -ne $config.UpgradeFrom){throw 'Installed-app rollback mismatch.'}
+                if($app.InstallLocation -ne $previousRoot -or $app.DisplayVersion -ne $previousVersion){throw 'Installed-app rollback mismatch.'}
                 $rollbackText=& $control --status
                 if($LASTEXITCODE){throw 'Cannot read rollback input state.'}
                 $rollback=$rollbackText | ConvertFrom-Json

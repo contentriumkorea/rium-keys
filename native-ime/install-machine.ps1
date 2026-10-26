@@ -64,7 +64,9 @@ $done=[Threading.EventWaitHandle]::OpenExisting("Local\RIUM.Keys.Install.$Transa
 $commit=[Threading.EventWaitHandle]::OpenExisting("Local\RIUM.Keys.Install.$Transaction.Commit")
 if($Operation -eq 'Upgrade'){
     # Reuse the existing profile and user defaults; only the versioned binaries change.
-    $previousRoot=Join-Path $env:ProgramFiles ("RIUM Keys\"+$config.UpgradeFrom)
+    $previousVersion=(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RiumKeysInput').DisplayVersion
+    if($previousVersion -notin @(Get-RiumUpgradeVersions $config)){throw 'Unsupported previous installed version.'}
+    $previousRoot=Join-Path $env:ProgramFiles ("RIUM Keys\"+$previousVersion)
     $changedViews=@();$oldBranding=@{};$oldAppValues=@{};$appChanged=$false;$transcript=$false;$upgradeCommitted=$false
     try {
         if(Test-Path -LiteralPath $root){throw 'New version directory already exists; refusing to overwrite.'}
@@ -82,7 +84,7 @@ if($Operation -eq 'Upgrade'){
             $key=$base.OpenSubKey($uninstall)
             if(!$key){throw 'Missing previous installed-apps entry.'}
             try {
-                if($key.GetValue('InstallLocation') -ne $previousRoot -or $key.GetValue('DisplayVersion') -ne $config.UpgradeFrom){throw 'Unexpected installed version.'}
+                if($key.GetValue('InstallLocation') -ne $previousRoot -or $key.GetValue('DisplayVersion') -ne $previousVersion){throw 'Unexpected installed version.'}
                 foreach($name in @('DisplayName','DisplayVersion','InstallLocation','DisplayIcon','UninstallString')){$oldAppValues[$name]=$key.GetValue($name)}
             }finally{$key.Dispose()}
         }finally{$base.Dispose()}

@@ -59,7 +59,14 @@ static HRESULT STDMETHODCALLTYPE context_qi(ITfContext *self, REFIID iid, void *
     }
     return E_NOINTERFACE;
 }
-static ULONG STDMETHODCALLTYPE context_ref(ITfContext *self) { (void)self; return 1; }
+static JamotongTextService *releaseReentryService;
+static ULONG STDMETHODCALLTYPE context_ref(ITfContext *self) {
+    if(releaseReentryService){
+        JamotongTextService *service=releaseReentryService;releaseReentryService=NULL;
+        service->cpPendingInFlight=TRUE;service->compTargetCtx=self;
+    }
+    return 1;
+}
 static HRESULT STDMETHODCALLTYPE context_status(ITfContext *self, TF_STATUS *status) {
     Context *ctx = (Context*)self;
     *status = ctx->status;
@@ -90,7 +97,11 @@ static HRESULT STDMETHODCALLTYPE no_selection(ITfContext *p,TfEditCookie ec,ULON
                                                TF_SELECTION *selection,ULONG *fetched) {
     (void)p;(void)ec;(void)index;(void)count;(void)selection;*fetched=0;return E_FAIL;
 }
+static JamotongTextService *watchedService;
+static int targetAtFirstOwnerRead=-1;
 static void fixture_owner(void *context, RiumOwnerStamp *out) {
+    if(watchedService && targetAtFirstOwnerRead<0)
+        targetAtFirstOwnerRead=watchedService->compTargetCtx!=NULL;
     *out=*(RiumOwnerStamp*)context;
 }
 static HRESULT STDMETHODCALLTYPE reject_session(ITfContext *p,TfClientId id,ITfEditSession *es,DWORD flags,HRESULT *result) {
@@ -173,6 +184,28 @@ int wmain(int argc, wchar_t **argv) {
     check(wants(sink,&ctx.iface),"verified text target retains the Korean key");
     logicalOwner.kind=RIUM_OWNER_COMMAND;logicalOwner.logicalObject=201;logicalOwner.lifetimeToken=302;
     pendingRequests=0;
+    service->compTargetCtx=&ctx.iface;service->compTargetFocusHwnd=owner;
+    watchedService=service;targetAtFirstOwnerRead=-1;
+    check(!wants(sink,&ctx.iface)&&targetAtFirstOwnerRead==0&&!service->compTargetCtx,
+          "completed input target is released before first command observation");
+    for(int busy=0;busy<4;++busy){
+        service->compTargetCtx=&ctx.iface;service->compTargetFocusHwnd=owner;
+        if(busy==0)service->cpPendingCommit=L'\ud55c';
+        if(busy==1)service->cpPendingInFlight=TRUE;
+        if(busy==2)service->compFinalizePending=TRUE;
+        if(busy==3)service->seqKb.pending[0]=L'a';
+        targetAtFirstOwnerRead=-1;
+        check(!wants(sink,&ctx.iface)&&targetAtFirstOwnerRead==1&&service->compTargetCtx==&ctx.iface,
+              "pending input target survives command precheck");
+        service->cpPendingCommit=0;service->cpPendingInFlight=FALSE;
+        service->compFinalizePending=FALSE;service->seqKb.pending[0]=0;
+    }
+    targetAtFirstOwnerRead=-1;releaseReentryService=service;
+    check(!wants(sink,&ctx.iface)&&!releaseReentryService&&targetAtFirstOwnerRead==1&&
+          service->cpPendingInFlight&&service->compTargetCtx==&ctx.iface,
+          "completed target Release preserves reentrant pending input");
+    service->cpPendingInFlight=FALSE;
+    watchedService=NULL;service->compTargetCtx=NULL;service->compTargetFocusHwnd=NULL;
     check(!wants(sink,&ctx.iface),"same HWND and context passes first V at a verified command target");
     BOOL routed=TRUE;
     check(SUCCEEDED(sink->lpVtbl->OnKeyDown(sink,&ctx.iface,'V',0x002f0001,&routed))&&!routed,

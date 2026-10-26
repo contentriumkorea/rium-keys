@@ -13,7 +13,16 @@ function Get-RiumPackageConfig([string]$Directory) {
         throw 'Invalid release package configuration.'
     }
     if (@($config.PayloadPaths).Count -ne @($config.PayloadPaths | Sort-Object -Unique).Count) { throw 'Duplicate configured payload.' }
+    [void](Get-RiumUpgradeVersions $config)
     return $config
+}
+function Get-RiumUpgradeVersions($Config) {
+    $versions=@($Config.UpgradeFrom)+@($Config.AlsoUpgradeFrom | Where-Object {$_})
+    if($versions.Count -ne @($versions | Sort-Object -Unique).Count){throw 'Duplicate upgrade source version.'}
+    foreach($version in $versions){
+        if($version -isnot [string] -or $version -notmatch '^2\.[0-9]+\.[0-9]+(-preview\.[1-9][0-9]*)?$' -or $version -eq $Config.Version){throw 'Invalid upgrade source version.'}
+    }
+    return $versions
 }
 function Resolve-RiumPackageRoot([string]$ScriptDirectory, [string]$PackageRoot) {
     if (!$PackageRoot) {
