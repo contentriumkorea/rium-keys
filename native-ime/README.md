@@ -1,7 +1,7 @@
 # CONTENTRIUM Keys native input engine
 
-Current release: **2.0.2**, Windows x64.
-[Installation](../docs/installation.md) · [Release evidence](../docs/release-2.0.2.md) · [Application evidence](../docs/input-owner-validation.md).
+Current release: **2.0.5**, Windows x64.
+[Installation](../docs/installation.md) · [Release evidence](../docs/release-2.0.5.md) · [Application evidence](../docs/input-owner-validation.md).
 
 This native TSF input method is based on Jamotong and replaces the 1.1.1 tray helper. Windows loads it when selected, without a companion hook/UIA process or startup executable. Native updates are installed manually. The legacy updater retains its unchanged signed 1.1.1 manifest and never automatically installs the native input method.
 
@@ -9,7 +9,7 @@ This native TSF input method is based on Jamotong and replaces the 1.1.1 tray he
 
 Hangul is composed in ordinary input fields. Original keys pass through when there is positive evidence of a command surface. Generic TSF restrictions apply across applications; exact-build DVA, CCL and AE providers inspect bounded metadata after module verification. This does not prove every application or future version is supported. See [provider boundaries](providers/README.md).
 
-Premiere 26.5.2.5 and Studio One 6.6.4.102451 passed the physical transitions recorded for development build 8. Earlier branding and installer releases retained that routing/composition code. Version 2.0.3 additionally fixes the audited blank timeline suffix and completed-target cleanup order. After Effects shortcut/return-to-text verification remains incomplete. Automatic installation checks do not substitute for application validation.
+Version 2.0.5 physically passed the recorded Premiere 26.5.2.5 search/time-ruler/first-P and limited window-switch transitions, plus After Effects 26.5.0.89 search, canvas text, first-H and return-to-search transitions. It includes the 2.0.3 cleanup ordering and the newer audited navigation-filter and paired time-ruler paths. Studio One 6.6.4.102451 physical evidence remains from development build 8. Automatic installation checks do not substitute for application validation; these results do not cover every panel, shortcut or future build.
 
 Mode resource 101 is white **가** for Hangul layouts; 102 is white **A** for Latin/direct input. Switches notify the shell. Resource 100 is the separate CK brand icon. Windows owns placement and each private HICON returned to it.
 
@@ -43,7 +43,7 @@ Setup runs as the ordinary user. Only machine registration requests UAC. PowerSh
 
 The load check never activates a profile, attaches an input sink or opens a window. No typing test is part of installation. A failed check blocks commit and preserves recovery files. Same-version setup verifies files, registration, shell brand extraction, ownership and loadability without reinstalling. The ordinary-user refresh requests shell icon-cache invalidation. Setup offers a Windows restart with Later selected by default; it never forcibly stops Explorer or user applications. Silent success returns 3010 (restart required); preflight success returns 0.
 
-2.0.1 and 2.0.2 upgrade directly to 2.0.3. Version 2.0.0 can first use the archived 2.0.1 installer. Development build 10 starts with the archived 2.0.0 installer, then follows that sequence. Other older native builds must be removed through Installed Apps first. Exact legacy version identifiers remain in migration checks and historical evidence to recognize existing installations.
+2.0.1 through 2.0.4 upgrade directly to 2.0.5. Version 2.0.0, development build 10 and older native builds must first switch to Microsoft Korean IME, remove the old input method through Installed Apps and restart Windows before a fresh installation. Archived draft installers are not required. Exact legacy version identifiers remain in migration checks and historical evidence to recognize existing installations.
 
 ## Development diagnostics
 

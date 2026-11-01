@@ -53,6 +53,9 @@ rejects an application-owned class merely named `Edit`.
 Passing these contracts is not evidence that physical typing works in an
 application. Installation, the actual loaded DLL path, original shortcut
 delivery, uncommitted text transitions, and return-to-text behavior require
-separate application tests before release. The installed preview.8 Premiere and
-Studio One functional results, remaining After Effects checks, and precise limits
-are recorded in [input-owner validation](../../docs/input-owner-validation.md).
+separate application tests before release. Version 2.0.5 physically verifies
+limited Premiere search/time-ruler/first-P and After Effects search/canvas-text/
+first-H/return-to-search transitions. Studio One physical evidence remains from
+development build 8. Results and precise limits are recorded in
+[2.0.5 release evidence](../../docs/release-2.0.5.md) and
+[input-owner validation](../../docs/input-owner-validation.md).

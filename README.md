@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/contentriumkorea/rium-keys/releases/latest"><img src="assets/release-version.svg" alt="현재 정식 버전 2.0.3" width="112"></a>
+  <a href="https://github.com/contentriumkorea/rium-keys/releases/latest"><img src="assets/release-version.svg" alt="현재 정식 버전 2.0.5" width="112"></a>
   <a href="#적용-범위와-제한"><img src="assets/platform-windows.svg" alt="Windows x64용 한글 입력기" width="112"></a>
   <a href="LICENSE"><img src="assets/license-mit.svg" alt="MIT License" width="102"></a>
 </p>
@@ -36,7 +36,7 @@
 2. 등록 단계의 Windows 관리자 확인창에서 **예**를 누르고 자동 점검 후 마칩니다. 직접 타이핑하는 시험은 없으며 재시작 시점은 선택할 수 있습니다.
 3. **Windows + Space → CONTENTRIUM Keys**를 선택합니다.
 
-설치 파일은 **약 661KB**입니다. [SHA-256 확인](https://github.com/contentriumkorea/rium-keys/releases/latest/download/SHA256SUMS.txt) · [상세 설치 및 업데이트 안내 →](docs/installation.md)
+설치 파일은 **약 664KB**입니다. [SHA-256 확인](https://github.com/contentriumkorea/rium-keys/releases/latest/download/SHA256SUMS.txt) · [상세 설치 및 업데이트 안내 →](docs/installation.md)
 
 ## 한글과 단축키 사이, 전환을 줄이세요
 
@@ -81,12 +81,12 @@
 | 방식 | 사용 방법 |
 | :--- | :--- |
 | **Windows 설치 파일** | 본체가 포함된 `CONTENTRIUM-Keys-Setup.exe`를 받습니다. Windows가 선택된 입력기를 불러오므로 별도 트레이 유틸리티나 자동 실행 EXE를 켜지 않습니다. |
-| **기존 설치 업데이트** | 2.0.1은 같은 EXE로 업데이트할 수 있습니다. 2.0.0과 그보다 오래된 입력기는 [버전별 설치 순서](docs/installation.md#기존-버전에서-설치)를 먼저 확인하세요. |
-| **온라인 설치·자동 업데이트** | 현재 공개판 2.0.3에는 포함하지 않습니다. 새 버전은 GitHub에서 설치 파일을 받아 설치합니다. |
+| **기존 설치 업데이트** | 2.0.1~2.0.4는 같은 EXE로 업데이트할 수 있습니다. 2.0.0과 그보다 오래된 입력기는 [버전별 설치 순서](docs/installation.md#기존-버전에서-설치)를 먼저 확인하세요. |
+| **온라인 설치·자동 업데이트** | 현재 공개판 2.0.5에는 포함하지 않습니다. 새 버전은 GitHub에서 설치 파일을 받아 설치합니다. |
 | **포터블 ZIP** | Windows 입력기 등록이 필요하므로 제공하지 않습니다. `Source code.zip`은 설치 파일이나 포터블 앱이 아닙니다. |
 | **제거·복구** | Windows 설정 → 앱 → 설치된 앱 → CONTENTRIUM Keys → 제거. 설치 전 입력기로 복구하며 개인 설정과 복구 기록은 보존합니다. |
 
-최신 정식판만 공개하고 이전 릴리스·첨부파일은 삭제하지 않고 비공개 초안으로 보관합니다. 2.0.1·2.0.2 사용자는 같은 설치 파일로 2.0.3으로 업데이트할 수 있습니다.
+최신 정식판만 공개하고 이전 릴리스·첨부파일은 삭제하지 않고 비공개 초안으로 보관합니다. 2.0.1~2.0.4 사용자는 같은 설치 파일로 2.0.5로 업데이트할 수 있습니다.
 
 ## 이렇게 사용하세요
 
@@ -103,9 +103,9 @@ Windows + Space → CONTENTRIUM Keys 선택
 
 ## 적용 범위와 제한
 
-- **확인된 환경:** 표준 Windows 입력칸·버튼, Premiere Pro 26.5.2.5와 Studio One 6.6.4.102451의 일부 시험 경로입니다. After Effects 26.5.0.89는 실제 단축키와 입력칸 복귀를 추가 검증해야 합니다.
+- **확인된 환경:** 표준 Windows 입력칸·버튼과 일부 편집 영역입니다. 2.0.5에서 Premiere Pro 26.5.2.5의 검색·타임라인 전환과 After Effects 26.5.0.89의 검색·컴포지션 텍스트·첫 H 단축키·검색칸 복귀를 실제로 확인했습니다. Studio One 6.6.4.102451의 실기 기록은 이전 개발 빌드 기준입니다.
 - **설치 조건:** Windows ARM64·32비트 운영체제는 지원 대상으로 검증하지 않았습니다. 설치 파일에는 Windows 게시자 코드 서명이 없습니다. 재시작을 미루면 기존 앱이나 작업 표시줄에 이전 입력기·아이콘이 남을 수 있습니다.
-- **개인정보:** 입력·문서 내용을 서버로 전송하지 않습니다. 2.0.3 입력기 자체는 업데이트 확인 통신도 하지 않습니다. 설정·복구 기록·설치 로그는 PC에 보관합니다.
+- **개인정보:** 입력·문서 내용을 서버로 전송하지 않습니다. 2.0.5 입력기 자체는 업데이트 확인 통신도 하지 않습니다. 설정·복구 기록·설치 로그는 PC에 보관합니다.
 
 <details>
 <summary><strong>상세 안내와 검증 범위</strong></summary>
@@ -113,14 +113,15 @@ Windows + Space → CONTENTRIUM Keys 선택
 | 환경 | 확인한 경로 | 아직 확인하지 못한 범위 |
 | :--- | :--- | :--- |
 | 표준 Windows 입력칸 / 버튼 | 한글 → 원래 V 단축키 → 한글, 조합·입력 상태 유지 | 자체 제작 입력창 전반 |
-| Premiere Pro **26.5.2.5** | 검색·자막·오디오/비디오 타임라인·선택된 그래픽의 시험 경로, 입력칸 복귀 후 한글 조합 | 다른 버전·추가 패널·빠른 연속 입력 전반 |
+| Premiere Pro **26.5.2.5** | 2.0.5: 프로젝트·효과 검색 후 시간 눈금자의 첫 P, 창 전환·한글 재입력. 자막·선택된 그래픽 등은 이전 개발 빌드 기록 | 다른 버전·추가 패널·빠른 연속 입력 전반 |
 | Studio One **6.6.4.102451** | 검색 → 작업 영역 C 단축키 → 검색, 앱 전환 후 시험 경로 | 다른 버전·나머지 입력칸 |
-| After Effects **26.5.0.89** | 한글 입력 일부·입력 위치 판별 | 실제 단축키·입력칸 복귀 |
+| After Effects **26.5.0.89** | 2.0.5: 프로젝트·효과 검색의 한글 조합, 타임라인·컴포지션의 첫 H, 컴포지션 텍스트 입력 후 첫 H와 검색칸 복귀 | 다른 버전·추가 패널·장시간·빠른 연속 입력 전반 |
 
-Premiere·Studio One의 과거 실기 결과는 개발 빌드 8에서 확인했습니다. 2.0.3은 빈 타임라인의 단축키 판별과 한글 입력 완료 후 첫 단축키의 처리 순서를 보완합니다. 과거 실기 기록과 이번 버전의 검증 범위는 아래 기록에서 구분합니다.
+Premiere·Studio One의 과거 실기 결과는 개발 빌드 8에서 확인했습니다. 2.0.5는 한글 입력 완료 후 첫 단축키 처리와 함께 Premiere의 시간 눈금자·일부 내부 필터 경로를 보완합니다. 에펙 실기 시험에서는 추가 결함이 재현되지 않았습니다. 모든 프로그램·패널·미래 버전의 동작을 보장하는 결과는 아닙니다.
 
 - [설치·업데이트·제거·복구와 로그 위치](docs/installation.md)
 - [프로그램별 입력·단축키 검증](docs/input-owner-validation.md)
+- [2.0.5 변경 내용과 실제 검증 범위](docs/release-2.0.5.md)
 - [2.0.3 검증 기록과 한계](docs/release-2.0.3.md)
 - [2.0.1 검증 기록](docs/release-2.0.1.md)
 - [버전별 내부 지원 범위](native-ime/providers/README.md)
@@ -136,7 +137,7 @@ Premiere·Studio One의 과거 실기 결과는 개발 빌드 8에서 확인했�
 
 CONTENTRIUM Keys is a two-set Korean input method for Windows x64. Compose Korean in text fields and use the original shortcuts in supported editing areas without switching to English. Compatibility depends on the application version and surface; universal compatibility is not guaranteed.
 
-The current release is **2.0.3**. Use the Windows installer and retain Microsoft Korean IME as the recovery input method. There is no portable package, online bootstrap installer or automatic updater in this release. The installer is not publisher code-signed. Input and document contents are not sent to a server.
+The current release is **2.0.5**. Premiere Pro 26.5.2.5 and After Effects 26.5.0.89 passed the limited physical transitions documented in the release record. Use the Windows installer and retain Microsoft Korean IME as the recovery input method. There is no portable package, online bootstrap installer or automatic updater in this release. The installer is not publisher code-signed. Input and document contents are not sent to a server.
 
 </details>
 

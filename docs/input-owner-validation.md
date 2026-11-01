@@ -289,6 +289,24 @@ validated by these checks; the stable updater is unchanged.
 
 Only verified application behavior can expand the documented support scope.
 
+## 2.0.5 installed application verification — 2026-11-02
+
+The installed 2.0.5.0 service passed the limited physical transitions documented
+in the [2.0.5 release record](release-2.0.5.md). Premiere Pro 26.5.2.5 passed Korean
+Project/Effects search, time-ruler click, first P, search reentry and two completed
+external-window-switch cycles. The previous time-ruler failure was reproduced
+before the fix. After Effects 26.5.0.89 passed Korean Project/Effects search,
+first H on timeline/composition, Korean canvas text-layer entry, first H after
+leaving that text layer, and return to Korean search input. Actual alphabet-key
+events were used; programmatic Unicode value writes were not counted as IME
+typing. Neither test used the Hangul/English toggle.
+
+Both applications loaded the installed 2.0.5.0 DLL. These tests supersede the
+earlier unverified status for those specific AE transitions, not for every panel
+or key combination. The existing AE provider required no code changes in this
+release. Long-duration, very-fast-input and other-version coverage remains open;
+the older Studio One evidence has not been refreshed.
+
 ## Preview.10 status display and public installer
 
 Preview.10 separates the white 가/A mode button from the fixed CK profile brand,
