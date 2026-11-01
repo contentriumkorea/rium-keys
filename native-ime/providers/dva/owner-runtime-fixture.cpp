@@ -32,6 +32,37 @@ static OwnerCommandEvidence BlankTimeline(OwnerSnapshot& s){
 int main(){
     auto s=std::make_unique<OwnerSnapshot>();OwnerNativeEditFacts edit{};auto e=TimelineWitness(*s);
     Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_COMMAND,"actual-timeline-witness-command");
+    // Exact types observed in the failing ALL PANELS workspace; all other
+    // fields derive from the independently recorded timeline/monitor witness.
+    for(unsigned mode=0;mode<2;++mode)for(unsigned type=0;type<2;++type){
+        e=mode?BlueEntryV8FocusedWitness(*s):TimelineWitness(*s);
+        auto& set=s->filters[1];auto& f=set.entries[set.count++];f={};
+        f.object={0x700000,type?0x26539E80u:0x264FACF0u,0,type?0x2AFBA1F0u:0x2AFB9E18u,ORead,1};
+        f.token=f.selfToken=701;f.pairMatched=f.callbackEmpty=1;f.refcount=1;
+        f.virtual88=type?0x19178C10:0x1915D250;f.filterRva=type?0x192D1C50:0x191D3D10;
+        f.dialogDisabledKnown=1;f.resolvedParent={0,1};
+        for(unsigned i=0;i<s->parentCount;++i)s->parents[i].resolvedParent={s->parents[i].parent,1};
+        for(unsigned key='A';key<='Z';++key){e.virtualKey=e.mappedCharacter=key;
+            Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_COMMAND,mode?"monitor-navigation-filter-preserves-letter-shortcut":"timeline-navigation-filter-preserves-letter-shortcut");}
+        if(type){
+            s->parents[0].resolvedParent.parent++;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"dialog-registry-parent-differs-from-valid-cache-rejected");s->parents[0].resolvedParent.parent--;
+            s->parents[0].resolvedParent.known=0;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"dialog-unresolved-registry-parent-rejected");s->parents[0].resolvedParent.known=1;
+            f.resolvedParent={0xBAD000,1};Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"dialog-own-parent-outside-audited-route-rejected");f.resolvedParent={0,1};
+            f.dialogDisabledKnown=0;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"dialog-unknown-early-guard-rejected");f.dialogDisabledKnown=1;
+        }
+        f.callbackEmpty=0;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"navigation-filter-custom-callback-still-blocked");f.callbackEmpty=1;
+        f.pairMatched=0;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"navigation-filter-stale-token-still-blocked");f.pairMatched=1;
+        f.filterRva++;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"navigation-filter-changed-handler-still-blocked");f.filterRva--;
+        f.virtual88++;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"navigation-filter-changed-policy-still-blocked");f.virtual88--;
+        f.object.typeRva++;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"navigation-filter-wrong-type-still-blocked");f.object.typeRva--;
+        e.virtualKey='\t';e.mappedCharacter='\t';Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"navigation-filter-does-not-approve-tab");
+        e.virtualKey=e.mappedCharacter='P';e.dvaModifiers=2;s->modifiers=s->observerModifiers=2;
+        Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"navigation-filter-does-not-expand-modified-key-domain");
+        e.dvaModifiers=0;s->modifiers=s->observerModifiers=0;
+        s->windows[0].property=Object(0x20000,0x265085F0);s->windows[0].propertyToken=101;s->windows[0].propertyRefcount=2;
+        edit.standardClass=edit.writable=1;edit.instanceProc=0x10000;edit.classProc=0x11000;
+        Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_TEXT,"navigation-filter-does-not-steal-native-text-input");edit={};
+    }
     e=BlankTimeline(*s);Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_COMMAND,"blank-timeline-eight-node-audited-suffix-command");
     s->parentCount=9;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-other-depth-not-inferred-command");
     e=BlankTimeline(*s);s->parentCount=7;Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"blank-timeline-truncated-chain-unknown");

@@ -1,28 +1,10 @@
 #include "owner-command-classifier.h"
+#include "owner-filter-policy.h"
 
 static bool Is(const OwnerObject& o, uint32_t vt) {
     if (!o.pointer || o.state != ORead || o.vtable != vt) return false;
     for (const auto& c : kOwnerTypes) if (c.vtable == vt) return o.colOffset == c.offset && o.typeRva == c.type;
     return false;
-}
-static bool BaseNode(uint32_t vt) {
-    return vt==0x27878AA8 || vt==0x26E30F30 || vt==0x27875E58 || vt==0x26E182C8;
-}
-static bool ExcludesLetters(const OwnerFilter& f, bool pre) {
-    if (!f.refcount || !f.token || f.token != f.selfToken || !f.pairMatched || !f.callbackEmpty ||
-        !Is(f.object,f.object.vtable) || f.virtual88 != 0x1915D250) return false;
-    // Count1 is live. The application's temporary AddRef means it must not be
-    // treated as disabled. These exact handlers exclude A-Z even when called.
-    if (pre) return BaseNode(f.object.vtable) && f.filterRva==0x191627C0;
-    if (BaseNode(f.object.vtable)) return f.filterRva==0x191627D0;
-    switch (f.object.vtable) {
-    case 0x2655DA38: return f.filterRva==0x193A5340; // TabWell: Space only.
-    case 0x26ECAD08: return f.filterRva==0x1F0EF580; // Return/numpadReturn/Escape.
-    case 0x26ECCA08: return f.filterRva==0x1F1070E0;
-    case 0x2776D2E8: case 0x2776DA20: return f.filterRva==0x191627D0;
-    case 0x27941B78: return f.filterRva==0x235EED60; // Backspace/Delete.
-    default: return false;
-    }
 }
 OwnerCommandResult OwnerClassifyCommand(const OwnerCommandEvidence& e) {
     using Why=OwnerCommandReason;
@@ -78,7 +60,7 @@ OwnerCommandResult OwnerClassifyCommand(const OwnerCommandEvidence& e) {
     for (unsigned f=0;f<2;++f) {
         const auto& set=s.filters[f];
         if (set.state!=ORead || set.count>kOwnerFilters) return unknown(Why::Filter);
-        for (unsigned i=0;i<set.count;++i) if (!ExcludesLetters(set.entries[i],f==0)) return unknown(Why::Filter);
+        for (unsigned i=0;i<set.count;++i) if (!OwnerFilterExcludesLetters(set.entries[i],f==0,s)) return unknown(Why::Filter);
     }
     return {OwnerCommandClass::TimelineCommandCandidate,Why::None};
 }

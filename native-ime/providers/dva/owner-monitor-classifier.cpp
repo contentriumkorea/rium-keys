@@ -1,4 +1,5 @@
 #include "owner-monitor-classifier.h"
+#include "owner-filter-policy.h"
 static bool Is(const OwnerObject& o,uint32_t vt){
     if(!o.pointer||o.state!=ORead||o.vtable!=vt)return false;
     for(const auto& c:kOwnerTypes)if(c.vtable==vt)return o.colOffset==c.offset&&o.typeRva==c.type;
@@ -6,19 +7,7 @@ static bool Is(const OwnerObject& o,uint32_t vt){
 }
 static bool Filters(const OwnerSnapshot& s){
     for(unsigned f=0;f<2;++f){const auto& set=s.filters[f];if(set.state!=ORead||set.count>kOwnerFilters)return false;
-        for(unsigned i=0;i<set.count;++i){const auto& e=set.entries[i];
-            if(!Is(e.object,e.object.vtable)||!e.refcount||!e.token||e.token!=e.selfToken||!e.pairMatched||!e.callbackEmpty||e.virtual88!=0x1915D250)return false;
-            const auto vt=e.object.vtable;const bool base=vt==0x27878AA8||vt==0x26E30F30||vt==0x27875E58||vt==0x26E182C8;
-            if(f==0){if(!base||e.filterRva!=0x191627C0)return false;continue;}
-            if(base&&e.filterRva==0x191627D0)continue;
-            switch(vt){
-            case 0x2655DA38:if(e.filterRva==0x193A5340)continue;break;
-            case 0x26ECAD08:if(e.filterRva==0x1F0EF580)continue;break;
-            case 0x26ECCA08:if(e.filterRva==0x1F1070E0)continue;break;
-            case 0x2776D2E8:case 0x2776DA20:if(e.filterRva==0x191627D0)continue;break;
-            case 0x27941B78:if(e.filterRva==0x235EED60)continue;break;
-            }return false;
-        }
+        for(unsigned i=0;i<set.count;++i)if(!OwnerFilterExcludesLetters(set.entries[i],f==0,s))return false;
     }return true;
 }
 static bool InitializedScalarDefault(const OwnerMonitor& m){

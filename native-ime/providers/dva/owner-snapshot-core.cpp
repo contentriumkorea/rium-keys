@@ -34,6 +34,41 @@ OwnerObject OwnerReadObject(OwnerReader& r, uintptr_t p) {
     return out;
 }
 static bool Is(const OwnerObject& o, uint32_t vt) { return o.state == ORead && o.vtable == vt; }
+OwnerParentResolution OwnerResolveParent(OwnerReader& r,uintptr_t object){
+    const auto token=r.Ptr(object+0x1F0);
+    if(r.failed||r.limited)return {};
+    if(!token)return {0,1};
+    const uint32_t epoch=r.U32(r.base+0x2D2C6B00);
+    if(!epoch||epoch==UINT32_MAX)return {};
+    uint64_t hash=0xCBF29CE484222325ULL;
+    for(unsigned i=0;i<8;++i){hash^=(token>>(i*8))&0xFF;hash*=0x100000001B3ULL;}
+    const auto shard=r.base+0x2D206AC0+(hash&0xFFF)*0xC0;
+    if(r.U32(shard+0x8C)==0x7FFFFFFF)return {};
+    const auto map=shard+0x90,sentinel=r.Ptr(map+8),count=r.Ptr(map+0x10);
+    const auto begin=r.Ptr(map+0x18),end=r.Ptr(map+0x20),capacity=r.Ptr(map+0x28);
+    const auto mask=r.Ptr(map+0x30),maxidx=r.Ptr(map+0x38);
+    if(r.failed||r.limited||!sentinel||!begin||mask>65535||((mask+1)&mask)||maxidx!=mask+1||
+       end<begin||capacity<end||end-begin!=(mask+1)*16||capacity-begin>16*65536||count>1048576)return {};
+    const auto bucket=begin+(hash&mask)*16,last=r.Ptr(bucket),first=r.Ptr(bucket+8);
+    uintptr_t visited[64]{},current=first;
+    for(unsigned i=0;i<64&&!r.failed&&!r.limited;++i){
+        if(current==sentinel)return {0,1};
+        if(!current)return {};
+        for(unsigned j=0;j<i;++j)if(visited[j]==current)return {};
+        visited[i]=current;
+        if(r.Ptr(current+0x10)==token){
+            const auto value=r.Ptr(current+0x18);
+            // Strong fallback can release an arbitrary cached object. Only
+            // direct weak-tag resolution has no application virtual calls.
+            if(r.failed||r.limited||!(value&1))return {};
+            if(epoch!=r.U32(r.base+0x2D2C6B00)||r.failed||r.limited)return {};
+            return {value&~uintptr_t(1),1};
+        }
+        if(current==last)return {0,1};
+        current=r.Ptr(current+8);
+    }
+    return {};
+}
 static uintptr_t Intern(OwnerReader& r, uintptr_t wrapper) {
     const auto raw = r.Ptr(wrapper); return raw ? r.Ptr(raw + 0x10) : 0;
 }
@@ -276,6 +311,10 @@ static void Collect(OwnerReader& r,const OwnerInputs& in,OwnerSnapshot* out,Owne
             if (!e.refcount) { ++out->zeroRefcounts; continue; }
             e.virtual88 = Slot(r, e.object, 0x88); e.filterRva = Slot(r, e.object, f == 0 ? 0x180 : 0x188);
             e.callback = r.Ptr(p + (f == 0 ? 0x410 : 0x3F8)); e.callbackEmpty = Empty(r, e.callback);
+            if(f==1&&Is(e.object,0x26539E80)){
+                uint8_t disabled=0;e.dialogDisabledKnown=r.Get(p+0x607,&disabled);e.dialogDisabled=disabled;
+                if(e.dialogDisabledKnown&&!disabled)e.resolvedParent=OwnerResolveParent(r,p);
+            }
         }
     }
     if(full){
@@ -283,6 +322,11 @@ static void Collect(OwnerReader& r,const OwnerInputs& in,OwnerSnapshot* out,Owne
         out->specialTree = r.Ptr(m + 0xF0); out->specialTreeEmpty = Empty(r, out->specialTree);
         out->modifiers = r.Byte(m + 0x208); out->observerModifiers = r.Byte(r.base + 0x2D3E1370);
         out->observerEnabled = r.Byte(r.base + 0x2D3E1B19); out->observer = OwnerReadObject(r, r.Ptr(r.base + 0x2D3E1B38));
+    }
+    bool dialogFocus=false;
+    if(full)for(unsigned i=0;i<out->filters[1].count&&i<kOwnerFilters;++i){
+        const auto& f=out->filters[1].entries[i];
+        if(Is(f.object,0x26539E80)&&f.dialogDisabledKnown&&!f.dialogDisabled)dialogFocus=true;
     }
     uintptr_t p = out->focusPairMatched ? out->focusNode : 0;
     for (unsigned i = 0; p && i < kOwnerParents && !r.failed && !r.limited; ++i) {
@@ -294,6 +338,7 @@ static void Collect(OwnerReader& r,const OwnerInputs& in,OwnerSnapshot* out,Owne
         n.refcount = r.U32(p + 0x18);
         if (!n.refcount) { ++out->zeroRefcounts; out->chainState = OUnknown; break; }
         n.selfToken = r.Ptr(p + 0x10); n.parentToken = r.Ptr(p + 0x1F0); n.parent = r.Ptr(p + 0x1F8);
+        if(dialogFocus)n.resolvedParent=OwnerResolveParent(r,p);
         n.flags = r.U32(p + 0x204);
         if(full){n.callback=r.Ptr(p+0x428);n.callbackEmpty=Empty(r,n.callback);n.keyRva=Slot(r,n.object,0x190);}
         uintptr_t off = Is(n.object, 0x26E30F30) ? 0x520 : Is(n.object, 0x27878AA8) ? 0x540 :

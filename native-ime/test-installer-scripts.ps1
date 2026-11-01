@@ -31,7 +31,8 @@ $badConfig=@{PayloadPaths=@('..\escape')}
 Write-Manifest @([pscustomobject]@{Path='..\escape';Sha256=('A'*64)})
 Reject {Assert-RiumManifest $testRoot $badConfig} 'manifest traversal rejected even if configured'
 Reject {Assert-RiumCandidateVersion (Join-Path $testRoot 'x64\RiumKeysInput.dll') $config.Version} 'unversioned candidate rejected'
-Check ($config.Version -eq '2.0.3' -and $config.UpgradeFrom -eq '2.0.2' -and $config.Channel -eq 'manual-release') 'release upgrades the previous installed build'
+Check ($config.Version -eq '2.0.4' -and $config.UpgradeFrom -eq '2.0.3' -and $config.Channel -eq 'manual-release') 'release upgrades the previous installed build'
+Check ((Get-RiumUpgradeVersions $config) -contains '2.0.3') 'installed 2.0.3 upgrades directly'
 Check ((Get-RiumUpgradeVersions $config) -contains '2.0.1') 'installed 2.0.1 upgrades directly'
 Check ((Get-RiumUpgradeVersions $config) -contains '2.0.2') 'installed 2.0.2 upgrades directly'
 Reject {Get-RiumUpgradeVersions @{Version='2.0.3';UpgradeFrom='..\foreign'}} 'upgrade source traversal rejected'

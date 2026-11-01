@@ -97,6 +97,47 @@ static unsigned checks=0,failures=0;
 static void Check(bool value,const char* name) { ++checks;if(!value)++failures;std::printf("%s synthetic %s\n",value?"PASS":"FAIL",name); }
 int main() {
     {
+        Memory m;const auto object=m.Alloc(),cached=m.Alloc(),actual=m.Alloc();
+        m.Set<uintptr_t>(object+0x1F0,303);m.Set(object+0x1F8,cached);
+        // Independent literal shard for token303, FNV1a64 LE8 => low12 B25.
+        const auto shard=Memory::base+0x2D206AC0+0xB25*0xC0,map=shard+0x90;
+        const auto sentinel=m.Alloc(),buckets=m.Alloc(),entry=m.Alloc();
+        m.Set<uint32_t>(Memory::base+0x2D2C6B00,0xFFFFF100);m.Set<uint32_t>(shard+0x8C,0);
+        m.Set(map+8,sentinel);m.Set<uintptr_t>(map+0x10,1);m.Set(map+0x18,buckets);
+        m.Set(map+0x20,buckets+16);m.Set(map+0x28,buckets+16);m.Set<uintptr_t>(map+0x30,0);m.Set<uintptr_t>(map+0x38,1);
+        m.Set(buckets,entry);m.Set(buckets+8,entry);m.Set(entry+8,sentinel);m.Set<uintptr_t>(entry+0x10,303);m.Set(entry+0x18,actual|1);
+        auto r=m.Reader();auto found=OwnerResolveParent(r,object);
+        Check(found.known&&found.parent==actual&&found.parent!=cached&&!r.failed,"registry-authoritative-parent-supersedes-cache");
+        const auto collision=m.Alloc();m.Set<uintptr_t>(collision+0x10,304);m.Set(collision+8,entry);m.Set(buckets+8,collision);
+        r=m.Reader();found=OwnerResolveParent(r,object);Check(found.known&&found.parent==actual,"registry-collision-chain-reaches-last-node");
+        m.Set(collision+8,collision);r=m.Reader();Check(!OwnerResolveParent(r,object).known,"registry-collision-cycle-rejected");
+        m.Set(buckets+8,entry);
+        m.Set(entry+0x18,actual);r=m.Reader();Check(!OwnerResolveParent(r,object).known,"registry-strong-fallback-with-release-is-not-assumed-safe");
+        m.Set(entry+0x18,actual|1);m.Set<uintptr_t>(map+0x30,2);r=m.Reader();Check(!OwnerResolveParent(r,object).known,"registry-invalid-mask-rejected");
+        m.Set<uintptr_t>(map+0x30,0);m.Set<uint32_t>(Memory::base+0x2D2C6B00,0);r=m.Reader();Check(!OwnerResolveParent(r,object).known,"registry-uninitialized-state-rejected");
+        m.Set<uint32_t>(Memory::base+0x2D2C6B00,UINT32_MAX);r=m.Reader();Check(!OwnerResolveParent(r,object).known,"registry-initialization-in-progress-rejected");
+        m.Set<uint32_t>(Memory::base+0x2D2C6B00,0xFFFFF100);m.Set(buckets+8,sentinel);r=m.Reader();found=OwnerResolveParent(r,object);
+        Check(found.known&&!found.parent&&!r.failed,"registry-absent-token-resolves-null");
+        m.Set<uintptr_t>(object+0x1F0,0);r=m.Reader();found=OwnerResolveParent(r,object);
+        Check(found.known&&!found.parent&&r.reads==1,"zero-parent-token-needs-no-registry-read");
+    }
+    {
+        Memory m;Chain c(m);m.Set(c.filter,Memory::base+0x26539E80);m.Set<uint8_t>(c.filter+0x607,1);
+        auto s=std::make_unique<OwnerSnapshot>();Check(c.Collect(m,s.get())&&s->filters[1].entries[0].dialogDisabledKnown&&s->filters[1].entries[0].dialogDisabled,"dialog-unconditional-false-guard-collected-without-parent-resolution");
+    }
+    {
+        Memory m;auto r=m.Reader();uint32_t bad=0;
+        Check(OwnerReadObject(r,m.Object(0x264FACF0)).state==ORead,"radio-filter-exact-type-readable");
+        r=m.Reader();Check(OwnerReadObject(r,m.Object(0x26539E80)).state==ORead,"dialog-filter-exact-type-readable");
+        m.Set<uint8_t>(Memory::base+0x192D1C70,0xCC);r=m.Reader();
+        Check(!OwnerVerifySpans(r,&bad)&&bad,"changed-dialog-filter-code-rejects-command-contract");
+    }
+    {
+        Memory m;auto r=m.Reader();uint32_t bad=0;
+        m.Set<uintptr_t>(Memory::base+0x26539E80+0x190,Memory::base+0x191627D0);
+        Check(!OwnerVerifySpans(r,&bad)&&bad==0x26539E80+0x190,"changed-dialog-key-forwarding-slot-rejected");
+    }
+    {
         Memory m;auto r=m.Reader();const auto p=m.Object(0x26E30F30);
         Check(OwnerReadObject(r,p).state==ORead,"exact-vtable-and-COL");
         m.Set<uint32_t>(Memory::base+0x26E30F30-8,0);r=m.Reader();

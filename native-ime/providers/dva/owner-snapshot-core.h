@@ -32,15 +32,19 @@ struct OwnerWindow {
     uintptr_t delegateBlock, backgroundBlock, propertyToken;
     uint32_t propertyRefcount;
 };
+struct OwnerParentResolution { uintptr_t parent; uint32_t known; };
 struct OwnerNode {
     OwnerObject object, delegate, handlerManager, handler;
     uintptr_t selfToken, parentToken, parent, callback, delegateBlock;
     uintptr_t childrenBegin, childrenEnd;
     uint32_t parentMatched, parentContains, callbackEmpty, refcount, flags, keyRva, terminal;
+    OwnerParentResolution resolvedParent;
 };
 struct OwnerFilter {
     OwnerObject object; uintptr_t token, selfToken, callback;
     uint32_t pairMatched, callbackEmpty, refcount, virtual88, filterRva;
+    uint32_t dialogDisabledKnown, dialogDisabled;
+    OwnerParentResolution resolvedParent;
 };
 struct OwnerFilterSet {
     uintptr_t begin, end; uint32_t state, count; OwnerFilter entries[kOwnerFilters];
@@ -95,6 +99,7 @@ struct OwnerSnapshot {
     OwnerNode parents[kOwnerParents]; OwnerFilterSet filters[2]; OwnerSelection selection; OwnerMonitor monitor;
 };
 OwnerObject OwnerReadObject(OwnerReader&, uintptr_t);
+OwnerParentResolution OwnerResolveParent(OwnerReader&, uintptr_t);
 OwnerDictionaryValue OwnerReadDictionary(OwnerReader&, uintptr_t, uint32_t keyRva, bool identity);
 OwnerDefaultFlag OwnerReadDefaultBypass(OwnerReader&);
 OwnerEndpoint OwnerReadEndpoint(OwnerReader&, uintptr_t raw, uintptr_t owner, uintptr_t block);
