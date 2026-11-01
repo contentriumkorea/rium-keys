@@ -29,9 +29,32 @@ static OwnerCommandEvidence BlankTimeline(OwnerSnapshot& s){
     s.parentCount=8;s.focusNode=s.parents[0].object.pointer;s.focusToken=s.parents[0].selfToken;
     return e;
 }
+// Exact eight-node time-ruler route observed on 2026-11-02. The first two
+// delegates differ from track space; their three key slots are false leaves.
+static OwnerCommandEvidence RulerTimeline(OwnerSnapshot& s){
+    auto e=BlankTimeline(s);
+    s.parents[0].delegate={0x710000,0x278732B8,0,0x2CF6DAF0,ORead,0};
+    s.parents[1].delegate={0x720000,0x272D8B68,0,0x2B2AE520,ORead,0};
+    return e;
+}
 int main(){
     auto s=std::make_unique<OwnerSnapshot>();OwnerNativeEditFacts edit{};auto e=TimelineWitness(*s);
     Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_COMMAND,"actual-timeline-witness-command");
+    e=RulerTimeline(*s);
+    for(unsigned key='A';key<='Z';++key){e.virtualKey=e.mappedCharacter=key;
+        Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_COMMAND,"time-ruler-letter-shortcut");}
+    e=RulerTimeline(*s);s->parents[1].delegate=Object(0x720000,0x272D48B8);
+    Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"time-ruler-mixed-track-route-rejected");
+    e=RulerTimeline(*s);s->parents[0].delegate.typeRva++;
+    Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"time-ruler-wrong-rtti-rejected");
+    e=RulerTimeline(*s);s->parents[1].callbackEmpty=0;
+    Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"time-ruler-custom-key-callback-rejected");
+    e=RulerTimeline(*s);s->parents[0].keyRva++;
+    Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"time-ruler-unknown-handler-rejected");
+    e=RulerTimeline(*s);s->parents[0].parentToken++;
+    Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"time-ruler-stale-parent-rejected");
+    e=RulerTimeline(*s);s->special[0]=0xBAD;
+    Check(OwnerRuntimeClassify(e,edit)==RIUM_OWNER_UNKNOWN,"time-ruler-active-special-handler-rejected");
     // Exact types observed in the failing ALL PANELS workspace; all other
     // fields derive from the independently recorded timeline/monitor witness.
     for(unsigned mode=0;mode<2;++mode)for(unsigned type=0;type<2;++type){

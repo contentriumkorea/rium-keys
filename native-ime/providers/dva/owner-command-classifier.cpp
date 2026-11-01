@@ -31,6 +31,9 @@ OwnerCommandResult OwnerClassifyCommand(const OwnerCommandEvidence& e) {
     // Exact paired audio route; all three key slots resolve to the same
     // verified literal-false leaves as video. Mixed routes remain unknown.
     const bool audio=!routeStart&&Is(s.parents[0].delegate,0x272E9598)&&Is(s.parents[1].delegate,0x272E9A18);
+    // The time ruler has its own paired eight-node route. Both delegates'
+    // key slots are bound to the already verified literal-false leaves.
+    const bool ruler=routeStart&&Is(s.parents[0].delegate,0x278732B8)&&Is(s.parents[1].delegate,0x272D8B68);
     constexpr uint32_t handlers[9]={0x1E937120,0x1E937120,0x1E937120,0x1E937120,0x1E937120,0x1E8E0880,0x1917CCD0,0x1917CCD0,0x1E8E3E00};
     for (unsigned i=0;i<s.parentCount;++i) {
         const unsigned route=i+routeStart;
@@ -43,7 +46,8 @@ OwnerCommandResult OwnerClassifyCommand(const OwnerCommandEvidence& e) {
             (route<8 && n.parentToken!=s.parents[i+1].selfToken) || (n.flags&0xC)) return unknown(Why::Chain);
         if (!n.callbackEmpty) return unknown(Why::Callback);
         if (n.keyRva!=handlers[route]) return unknown(Why::Delegate);
-        const uint32_t owner=audio&&route<2?(route?0x272E9A18:0x272E9598):(route<6?owners[route]:0);
+        const uint32_t owner=ruler&&i<2?(i?0x272D8B68:0x278732B8):
+            audio&&route<2?(route?0x272E9A18:0x272E9598):(route<6?owners[route]:0);
         if (route<6 && !Is(n.delegate,owner)) return unknown(Why::Delegate);
     }
     // Bind the actual native focus to this logical route, not a stale global

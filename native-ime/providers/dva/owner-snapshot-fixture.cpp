@@ -284,11 +284,11 @@ int main() {
         m.forbidden=c.child+0x428;m.forbiddenReads=0;r=m.Reader();OwnerCollectCaptionText(r,f.input,s.get());
         Check(!m.forbiddenReads&&!s->parents[0].callback&&!s->parents[0].keyRva,"caption-text-skips-command-callback-metadata");
     }
-    for(uint32_t vt:{0x272E9598u,0x272E9A18u}){
+    for(uint32_t vt:{0x272E9598u,0x272E9A18u,0x278732B8u,0x272D8B68u}){
         for(uint32_t off:{0x168u,0x170u,0x178u}){
             Memory m;const uint32_t expected=off==0x168?0x1E912F10:off==0x170?0x1E912F20:0x1E912250;
             m.Set<uintptr_t>(Memory::base+vt+off,Memory::base+expected+1);
-            auto r=m.Reader();uint32_t bad=0;Check(!OwnerVerifySpans(r,&bad)&&bad==vt+off,"audio-changed-relocated-key-slot-rejected");
+            auto r=m.Reader();uint32_t bad=0;Check(!OwnerVerifySpans(r,&bad)&&bad==vt+off,"timeline-changed-relocated-key-slot-rejected");
         }
     }
     std::printf("synthetic_checks=%u failures=%u actual_provider=NOT_EXERCISED\n",checks,failures);
